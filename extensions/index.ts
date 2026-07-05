@@ -75,7 +75,8 @@ const TOOL_IMAGE_EXPAND_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-r
 const CUSTOM_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-custom-message-render");
 const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-message-render");
 const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifications-v2");
-const WRAP_MARK = "\uE000";
+const WRAP_MARK = "\u200B";
+const LEGACY_WRAP_MARK = "\uE000";
 const CLIP_MARK = "\uE001";
 const TRAILING_MARK = "  · ";
 const KITTY_IMAGE_PREFIX = "\x1b_G";
@@ -747,7 +748,7 @@ function getToolCallLine(tool: any): string {
 	const value = (tool as any)?.callRendererComponent?.value;
 	if (typeof value === "string" && value.trim()) {
 		const line = value.split("\n").find((line) => stripAnsi(line).trim()) ?? value;
-		return line.replaceAll(WRAP_MARK, "").replaceAll(CLIP_MARK, "");
+		return stripWrapMarks(line).replaceAll(CLIP_MARK, "");
 	}
 	const summary = getToolArgSummary(tool);
 	const label = humanizeToolName(getToolName(tool));
@@ -1293,8 +1294,8 @@ function patchGlobalToolBorders(): void {
 		// Agent-family tools stay column-aligned with every other tool row — no extra
 		// leading indent (the old nested pad made Agent look offset from Read/Bash).
 		const core = textLines.map((line) => {
-			const normalized = normalizeLeadingCheckGlyph(line);
-			return clampLineWidth(stripOuterBackgroundAnsi(normalized), width);
+			const normalized = stripOuterBackgroundAnsi(normalizeLeadingCheckGlyph(line));
+			return clampLineWidth(normalized, width);
 		});
 		const spacerLine = " ".repeat(width);
 		let result: string[];
@@ -2638,10 +2639,12 @@ function patchToolExecutionRenderers(): void {
 			return (args: any, theme: Theme, ctx: any) =>
 				renderApplyPatchCall(args, theme, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
 		}
+		const originalRenderer = typeof originalGetCallRenderer === "function" ? originalGetCallRenderer.call(this) : undefined;
+		if (typeof originalRenderer === "function") return originalRenderer;
 		if (shouldUseGenericToolRenderer(toolName)) {
 			return (args: any, theme: Theme, ctx: any) => renderGenericToolCall(toolName, args, theme, ctx);
 		}
-		return typeof originalGetCallRenderer === "function" ? originalGetCallRenderer.call(this) : undefined;
+		return undefined;
 	};
 
 	proto.getResultRenderer = function patchedGetResultRenderer() {
@@ -2650,11 +2653,14 @@ function patchToolExecutionRenderers(): void {
 		if (toolName === "apply_patch") {
 			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
 				renderApplyPatchResult({ content: result.content, details: result.details }, options.isPartial, theme, ctx);
-		} else if (shouldUseGenericToolRenderer(toolName)) {
-			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
-				renderGenericToolResult(toolName, result, options, theme, ctx);
 		} else {
-			renderer = typeof originalGetResultRenderer === "function" ? originalGetResultRenderer.call(this) : undefined;
+			const originalRenderer = typeof originalGetResultRenderer === "function" ? originalGetResultRenderer.call(this) : undefined;
+			if (typeof originalRenderer === "function") {
+				renderer = originalRenderer;
+			} else if (shouldUseGenericToolRenderer(toolName)) {
+				renderer = (result: any, options: any, theme: Theme, ctx: any) =>
+					renderGenericToolResult(toolName, result, options, theme, ctx);
+			}
 		}
 		if (typeof renderer !== "function") return renderer;
 		// Strip transient Magic Context tags from the text the renderer sees,
@@ -3331,21 +3337,34 @@ function markedContinuationPrefix(prefix: string): string {
 	return " ".repeat(visibleWidth(prefix));
 }
 
+function stripWrapMarks(text: string): string {
+	return text.replaceAll(WRAP_MARK, "").replaceAll(LEGACY_WRAP_MARK, "");
+}
+
+function findWrapMark(line: string): { index: number; mark: string } | undefined {
+	const current = line.indexOf(WRAP_MARK);
+	const legacy = line.indexOf(LEGACY_WRAP_MARK);
+	if (current === -1 && legacy === -1) return undefined;
+	if (current === -1) return { index: legacy, mark: LEGACY_WRAP_MARK };
+	if (legacy === -1 || current < legacy) return { index: current, mark: WRAP_MARK };
+	return { index: legacy, mark: LEGACY_WRAP_MARK };
+}
+
 function wrapMarkedLine(line: string, width: number): string[] {
 	const clipIndex = line.indexOf(CLIP_MARK);
 	if (clipIndex !== -1) {
-		const prefix = line.slice(0, clipIndex);
-		const body = line.slice(clipIndex + CLIP_MARK.length);
+		const prefix = stripWrapMarks(line.slice(0, clipIndex));
+		const body = stripWrapMarks(line.slice(clipIndex + CLIP_MARK.length));
 		if (body.includes(TRAILING_MARK)) return [alignTrailingMarkedLine(`${prefix}${body}`, width)];
 		const bodyWidth = Math.max(1, width - visibleWidth(prefix));
 		if (visibleWidth(body) <= bodyWidth) return [`${prefix}${body}`];
 		const hint = "…";
 		return [`${prefix}${truncateToWidth(body, Math.max(0, bodyWidth - visibleWidth(hint)), "", false)}${hint}`];
 	}
-	const markerIndex = line.indexOf(WRAP_MARK);
-	if (markerIndex === -1) return wrapTextWithAnsi(line, width);
-	const prefix = line.slice(0, markerIndex);
-	const body = line.slice(markerIndex + WRAP_MARK.length);
+	const marker = findWrapMark(line);
+	if (!marker) return wrapTextWithAnsi(stripWrapMarks(line), width);
+	const prefix = stripWrapMarks(line.slice(0, marker.index));
+	const body = stripWrapMarks(line.slice(marker.index + marker.mark.length));
 	const prefixWidth = visibleWidth(prefix);
 	const bodyWidth = Math.max(1, width - prefixWidth);
 	const wrapped = wrapTextWithAnsi(body, bodyWidth);
