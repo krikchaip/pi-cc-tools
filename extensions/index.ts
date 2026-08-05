@@ -18,6 +18,7 @@ import {
 	keyHint,
 	keyText,
 	rawKeyHint,
+	SettingsManager,
 	createBashTool,
 	createEditTool,
 	createFindTool,
@@ -6447,7 +6448,8 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
-	const bashTool = createBashTool(cwd);
+	const shellPath = SettingsManager.create(cwd).getShellPath();
+	const bashTool = createBashTool(cwd, { shellPath });
 	pi.registerTool({
 		name: "bash",
 		label: "bash",
