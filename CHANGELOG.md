@@ -3,6 +3,12 @@
 > [!IMPORTANT]
 > **1.0.69 — package rename (permanent).** Canonical npm name is now [`pi-claude-code-ui`](https://www.npmjs.com/package/pi-claude-code-ui). `pi-claude-style-tools` is legacy and will not receive further releases. Install with `pi install npm:pi-claude-code-ui` or `npm i pi-claude-code-ui`.
 
+## Unreleased
+
+### Fixed
+
+- **Pi 0.84 Markdown renderers survive the assistant-message layout patch** — Mermaid fences now pass through Pi's registered Markdown transformer and render as terminal diagrams instead of raw source. LaTeX and TeX fenced blocks retain Pi's native Unicode layout, including stacked fractions and matrices.
+
 ## 1.0.80 — 2026-08-24
 
 ### Fixed

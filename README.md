@@ -33,6 +33,8 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Transparent edit/write diffs** with universal red/green diff colors
 - **Grouped consecutive tool calls** with a compact status header and per-tool glance rows (set `groupToolCalls: false` to disable)
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
+- **Mermaid diagrams** — preserves Pi 0.84's Unicode diagram renderer in styled assistant messages
+- **Terminal LaTeX** — renders standard math delimiters plus `latex`/`tex` fenced blocks as readable Unicode math
 - **Global border patch** for all tool rows, including unknown/custom tools
 
 ## Configuration
@@ -155,6 +157,12 @@ This package targets recent Pi versions where tool renderers use:
 - `renderResult(result, { expanded, isPartial }, theme, context)`
 
 Unknown/custom tools do not have a public global renderer hook in Pi, so this package patches container rendering to add top/bottom borders for all tool executions in border mode.
+
+### Mermaid and LaTeX
+
+Pi 0.84 renders a `mermaid` fence as a Unicode terminal diagram. This package preserves Pi's Markdown transformer when it applies its assistant-message layout. Set `markdown.mermaid` to `"off"`, `"final"`, or `"streaming"`; Pi defaults to `"streaming"`.
+
+LaTeX is terminal-friendly Unicode output, not full typesetting. Use `$...$`, `\(...\)`, `\[...\]`, `$$...$$`, or a fenced `latex`/`tex` block.
 
 ## Credits
 
