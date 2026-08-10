@@ -421,14 +421,16 @@ function terminalColumnCeiling(): number {
 	return Number.isFinite(cols) && (cols as number) > 0 ? (cols as number) : 0;
 }
 
-function clampLineWidth(line: string, width: number): string {
+export function clampLineWidth(line: string, width: number): string {
 	if (width <= 0) return "";
 	// Hard ceiling: never emit a line wider than the real terminal. pi sometimes
 	// hands renderers a width wider than stdout.columns (e.g. content later placed
 	// in a narrower side panel), which trips pi's render width-assertion crash.
+	// Clip only the overflow. The default truncate suffix is "...", which repeats
+	// at the right edge of every patched row when Pi and stdout widths disagree.
 	const ceiling = Math.min(width, terminalColumnCeiling() || width);
 	if (ceiling <= 0) return "";
-	return visibleWidth(line) > ceiling ? truncateToWidth(line, ceiling) : line;
+	return visibleWidth(line) > ceiling ? truncateToWidth(line, ceiling, "") : line;
 }
 
 function isToolExecutionLike(value: unknown): value is { toolName: string; toolCallId: string } {
