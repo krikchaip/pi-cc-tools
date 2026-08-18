@@ -151,6 +151,33 @@ interface SettingsFile {
 
 let _settingsCache: { value: SettingsFile; timestamp: number } | null = null;
 const SETTINGS_CACHE_TTL_MS = 5_000;
+let _piOutputPadCache: { value: 0 | 1; timestamp: number } | null = null;
+const PI_OUTPUT_PAD_CACHE_TTL_MS = 250;
+
+function readPiOutputPad(): 0 | 1 {
+	const now = Date.now();
+	if (_piOutputPadCache && now - _piOutputPadCache.timestamp < PI_OUTPUT_PAD_CACHE_TTL_MS) {
+		return _piOutputPadCache.value;
+	}
+	let value: 0 | 1 = 1;
+	try {
+		const agentDir = process.env.PI_CODING_AGENT_DIR || resolve(process.env.HOME ?? "", ".pi", "agent");
+		const raw = JSON.parse(readFileSync(resolve(agentDir, "settings.json"), "utf8"));
+		if (raw?.outputPad === 0) value = 0;
+	} catch {
+		// Keep Pi's default output padding when settings are absent or invalid.
+	}
+	_piOutputPadCache = { value, timestamp: now };
+	return value;
+}
+
+function syncToolOutputPad(component: any, outputPad: 0 | 1): void {
+	const contentBox = component?.contentBox;
+	if (!contentBox || typeof contentBox !== "object" || contentBox.paddingX === outputPad) return;
+	contentBox.paddingX = outputPad;
+	contentBox.invalidate?.();
+	component[TOOL_RENDER_CACHE] = undefined;
+}
 
 function readSettings(): SettingsFile {
 	const now = Date.now();
@@ -878,7 +905,7 @@ function formatBranchedToolLines(
 		// re-prefixing. Agent breathe used · which the old stripper missed, so the
 		// title walked sideways as size changed inside groups.
 		const body = lineIndex === 0 ? removeGroupedToolPrefix(line) : trimAnsiLeft(line);
-		const prefix = lineIndex === 0 ? `${branchPrefix(index, total)}${light} ` : `${branchContinuation(index, total)}  `;
+		const prefix = lineIndex === 0 ? `${branchPrefix(index, total)}${light} ` : branchContinuation(index, total);
 		output.push(clampLineWidth(`${prefix}${body}`, width));
 	}
 	return output;
@@ -1270,11 +1297,14 @@ function patchGlobalToolBorders(): void {
 	proto.render = function patchedContainerRender(width: number): string[] {
 		maybeMergeConsecutiveThinkingMessages(this);
 		if (isToolExecutionLike(this)) {
+			const outputPad = readPiOutputPad();
+			syncToolOutputPad(this, outputPad);
 			const cached = (this as any)[TOOL_RENDER_CACHE];
 			const branchKey = toolBranchRenderCacheKey();
 			if (
 				cached?.width === width
 				&& cached?.mode === toolBackgroundMode
+				&& cached?.outputPad === outputPad
 				&& cached?.branchKey === branchKey
 				&& cached?.branchEpoch === _toolBranchVisualEpoch
 			) {
@@ -1286,7 +1316,11 @@ function patchGlobalToolBorders(): void {
 		if (!Array.isArray(rendered) || rendered.length === 0) return rendered;
 		const todoOverlay = formatTodoOverlayLines(rendered, width);
 		if (!isToolExecutionLike(this)) return todoOverlay;
-		const branchCache = { branchKey: toolBranchRenderCacheKey(), branchEpoch: _toolBranchVisualEpoch };
+		const branchCache = {
+			outputPad: readPiOutputPad(),
+			branchKey: toolBranchRenderCacheKey(),
+			branchEpoch: _toolBranchVisualEpoch,
+		};
 		if (toolBackgroundMode === "default") {
 			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
 			return rendered;
@@ -1360,18 +1394,22 @@ function configuredKeyHint(binding: Parameters<typeof keyText>[0], fallbackKey: 
 	return rawKeyHint(fallbackKey, description);
 }
 
-function expandHint(_theme: Theme, action: "expand" | "collapse" | "toggle" = "toggle"): string {
-	return ` • ${configuredKeyHint("app.tools.expand", "ctrl+o", `to ${action}`)}`;
+function hintSeparator(theme: Theme | undefined, color: "muted" | "warning"): string {
+	return theme ? theme.fg(color, " • ") : " • ";
 }
 
-function deepExpandHint(): string {
-	return ` • ${rawKeyHint("ctrl+shift+o", extraToolOutputExpanded ? "less detail" : "more detail")}`;
+function expandHint(theme: Theme | undefined, action: "expand" | "collapse" | "toggle" = "toggle"): string {
+	return `${hintSeparator(theme, "muted")}${configuredKeyHint("app.tools.expand", "ctrl+o", `to ${action}`)}`;
 }
 
-function toolOutputDetailHint(theme: Theme, expanded: boolean, hasMore = false): string {
+function deepExpandHint(theme: Theme | undefined, separatorColor: "muted" | "warning" = "muted"): string {
+	return `${hintSeparator(theme, separatorColor)}${rawKeyHint("ctrl+shift+o", extraToolOutputExpanded ? "less detail" : "more detail")}`;
+}
+
+function toolOutputDetailHint(theme: Theme | undefined, expanded: boolean, hasMore = false): string {
 	if (!expanded) return expandHint(theme, "toggle");
 	const parts = [expandHint(theme, "collapse")];
-	if (hasMore || extraToolOutputExpanded) parts.push(deepExpandHint());
+	if (hasMore || extraToolOutputExpanded) parts.push(deepExpandHint(theme));
 	return parts.join("");
 }
 
@@ -2460,13 +2498,29 @@ function patchToolExecutionRenderers(): void {
 	const proto = ToolExecutionComponent.prototype as any;
 	if (proto[TOOL_EXECUTION_PATCH_FLAG]) return;
 
+	const originalRender = proto.render;
 	const originalHasRendererDefinition = proto.hasRendererDefinition;
 	const originalGetCallRenderer = proto.getCallRenderer;
 	const originalGetResultRenderer = proto.getResultRenderer;
+	const originalGetRenderShell = proto.getRenderShell;
+
+	if (typeof originalRender === "function") {
+		proto.render = function patchedToolExecutionRender(width: number): string[] {
+			syncToolOutputPad(this, readPiOutputPad());
+			return originalRender.call(this, width);
+		};
+	}
 
 	if (typeof originalHasRendererDefinition === "function") {
 		proto.hasRendererDefinition = function patchedHasRendererDefinition() {
 			return originalHasRendererDefinition.call(this) || shouldUseGenericToolRenderer(this?.toolName);
+		};
+	}
+
+	if (typeof originalGetRenderShell === "function") {
+		proto.getRenderShell = function patchedGetRenderShell() {
+			const toolName = typeof this?.toolName === "string" ? this.toolName : "";
+			return isMcpToolName(toolName) ? "self" : originalGetRenderShell.call(this);
 		};
 	}
 
@@ -2475,6 +2529,9 @@ function patchToolExecutionRenderers(): void {
 		if (toolName === "apply_patch") {
 			return (args: any, theme: Theme, ctx: any) =>
 				renderApplyPatchCall(args, theme, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
+		}
+		if (isMcpToolName(toolName)) {
+			return (args: any, theme: Theme, ctx: any) => renderGenericToolCall(toolName, args, theme, ctx);
 		}
 		const originalRenderer = typeof originalGetCallRenderer === "function" ? originalGetCallRenderer.call(this) : undefined;
 		if (typeof originalRenderer === "function") return originalRenderer;
@@ -2490,6 +2547,9 @@ function patchToolExecutionRenderers(): void {
 		if (toolName === "apply_patch") {
 			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
 				renderApplyPatchResult({ content: result.content, details: result.details }, options.isPartial, theme, ctx);
+		} else if (isMcpToolName(toolName)) {
+			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
+				renderMcpToolResult(result, !!options?.expanded, !!options?.isPartial, theme, ctx);
 		} else {
 			const originalRenderer = typeof originalGetResultRenderer === "function" ? originalGetResultRenderer.call(this) : undefined;
 			if (typeof originalRenderer === "function") {
@@ -2967,12 +3027,13 @@ function getBlinkingEntries(): BlinkEntry[] {
 		.slice(0, MAX_BLINKING_TOOLS);
 }
 
-function updateBlinkActiveStates(): void {
+function updateBlinkActiveStates(skipInvalidateKey?: any): void {
 	const activeSet = new Set(getBlinkingEntries().map((entry) => entry.key));
 	for (const entry of _blinkContexts.values()) {
 		const active = activeSet.has(entry.key);
 		if (entry.key?._blinkActive !== active) {
 			entry.key._blinkActive = active;
+			if (entry.key === skipInvalidateKey) continue;
 			try { entry.invalidate(); } catch { /* noop */ }
 		}
 	}
@@ -3044,7 +3105,10 @@ function setupBlinkTimer(ctx: any): void {
 	_blinkContexts.set(key, { key, order: ++_blinkOrder, invalidate });
 	key._blinkActive = false;
 	markBlinkActivity();
-	updateBlinkActiveStates();
+	// Registration runs inside the call renderer. Invalidating this same tool
+	// synchronously re-enters updateDisplay() and inserts its reused component
+	// twice. Update its active flag now; the current render already paints it.
+	updateBlinkActiveStates(key);
 	_stopGlobalBlinkTimerIfEmpty();
 	_scheduleGlobalBlinkTimer();
 }
@@ -3211,8 +3275,10 @@ function wrapMarkedLine(line: string, width: number): string[] {
 
 class ToolText extends Text {
 	private value = "";
+	private followPiOutputPad = false;
 	private toolCachedValue?: string;
 	private toolCachedWidth?: number;
+	private toolCachedPaddingX?: number;
 	private toolCachedLines?: string[];
 	private observedWidth?: number;
 	private pendingObservedWidth?: number;
@@ -3235,6 +3301,12 @@ class ToolText extends Text {
 		if (!observer) this.pendingObservedWidth = undefined;
 	}
 
+	setFollowPiOutputPad(follow: boolean): void {
+		if (this.followPiOutputPad === follow) return;
+		this.followPiOutputPad = follow;
+		this.invalidate();
+	}
+
 	private observeWidth(width: number): void {
 		if (this.observedWidth === width) return;
 		this.observedWidth = width;
@@ -3253,32 +3325,39 @@ class ToolText extends Text {
 	invalidate(): void {
 		this.toolCachedValue = undefined;
 		this.toolCachedWidth = undefined;
+		this.toolCachedPaddingX = undefined;
 		this.toolCachedLines = undefined;
 	}
 
 	render(width: number): string[] {
 		this.observeWidth(width);
 		const branchKey = toolBranchRenderCacheKey();
+		const requestedPaddingX = this.followPiOutputPad ? readPiOutputPad() : 0;
+		const paddingX = width > requestedPaddingX * 2 ? requestedPaddingX : 0;
 		if (
 			this.toolCachedLines
 			&& this.toolCachedValue === this.value
 			&& this.toolCachedWidth === width
+			&& this.toolCachedPaddingX === paddingX
 			&& (this as any)._toolBranchCacheKey === branchKey
 			&& (this as any)._toolBranchCacheEpoch === _toolBranchVisualEpoch
 		) return this.toolCachedLines;
 		if (!this.value || this.value.trim() === "") {
 			this.toolCachedValue = this.value;
 			this.toolCachedWidth = width;
+			this.toolCachedPaddingX = paddingX;
 			this.toolCachedLines = [];
 			return this.toolCachedLines;
 		}
-		const contentWidth = Math.max(1, width);
+		const contentWidth = Math.max(1, width - paddingX * 2);
+		const horizontalPad = " ".repeat(paddingX);
 		const lines = this.value.replace(/\t/g, "   ").split("\n");
 		const rendered = lines
 			.flatMap((line) => wrapMarkedLine(line, contentWidth))
-			.map((line) => padToWidth(line, width));
+			.map((line) => `${horizontalPad}${padToWidth(line, contentWidth)}${horizontalPad}`);
 		this.toolCachedValue = this.value;
 		this.toolCachedWidth = width;
+		this.toolCachedPaddingX = paddingX;
 		this.toolCachedLines = rendered;
 		(this as any)._toolBranchCacheKey = branchKey;
 		(this as any)._toolBranchCacheEpoch = _toolBranchVisualEpoch;
@@ -3286,9 +3365,10 @@ class ToolText extends Text {
 	}
 }
 
-function makeText(last: unknown, text: string): Text {
+function makeText(last: unknown, text: string, followPiOutputPad = false): Text {
 	const component = last instanceof ToolText ? last : new ToolText();
 	component.setWidthObserver();
+	component.setFollowPiOutputPad(followPiOutputPad);
 	component.setText(text);
 	return component;
 }
@@ -3301,6 +3381,10 @@ function makeResponsiveDiffText(ctx: any, last: unknown, text: string): Text {
 		safeInvalidate(ctx);
 	});
 	return component;
+}
+
+function makeMcpText(last: unknown, text: string): Text {
+	return makeText(last, text, true);
 }
 
 function previewLimit(): number {
@@ -3383,10 +3467,10 @@ function buildPreviewText(
 	}
 	const remaining = Math.max(0, totalLineCount - limit);
 	if (remaining > 0) {
-		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines${toolOutputDetailHint(theme, expanded, true)})`)}`;
+		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines`)}${toolOutputDetailHint(theme, expanded, true)}${theme.fg("muted", ")")}`;
 	}
 	if (expanded && totalLineCount > maxLines) {
-		text += `\n${theme.fg("warning", `(display capped at ${maxLines} lines${deepExpandHint()})`)}`;
+		text += `\n${theme.fg("warning", `(display capped at ${maxLines} lines`)}${deepExpandHint(theme, "warning")}${theme.fg("warning", ")")}`;
 	}
 	return text;
 }
@@ -5402,6 +5486,7 @@ function renderGenericToolCall(name: string, args: any, theme: Theme, ctx: any):
 	return makeText(
 		ctx.lastComponent,
 		toolHeader(genericToolLabel(name), summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+		isMcpToolName(name),
 	);
 }
 
@@ -5989,9 +6074,98 @@ function summarizeGenericToolCall(name: string, args: any, theme: Theme, sp: (pa
 	return summarizeOpenAiToolCall(name, args, theme, sp);
 }
 
+interface McpKeyValueField {
+	key: string;
+	value: string;
+}
+
+const MCP_COLLAPSED_SCAN_LINES = 4;
+const MCP_MAX_STRUCTURED_FIELDS = 200;
+const MCP_FIELD_KEY_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} _./()-]{0,31}$/u;
+const MCP_FIELD_INITIALISMS = new Set(["api", "html", "http", "https", "id", "ip", "sha", "uri", "url", "uuid"]);
+
+function humanizeMcpJsonPath(path: string[]): string {
+	const words = path.flatMap((segment) => segment
+		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+		.split(/[_\s-]+/)
+		.filter(Boolean));
+	return words.map((word, index) => {
+		const lower = word.toLowerCase();
+		if (MCP_FIELD_INITIALISMS.has(lower)) return lower.toUpperCase();
+		return index === 0 ? `${lower.charAt(0).toUpperCase()}${lower.slice(1)}` : lower;
+	}).join(" ");
+}
+
+function formatMcpJsonValue(value: unknown): string {
+	if (value === null) return "null";
+	if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
+	return String(value);
+}
+
+function flattenMcpJsonFields(value: unknown, path: string[], fields: McpKeyValueField[]): void {
+	if (fields.length >= MCP_MAX_STRUCTURED_FIELDS) return;
+	if (value === null || typeof value !== "object") {
+		if (path.length > 0) fields.push({ key: humanizeMcpJsonPath(path), value: formatMcpJsonValue(value) });
+		return;
+	}
+	if (Array.isArray(value)) {
+		if (value.length === 0) {
+			if (path.length > 0) fields.push({ key: humanizeMcpJsonPath(path), value: "[]" });
+			return;
+		}
+		if (value.every((item) => item === null || typeof item !== "object")) {
+			const keyPath = path.length > 0 ? path : ["Values"];
+			fields.push({ key: humanizeMcpJsonPath(keyPath), value: value.map(formatMcpJsonValue).join(", ") });
+			return;
+		}
+		value.forEach((item, index) => flattenMcpJsonFields(item, [...path, String(index + 1)], fields));
+		return;
+	}
+	const entries = Object.entries(value as Record<string, unknown>);
+	if (entries.length === 0) {
+		if (path.length > 0) fields.push({ key: humanizeMcpJsonPath(path), value: "{}" });
+		return;
+	}
+	for (const [key, child] of entries) flattenMcpJsonFields(child, [...path, key], fields);
+}
+
+function parseMcpJsonFields(raw: string): McpKeyValueField[] | null {
+	try {
+		const parsed = JSON.parse(raw);
+		if (!parsed || typeof parsed !== "object") return null;
+		const fields: McpKeyValueField[] = [];
+		flattenMcpJsonFields(parsed, [], fields);
+		return fields.length >= 2 ? fields : null;
+	} catch {
+		return null;
+	}
+}
+
+function parseMcpKeyValueFields(lines: string[]): McpKeyValueField[] | null {
+	if (lines.length < 2) return null;
+	const fields: McpKeyValueField[] = [];
+	for (const line of lines) {
+		const separator = line.indexOf(":");
+		if (separator <= 0) return null;
+		const key = line.slice(0, separator).trim();
+		if (!MCP_FIELD_KEY_PATTERN.test(key)) return null;
+		fields.push({ key, value: line.slice(separator + 1).trim() });
+	}
+	return fields;
+}
+
+function renderMcpKeyValueFields(fields: McpKeyValueField[], expanded: boolean, theme: Theme): string {
+	const keyWidth = Math.max(...fields.map(({ key }) => key.length));
+	const rows = fields.map(({ key, value }) => (
+		`${theme.fg("muted", key.padEnd(keyWidth))}  ${theme.fg("toolOutput", value || " ")}`
+	));
+	const collapsedLimit = Math.min(MCP_COLLAPSED_SCAN_LINES, previewLimit());
+	return buildPreviewText(rows, expanded, theme, collapsedLimit, fields.length);
+}
+
 function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean, theme: Theme, ctx: any): Text {
 	if (isPartial) {
-		return makeText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", "MCP running..."), expanded, theme, ctx, {
+		return makeMcpText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", "MCP running..."), expanded, theme, ctx, {
 			styleLine: (line) => theme.fg("toolOutput", line || " "),
 		}));
 	}
@@ -5999,26 +6173,27 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 	setToolStatus(ctx, ctx.isError ? "error" : "success");
 
 	const mode = getMode(readSettings().mcpOutputMode, ["hidden", "summary", "preview"] as const, "preview");
-	if (mode === "hidden") return makeText(ctx.lastComponent, "");
+	if (mode === "hidden") return makeMcpText(ctx.lastComponent, "");
 
 	const raw = getTextContent(result).trim();
 	const lines = raw ? raw.split("\n") : [];
 	if (lines.length === 0) {
-		return makeText(ctx.lastComponent, withBranch(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done"), theme));
+		return makeMcpText(ctx.lastComponent, withBranch(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done"), theme));
 	}
 
 	const statusText = ctx.isError ? theme.fg("error", lines[0]) : theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`);
-	if (mode === "summary") return makeText(ctx.lastComponent, withBranch(statusText, theme));
-	if (!expanded) return makeText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
-	const preview = buildPreviewText(
-		lines,
-		true,
-		theme,
-		previewLimit(),
-		lines.length,
-		(line) => theme.fg(ctx.isError ? "error" : "toolOutput", line || " "),
-	);
-	return makeText(ctx.lastComponent, withBranch(`${statusText}\n${preview}`, theme));
+	if (mode === "summary") return makeMcpText(ctx.lastComponent, withBranch(statusText, theme));
+	if (ctx.isError) {
+		if (!expanded) return makeMcpText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
+		const errorPreview = buildPreviewText(lines, true, theme, previewLimit(), lines.length, (line) => theme.fg("error", line || " "));
+		return makeMcpText(ctx.lastComponent, withFinalBranchBlock(errorPreview, theme));
+	}
+
+	const fields = parseMcpJsonFields(raw) ?? parseMcpKeyValueFields(lines);
+	const preview = fields
+		? renderMcpKeyValueFields(fields, expanded, theme)
+		: buildPreviewText(lines, expanded, theme, previewLimit(), lines.length, (line) => theme.fg("toolOutput", line || " "));
+	return makeMcpText(ctx.lastComponent, withFinalBranchBlock(preview, theme));
 }
 
 function summarizeOpenAiToolCall(name: string, args: any, theme: Theme, sp: (path: string) => string): string {
@@ -7275,6 +7450,7 @@ export default function (pi: ExtensionAPI) {
 				name,
 				label,
 				description,
+				renderShell: "self",
 				parameters: record.parameters,
 				prepareArguments: typeof record.prepareArguments === "function" ? record.prepareArguments : undefined,
 				async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {

@@ -38,6 +38,7 @@
   "scripts": {
     "test": "node --experimental-strip-types --test scripts/bash-command.test.ts",
     "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck extensions/index.ts extensions/spinner.ts",
+    "test:mcp-renderer": "bun scripts/test-mcp-renderer.ts",
     "test:shell-settings": "bun scripts/test-shell-settings.ts",
     "pack:dry-run": "npm pack --dry-run",
     "publish:dry-run": "npm publish --dry-run",
