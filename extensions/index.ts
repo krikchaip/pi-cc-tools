@@ -5616,65 +5616,76 @@ interface McpKeyValueField {
 }
 
 const MCP_COLLAPSED_SCAN_LINES = 4;
-const MCP_MAX_STRUCTURED_FIELDS = 200;
+const MCP_MAX_JSON_TREE_LINES = 1_000;
 const MCP_FIELD_KEY_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} _./()-]{0,31}$/u;
-const MCP_FIELD_INITIALISMS = new Set(["api", "html", "http", "https", "id", "ip", "sha", "uri", "url", "uuid"]);
 
-function humanizeMcpJsonPath(path: string[]): string {
-	const words = path.flatMap((segment) => segment
-		.replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-		.split(/[_\s-]+/)
-		.filter(Boolean));
-	return words.map((word, index) => {
-		const lower = word.toLowerCase();
-		if (MCP_FIELD_INITIALISMS.has(lower)) return lower.toUpperCase();
-		return index === 0 ? `${lower.charAt(0).toUpperCase()}${lower.slice(1)}` : lower;
-	}).join(" ");
+interface McpJsonTree {
+	lines: string[];
+	totalLineCount: number;
 }
 
-function formatMcpJsonValue(value: unknown): string {
-	if (value === null) return "null";
-	if (typeof value === "string") return value.replace(/\s+/g, " ").trim();
-	return String(value);
+function isMcpJsonContainer(value: unknown): value is unknown[] | Record<string, unknown> {
+	return typeof value === "object" && value !== null;
 }
 
-function flattenMcpJsonFields(value: unknown, path: string[], fields: McpKeyValueField[]): void {
-	if (fields.length >= MCP_MAX_STRUCTURED_FIELDS) return;
-	if (value === null || typeof value !== "object") {
-		if (path.length > 0) fields.push({ key: humanizeMcpJsonPath(path), value: formatMcpJsonValue(value) });
-		return;
-	}
-	if (Array.isArray(value)) {
-		if (value.length === 0) {
-			if (path.length > 0) fields.push({ key: humanizeMcpJsonPath(path), value: "[]" });
-			return;
-		}
-		if (value.every((item) => item === null || typeof item !== "object")) {
-			const keyPath = path.length > 0 ? path : ["Values"];
-			fields.push({ key: humanizeMcpJsonPath(keyPath), value: value.map(formatMcpJsonValue).join(", ") });
-			return;
-		}
-		value.forEach((item, index) => flattenMcpJsonFields(item, [...path, String(index + 1)], fields));
-		return;
-	}
-	const entries = Object.entries(value as Record<string, unknown>);
-	if (entries.length === 0) {
-		if (path.length > 0) fields.push({ key: humanizeMcpJsonPath(path), value: "{}" });
-		return;
-	}
-	for (const [key, child] of entries) flattenMcpJsonFields(child, [...path, key], fields);
+function mcpJsonEntries(value: unknown[] | Record<string, unknown>): Array<[string, unknown]> {
+	return Array.isArray(value)
+		? value.map((child, index) => [`[${index + 1}]`, child])
+		: Object.entries(value);
 }
 
-function parseMcpJsonFields(raw: string): McpKeyValueField[] | null {
+function mcpJsonContainerMetadata(value: unknown[] | Record<string, unknown>, theme: Theme): string {
+	const count = Array.isArray(value) ? value.length : Object.keys(value).length;
+	const kind = Array.isArray(value) ? "array" : "object";
+	const unit = Array.isArray(value) ? "item" : "field";
+	return `${theme.fg("accent", kind)}${theme.fg("dim", ` · ${count} ${unit}${count === 1 ? "" : "s"}`)}`;
+}
+
+function formatMcpJsonPrimitive(value: unknown, theme: Theme): string {
+	if (value === null) return theme.fg("muted", "null");
+	if (typeof value === "string") return theme.fg("toolOutput", value.replace(/\s+/g, " ").trim());
+	if (typeof value === "boolean") return theme.fg(value ? "success" : "warning", String(value));
+	return theme.fg("accent", String(value));
+}
+
+function parseMcpJsonTree(raw: string, theme: Theme): McpJsonTree | null {
 	try {
-		const parsed = JSON.parse(raw);
-		if (!parsed || typeof parsed !== "object") return null;
-		const fields: McpKeyValueField[] = [];
-		flattenMcpJsonFields(parsed, [], fields);
-		return fields.length >= 2 ? fields : null;
+		const parsed: unknown = JSON.parse(raw);
+		if (!isMcpJsonContainer(parsed)) return null;
+		const lines: string[] = [];
+		let totalLineCount = 1;
+		const addLine = (line: string): void => {
+			if (lines.length < MCP_MAX_JSON_TREE_LINES) lines.push(line);
+		};
+		const renderChildren = (container: unknown[] | Record<string, unknown>, prefix: string): void => {
+			const children = mcpJsonEntries(container);
+			const keyWidth = Math.max(0, ...children.map(([label]) => visibleWidth(label)));
+			children.forEach(([label, child], index) => {
+				const last = index === children.length - 1;
+				totalLineCount += 1;
+				const connector = last ? "└" : "├";
+				const lead = `${currentToolBranchAnsi(theme)}${prefix}${connector}${TRANSPARENT_RESET} `;
+				const paddedLabel = `${label}${" ".repeat(Math.max(0, keyWidth - visibleWidth(label)))}`;
+				const key = theme.fg("muted", paddedLabel);
+				if (!isMcpJsonContainer(child)) {
+					addLine(`${lead}${key}${theme.fg("dim", "  ")}${formatMcpJsonPrimitive(child, theme)}`);
+					return;
+				}
+				addLine(`${lead}${key}${theme.fg("dim", "  ")}${mcpJsonContainerMetadata(child, theme)}`);
+				const nextPrefix = `${prefix}${last ? "  " : "│ "}`;
+				renderChildren(child, nextPrefix);
+			});
+		};
+		addLine(`${theme.bold("Response")}  ${mcpJsonContainerMetadata(parsed, theme)}`);
+		renderChildren(parsed, "");
+		return { lines, totalLineCount };
 	} catch {
 		return null;
 	}
+}
+
+function renderMcpJsonTree(tree: McpJsonTree, expanded: boolean, theme: Theme): string {
+	return buildPreviewText(tree.lines, expanded, theme, previewLimit(), tree.totalLineCount);
 }
 
 function parseMcpKeyValueFields(lines: string[]): McpKeyValueField[] | null {
@@ -5725,7 +5736,12 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 		return makeMcpText(ctx.lastComponent, withFinalBranchBlock(errorPreview, theme));
 	}
 
-	const fields = parseMcpJsonFields(raw) ?? parseMcpKeyValueFields(lines);
+	const jsonTree = parseMcpJsonTree(raw, theme);
+	if (jsonTree) {
+		const preview = renderMcpJsonTree(jsonTree, expanded, theme);
+		return makeMcpText(ctx.lastComponent, withBranch(preview, theme));
+	}
+	const fields = parseMcpKeyValueFields(lines);
 	const preview = fields
 		? renderMcpKeyValueFields(fields, expanded, theme)
 		: buildPreviewText(lines, expanded, theme, previewLimit(), lines.length, (line) => theme.fg("toolOutput", line || " "));

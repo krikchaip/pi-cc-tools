@@ -108,9 +108,9 @@ try {
     },
   });
   const jsonCollapsed = render(githubGetMe);
-  for (const expected of ["Login", "example-user", "ID", "Profile URL", "Avatar URL", "9 more"]) {
+  for (const expected of ["Response", "object · 5 fields", "login", "example-user", "profile_url", "details", "object · 9 fields", "7 more"]) {
     if (!jsonCollapsed.includes(expected)) {
-      throw new Error(`collapsed JSON MCP output missed Variant C field ${JSON.stringify(expected)}`);
+      throw new Error(`collapsed JSON MCP output missed branch-tree content ${JSON.stringify(expected)}`);
     }
   }
   if (jsonCollapsed.includes('{"login"')) {
@@ -120,8 +120,61 @@ try {
     throw new Error("collapsed JSON MCP hint did not restore muted color for its closing parenthesis");
   }
   const jsonExpanded = render(githubGetMe, true);
-  if (!jsonExpanded.includes("Details name") || !jsonExpanded.includes("Example User")) {
-    throw new Error("expanded JSON MCP output did not flatten nested fields");
+  if (!jsonExpanded.includes("details") || !jsonExpanded.includes("name") || !jsonExpanded.includes("Example User")) {
+    throw new Error("expanded JSON MCP output did not preserve nested object fields");
+  }
+  if (jsonExpanded.includes("Details name")) {
+    throw new Error("expanded JSON MCP output still flattened nested paths");
+  }
+
+  const commitsJson = JSON.stringify({
+    total_count: 2,
+    commits: [
+      {
+        sha: "a1b2c3d4",
+        author: { name: "Example Author", verified: true },
+        parents: ["91aa004", "82bb113"],
+      },
+      {
+        sha: "e5f6a7b8",
+        author: { name: "Sample Contributor", verified: false },
+        parents: ["a1b2c3d4"],
+      },
+    ],
+  });
+  const commitsExpandedRaw = renderRaw(commitsJson, true);
+  const commitsExpanded = commitsExpandedRaw.replace(/\x1b\[[0-9;]*m/g, "");
+  for (const expected of ["commits", "array · 2 items", "[1]", "object · 3 fields", "author", "object · 2 fields", "parents", "array · 2 items"]) {
+    if (!commitsExpanded.includes(expected)) {
+      throw new Error(`expanded JSON MCP output missed nested array content ${JSON.stringify(expected)}`);
+    }
+  }
+  for (const expected of [
+    "total_count  2",
+    "commits      array · 2 items",
+    "sha      a1b2c3d4",
+    "author   object · 2 fields",
+    "parents  array · 2 items",
+    "name      Example Author",
+    "verified  true",
+  ]) {
+    if (!commitsExpanded.includes(expected)) {
+      throw new Error(`expanded JSON MCP output did not align sibling columns at ${JSON.stringify(expected)}`);
+    }
+  }
+  const ansiBefore = (index: number): string | undefined => (
+    [...commitsExpandedRaw.slice(0, index).matchAll(/\x1b\[[0-9;]*m/g)].at(-1)?.[0]
+  );
+  const responseIndex = commitsExpandedRaw.indexOf("Response");
+  const rootConnectorIndex = commitsExpandedRaw.lastIndexOf("└", responseIndex);
+  const childConnectorIndex = commitsExpandedRaw.indexOf("├", responseIndex);
+  if (rootConnectorIndex < 0 || childConnectorIndex < 0) {
+    throw new Error("expanded JSON MCP output did not render root and child connectors");
+  }
+  const rootConnectorColor = ansiBefore(rootConnectorIndex);
+  const childConnectorColor = ansiBefore(childConnectorIndex);
+  if (!rootConnectorColor || childConnectorColor !== rootConnectorColor) {
+    throw new Error(`nested JSON guide color did not match root branch: ${JSON.stringify({ rootConnectorColor, childConnectorColor })}`);
   }
 
   const prose = render("Found one repository\nOwner is example-org\nReady to inspect");
