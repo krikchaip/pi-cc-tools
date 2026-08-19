@@ -1,0 +1,61 @@
+#!/usr/bin/expect -f
+# Real-Pi TUI capture for grouped MCP JSON indentation.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "mcp-batch-anchor.ts"]
+set scratch "/tmp/mcp-batch-anchor-e2e-[pid]"
+set cwd [file join $scratch "cwd"]
+set agent [file join $scratch "agent"]
+file mkdir $cwd
+file mkdir $agent
+
+set settings [open [file join $agent "settings.json"] "w"]
+puts $settings {{"quietStartup":true,"theme":"dark","outputPad":0}}
+close $settings
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" {
+        puts stderr "unexpected project trust prompt"
+        return 0
+      }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+cd $cwd
+log_file -noappend [file join $scratch "frame.ansi"]
+spawn env TERM=xterm-256color COLORTERM=truecolor COLUMNS=100 LINES=40 PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  pi --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path -e $fixture_path
+stty columns 100 rows 40
+
+if {![wait_for 10 {BATCH ANCHOR E2E}]} {
+  puts stderr "batched JSON fixture did not open"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+if {![wait_for 6 {author@example\.com}]} {
+  puts stderr "complete JSON tree did not render"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+after 250
+send -- "\033"
+after 100
+send "\003\003"
+catch {close}
+puts "ARTIFACTS $scratch"

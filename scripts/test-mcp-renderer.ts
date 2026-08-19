@@ -274,6 +274,52 @@ try {
     throw new Error(`grouped nested guide was not below the child row's first character: ${JSON.stringify({ childCallRow, nestedResultRow })}`);
   }
 
+  const makeJsonExecution = (id: string) => {
+    const component = new ToolExecutionComponent(
+      "mcp",
+      id,
+      { server: "github", tool: "list_commits" },
+      {},
+      legacyDefinition,
+      { requestRender() {} } as any,
+      process.cwd(),
+    );
+    component.markExecutionStarted();
+    component.setArgsComplete();
+    component.updateResult({ content: [{ type: "text", text: commitsJson }], isError: false }, false);
+    return component;
+  };
+  const jsonGroupParent = new Container();
+  jsonGroupParent.addChild(makeJsonExecution("call_json_fixture_1"));
+  jsonGroupParent.addChild(makeJsonExecution("call_json_fixture_2"));
+  jsonGroupParent.render(120);
+  const jsonGroup = (jsonGroupParent as any).children[0];
+  jsonGroup.setExpanded(true);
+  const jsonGroupLines = jsonGroupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const jsonCallRow = jsonGroupLines.find((line: string) => line.includes("MCP") && line.includes("list_commits"));
+  const jsonResponseRow = jsonGroupLines.find((line: string) => line.includes("Response") && line.includes("object"));
+  const jsonRootFieldRow = jsonGroupLines.find((line: string) => line.includes("total_count"));
+  const jsonArrayItemRow = jsonGroupLines.find((line: string) => line.includes("[1]") && line.includes("object"));
+  const jsonNestedFieldRow = jsonGroupLines.find((line: string) => line.includes("sha") && line.includes("a1b2c3d4"));
+  const statusColumn = jsonCallRow?.indexOf("●") ?? -1;
+  const deepestGuideColumn = (line: string | undefined): number => line ? Math.max(line.lastIndexOf("├"), line.lastIndexOf("└")) : -1;
+  const groupedJsonColumns = {
+    status: statusColumn,
+    response: deepestGuideColumn(jsonResponseRow),
+    rootField: deepestGuideColumn(jsonRootFieldRow),
+    arrayItem: deepestGuideColumn(jsonArrayItemRow),
+    nestedField: deepestGuideColumn(jsonNestedFieldRow),
+  };
+  if (
+    statusColumn < 0
+    || groupedJsonColumns.response !== statusColumn
+    || groupedJsonColumns.rootField !== groupedJsonColumns.response + 2
+    || groupedJsonColumns.arrayItem !== groupedJsonColumns.rootField + 2
+    || groupedJsonColumns.nestedField !== groupedJsonColumns.arrayItem + 2
+  ) {
+    throw new Error(`grouped JSON tree lost one or more indentation levels: ${JSON.stringify({ groupedJsonColumns, jsonCallRow, jsonResponseRow, jsonRootFieldRow, jsonArrayItemRow, jsonNestedFieldRow })}`);
+  }
+
   for (const handler of fakePi.handlers.get("agent_end") ?? []) {
     await handler({}, { hasUI: false });
   }
