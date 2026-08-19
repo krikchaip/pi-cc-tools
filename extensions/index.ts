@@ -682,6 +682,16 @@ function trimAnsiLeft(text: string): string {
 	}
 }
 
+function trimAnsiLeftColumns(text: string, columns: number): string {
+	let current = text;
+	for (let index = 0; index < columns; index++) {
+		const next = current.replace(/^((?:\x1b\[[0-9;]*m)*)[ \t]/, "$1");
+		if (next === current) break;
+		current = next;
+	}
+	return current;
+}
+
 function removeGroupedToolPrefix(line: string, groupedLabel?: string): string {
 	return trimAnsiLeft(stripGroupedToolLabel(trimAnsiLeft(stripLeadingToolStatus(line)), groupedLabel));
 }
@@ -725,9 +735,14 @@ function getCompactToolLine(tool: any, width: number, groupedLabel?: string): st
 }
 
 function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: string): string[] {
-	const lines = stripToolChrome(tool.render(Math.max(1, width)))
-		.map((line) => removeGroupedToolPrefix(line, groupedLabel))
-		.map((line) => tintGroupedToolLine(line, groupedLabel));
+	const rendered = stripToolChrome(tool.render(Math.max(1, width)));
+	const jsonTreeRootIndex = rendered.findIndex((line, lineIndex) => (
+		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+·/.test(stripAnsi(line).trimStart())
+	));
+	const lines = rendered.map((line, lineIndex) => {
+		if (jsonTreeRootIndex >= 0 && lineIndex >= jsonTreeRootIndex) return line;
+		return tintGroupedToolLine(removeGroupedToolPrefix(line, groupedLabel), groupedLabel);
+	});
 	return lines.length > 0 ? lines : [`${FG_DIM}${String(tool?.toolName ?? "tool")}${TRANSPARENT_RESET}`];
 }
 
@@ -755,6 +770,12 @@ function formatBranchedToolLines(
 	const output: string[] = [];
 	const content = lines.filter((line) => isTerminalImageLine(line) || stripAnsi(line).trim().length > 0);
 	const safeContent = content.length > 0 ? content : [""];
+	const jsonTreeRootIndex = safeContent.findIndex((line, lineIndex) => (
+		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+·/.test(stripAnsi(line).trimStart())
+	));
+	const jsonTreeBaseIndent = jsonTreeRootIndex >= 0
+		? (stripAnsi(safeContent[jsonTreeRootIndex] ?? "").match(/^[ \t]*/)?.[0].length ?? 0)
+		: 0;
 	const light = groupStatusLight(status, options);
 	for (let lineIndex = 0; lineIndex < safeContent.length; lineIndex++) {
 		const line = safeContent[lineIndex];
@@ -765,8 +786,15 @@ function formatBranchedToolLines(
 		// Always strip any leftover status marker from the child call line before
 		// re-prefixing. Agent breathe used · which the old stripper missed, so the
 		// title walked sideways as size changed inside groups.
-		const body = lineIndex === 0 ? removeGroupedToolPrefix(line) : trimAnsiLeft(line);
-		const prefix = lineIndex === 0 ? `${branchPrefix(index, total)}${light} ` : branchContinuation(index, total);
+		const isJsonTreeLine = jsonTreeRootIndex >= 0 && lineIndex >= jsonTreeRootIndex;
+		const body = lineIndex === 0
+			? removeGroupedToolPrefix(line)
+			: isJsonTreeLine
+				? trimAnsiLeftColumns(line, jsonTreeBaseIndent)
+				: trimAnsiLeft(line);
+		const prefix = lineIndex === 0
+			? `${branchPrefix(index, total)}${light} `
+			: branchContinuation(index, total);
 		output.push(clampLineWidth(`${prefix}${body}`, width));
 	}
 	return output;
