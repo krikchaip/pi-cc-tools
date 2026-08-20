@@ -43,6 +43,19 @@ const neq = (a: string[], b: string[], label: string) => {
 };
 
 // ---------------------------------------------------------------------------
+// 0. Extension reload refreshes the assistant update wrapper.
+// ---------------------------------------------------------------------------
+{
+	const firstUpdateWrapper = AssistantMessageComponent.prototype.updateContent;
+	ext.default(fakePi as any);
+	const reloadedUpdateWrapper = AssistantMessageComponent.prototype.updateContent;
+	if (reloadedUpdateWrapper === firstUpdateWrapper) {
+		throw new Error("assistant: extension reload kept a stale updateContent wrapper");
+	}
+	console.log("OK  assistant message: updateContent wrapper refreshes on extension reload");
+}
+
+// ---------------------------------------------------------------------------
 // 1. Assistant message: cache hit is byte-identical; updateContent invalidates.
 // ---------------------------------------------------------------------------
 {
