@@ -1242,6 +1242,7 @@ function safeInvalidate(ctx: any): void {
 
 const ASSISTANT_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message");
 const ASSISTANT_RENDER_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message-render");
+const ASSISTANT_UPDATE_BASE = Symbol.for("pi-claude-style-tools:assistant-message-update-base");
 const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-execution");
 
 // Rendered-output cache for assistant/user/custom message components.
@@ -2042,7 +2043,6 @@ function patchUserMessageRender(): void {
 
 function patchAssistantMessages(): void {
 	const proto = AssistantMessageComponent.prototype as any;
-	if (proto[ASSISTANT_PATCH_FLAG]) return;
 	const originalRender = proto.render;
 	if (typeof originalRender === "function" && !proto[ASSISTANT_RENDER_PATCH_FLAG]) {
 		proto.render = function patchedAssistantMessageRender(width: number) {
@@ -2069,7 +2069,14 @@ function patchAssistantMessages(): void {
 		};
 		proto[ASSISTANT_RENDER_PATCH_FLAG] = true;
 	}
-	const originalUpdateContent = proto.updateContent;
+	// Pi reloads Markdown with a new class identity before it rebuilds the chat.
+	// Refresh this wrapper on each extension load so instanceof uses that identity.
+	// Keep one base method to prevent wrappers from stacking across reloads.
+	if (typeof proto[ASSISTANT_UPDATE_BASE] !== "function") {
+		proto[ASSISTANT_UPDATE_BASE] = proto.updateContent;
+	}
+	const originalUpdateContent = proto[ASSISTANT_UPDATE_BASE];
+	if (typeof originalUpdateContent !== "function") return;
 	proto.updateContent = function patchedUpdateContent(message: any) {
 		// Content changed (also reached via invalidate() → updateContent): drop the
 		// cached rendered output so the next render rebuilds with the new children.
