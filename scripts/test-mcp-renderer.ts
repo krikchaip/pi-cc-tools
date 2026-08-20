@@ -46,17 +46,17 @@ try {
     throw new Error("MCP renderer did not use a host-independent self-render shell");
   }
 
-  const renderRaw = (text: string, expanded = false): string => {
+  const renderRaw = (text: string, expanded = false, width = 120): string => {
     const component = mcp.renderResult(
       { content: [{ type: "text", text }] },
       { expanded, isPartial: false },
       theme,
       { state: {}, isError: false, lastComponent: undefined },
     );
-    return component.render(120).join("\n");
+    return component.render(width).join("\n");
   };
-  const render = (text: string, expanded = false): string => (
-    renderRaw(text, expanded).replace(/\x1b\[[0-9;]*m/g, "")
+  const render = (text: string, expanded = false, width = 120): string => (
+    renderRaw(text, expanded, width).replace(/\x1b\[[0-9;]*m/g, "")
   );
 
   const fields = [
@@ -185,6 +185,53 @@ try {
     throw new Error("non-field MCP output regressed to the count-only result");
   }
 
+  const wrappedFinalRows = render(
+    "The earlier MCP output line is long enough to wrap before the final line\nThe final MCP output line is long enough to wrap across several terminal rows",
+    false,
+    32,
+  ).split("\n");
+  const finalBranchIndex = wrappedFinalRows.findIndex((line) => line.startsWith("└ "));
+  const finalContinuations = finalBranchIndex >= 0 ? wrappedFinalRows.slice(finalBranchIndex + 1) : [];
+  if (finalBranchIndex < 0 || finalContinuations.length === 0) {
+    throw new Error(`MCP final-line wrap regression setup did not wrap: ${JSON.stringify(wrappedFinalRows)}`);
+  }
+  if (!wrappedFinalRows.slice(0, finalBranchIndex).some((line) => line.startsWith("│ "))) {
+    throw new Error(`wrapped MCP non-final line lost its indentation guide: ${JSON.stringify(wrappedFinalRows)}`);
+  }
+  if (finalContinuations.some((line) => line.startsWith("│ "))) {
+    throw new Error(`wrapped MCP final line kept indentation guides: ${JSON.stringify(wrappedFinalRows)}`);
+  }
+  if (finalContinuations.some((line) => !line.startsWith("  "))) {
+    throw new Error(`wrapped MCP final line lost branch indentation: ${JSON.stringify(wrappedFinalRows)}`);
+  }
+
+  const edit = fakePi.tools.get("edit");
+  if (typeof edit?.renderResult !== "function") throw new Error("Edit renderer was not registered");
+  const editErrorComponent = edit.renderResult(
+    {
+      content: [{
+        type: "text",
+        text: "Could not find the exact text in extensions/index.ts. The old text must match exactly including all whitespace and newlines.",
+      }],
+    },
+    { expanded: false, isPartial: false },
+    theme,
+    { state: {}, isError: true, lastComponent: undefined },
+  );
+  const editErrorRows = editErrorComponent.render(44)
+    .map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const editBranchIndex = editErrorRows.findIndex((line: string) => line.startsWith(" └ "));
+  const editContinuations = editBranchIndex >= 0 ? editErrorRows.slice(editBranchIndex + 1) : [];
+  if (editBranchIndex < 0 || editContinuations.length === 0) {
+    throw new Error(`Edit final-line wrap regression setup did not wrap: ${JSON.stringify(editErrorRows)}`);
+  }
+  if (editContinuations.some((line: string) => line.startsWith(" │ "))) {
+    throw new Error(`wrapped Edit final line kept indentation guides: ${JSON.stringify(editErrorRows)}`);
+  }
+  if (editContinuations.some((line: string) => !line.startsWith("   "))) {
+    throw new Error(`wrapped Edit final line lost branch indentation: ${JSON.stringify(editErrorRows)}`);
+  }
+
   const { ToolExecutionComponent } = await import(
     "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js"
   );
@@ -272,6 +319,53 @@ try {
   const nestedGuideColumn = nestedResultRow ? Math.max(nestedResultRow.indexOf("├"), nestedResultRow.indexOf("└")) : -1;
   if (childFirstCharacterColumn < 0 || nestedGuideColumn !== childFirstCharacterColumn) {
     throw new Error(`grouped nested guide was not below the child row's first character: ${JSON.stringify({ childCallRow, nestedResultRow })}`);
+  }
+
+  const wrappedGroupText = [
+    "Progress: one two three four five six nonfinal-tail-token",
+    "Summary: alpha beta gamma delta grouped-tail-token",
+  ].join("\n");
+  const makeWrappedExecution = (id: string, text: string) => {
+    const component = new ToolExecutionComponent(
+      "mcp",
+      id,
+      { server: "github", tool: "get_repository" },
+      {},
+      legacyDefinition,
+      { requestRender() {} } as any,
+      process.cwd(),
+    );
+    component.markExecutionStarted();
+    component.setArgsComplete();
+    component.updateResult({ content: [{ type: "text", text }], isError: false }, false);
+    return component;
+  };
+  const wrappedGroupParent = new Container();
+  wrappedGroupParent.addChild(makeWrappedExecution("call_wrap_fixture_1", fields));
+  wrappedGroupParent.addChild(makeWrappedExecution("call_wrap_fixture_2", wrappedGroupText));
+  wrappedGroupParent.render(44);
+  const wrappedGroup = (wrappedGroupParent as any).children[0];
+  wrappedGroup.setExpanded(true);
+  const wrappedGroupLines = wrappedGroupParent.render(44)
+    .map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const groupedProgressContinuation = wrappedGroupLines.find((line: string) => line.includes("nonfinal-tail-token"));
+  const groupedSummaryRow = wrappedGroupLines.find((line: string) => line.includes("Summary"));
+  const groupedFinalContinuation = wrappedGroupLines.find((line: string) => line.includes("grouped-tail-token"));
+  const groupedClosedBranchColumn = groupedSummaryRow?.lastIndexOf("└") ?? -1;
+  const groupedSummaryColumn = groupedSummaryRow?.indexOf("Summary") ?? -1;
+  const groupedFinalContinuationColumn = groupedFinalContinuation?.indexOf("grouped-tail-token") ?? -1;
+  const groupedFinalContinuationPrefix = groupedFinalContinuation?.slice(0, groupedFinalContinuationColumn) ?? "";
+  if (!groupedProgressContinuation?.includes("│")) {
+    throw new Error(`grouped non-final wrap lost its indentation guide: ${JSON.stringify(wrappedGroupLines)}`);
+  }
+  if (
+    groupedClosedBranchColumn < 0
+    || groupedSummaryColumn !== groupedClosedBranchColumn + 2
+    || groupedFinalContinuation === groupedSummaryRow
+    || groupedFinalContinuationColumn !== groupedSummaryColumn
+    || /[│├└]/.test(groupedFinalContinuationPrefix)
+  ) {
+    throw new Error(`grouped final wrap was not aligned with its first text character: ${JSON.stringify({ groupedClosedBranchColumn, groupedSummaryColumn, groupedFinalContinuationColumn, groupedFinalContinuationPrefix, wrappedGroupLines })}`);
   }
 
   const makeJsonExecution = (id: string) => {

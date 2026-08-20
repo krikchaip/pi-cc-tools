@@ -692,6 +692,37 @@ function trimAnsiLeftColumns(text: string, columns: number): string {
 	return current;
 }
 
+function closedBranchContinuationTrims(lines: string[]): Map<number, number> {
+	const trims = new Map<number, number>();
+	let closedBranch: { outerIndent: number; contentColumn: number } | undefined;
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+		const plain = stripAnsi(lines[lineIndex]);
+		const closedMatch = /^([ \t]*)(└─ |└ )/.exec(plain);
+		if (closedMatch) {
+			const outerIndent = visibleWidth(closedMatch[1]);
+			closedBranch = {
+				outerIndent,
+				contentColumn: outerIndent + visibleWidth(closedMatch[2]),
+			};
+			continue;
+		}
+		if (closedBranch) {
+			const leading = plain.match(/^[ \t]*/)?.[0] ?? "";
+			const firstContent = plain.slice(leading.length, leading.length + 1);
+			if (
+				firstContent
+				&& !"│├└".includes(firstContent)
+				&& visibleWidth(leading) >= closedBranch.contentColumn
+			) {
+				trims.set(lineIndex, closedBranch.outerIndent);
+				continue;
+			}
+		}
+		closedBranch = undefined;
+	}
+	return trims;
+}
+
 function removeGroupedToolPrefix(line: string, groupedLabel?: string): string {
 	return trimAnsiLeft(stripGroupedToolLabel(trimAnsiLeft(stripLeadingToolStatus(line)), groupedLabel));
 }
@@ -739,8 +770,11 @@ function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: stri
 	const jsonTreeRootIndex = rendered.findIndex((line, lineIndex) => (
 		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+·/.test(stripAnsi(line).trimStart())
 	));
+	const closedContinuationTrims = closedBranchContinuationTrims(rendered);
 	const lines = rendered.map((line, lineIndex) => {
 		if (jsonTreeRootIndex >= 0 && lineIndex >= jsonTreeRootIndex) return line;
+		const closedContinuationTrim = closedContinuationTrims.get(lineIndex);
+		if (closedContinuationTrim !== undefined) return trimAnsiLeftColumns(line, closedContinuationTrim);
 		return tintGroupedToolLine(removeGroupedToolPrefix(line, groupedLabel), groupedLabel);
 	});
 	return lines.length > 0 ? lines : [`${FG_DIM}${String(tool?.toolName ?? "tool")}${TRANSPARENT_RESET}`];
@@ -776,6 +810,7 @@ function formatBranchedToolLines(
 	const jsonTreeBaseIndent = jsonTreeRootIndex >= 0
 		? (stripAnsi(safeContent[jsonTreeRootIndex] ?? "").match(/^[ \t]*/)?.[0].length ?? 0)
 		: 0;
+	const closedContinuationTrims = closedBranchContinuationTrims(safeContent);
 	const light = groupStatusLight(status, options);
 	for (let lineIndex = 0; lineIndex < safeContent.length; lineIndex++) {
 		const line = safeContent[lineIndex];
@@ -787,11 +822,14 @@ function formatBranchedToolLines(
 		// re-prefixing. Agent breathe used · which the old stripper missed, so the
 		// title walked sideways as size changed inside groups.
 		const isJsonTreeLine = jsonTreeRootIndex >= 0 && lineIndex >= jsonTreeRootIndex;
+		const closedContinuationTrim = closedContinuationTrims.get(lineIndex);
 		const body = lineIndex === 0
 			? removeGroupedToolPrefix(line)
 			: isJsonTreeLine
 				? trimAnsiLeftColumns(line, jsonTreeBaseIndent)
-				: trimAnsiLeft(line);
+				: closedContinuationTrim !== undefined
+					? trimAnsiLeftColumns(line, closedContinuationTrim)
+					: trimAnsiLeft(line);
 		const prefix = lineIndex === 0
 			? `${branchPrefix(index, total)}${light} `
 			: branchContinuation(index, total);
@@ -2911,8 +2949,11 @@ function markedContinuationPrefix(prefix: string): string {
 	const branchMatch = /^(\s*)(│  |│ |├─ |└─ |├ |└ )/.exec(plain);
 	if (branchMatch) {
 		const indent = branchMatch[1];
+		const lead = branchMatch[2];
+		// A closed branch must not grow a guide only because its text wraps.
+		if (lead.startsWith("└")) return " ".repeat(visibleWidth(prefix));
 		// Keep the same structure width as the lead glyph so wraps stay aligned.
-		const pad = Math.max(0, visibleWidth(branchMatch[2]) - 1);
+		const pad = Math.max(0, visibleWidth(lead) - 1);
 		return `${indent}${currentToolBranchAnsi()}│${TRANSPARENT_RESET}${" ".repeat(pad)}`;
 	}
 	return " ".repeat(visibleWidth(prefix));
