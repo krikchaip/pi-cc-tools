@@ -6081,20 +6081,23 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 		return makeText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
 	}
 
-	if (!ctx.isError && lines.length === 1) {
+	if (ctx.isError) {
+		const errorText = lines.map((line) => theme.fg("error", line || " ")).join("\n");
+		return makeText(ctx.lastComponent, withBranch(errorText, theme));
+	}
+
+	if (lines.length === 1) {
 		return makeText(ctx.lastComponent, withBranch(formatOpenAiSuccessLine(name, lines[0], theme), theme));
 	}
 
-	const preview = lines.length === 1
-		? theme.fg(ctx.isError ? "error" : "dim", lines[0])
-		: buildPreviewText(
-			lines,
-			true,
-			theme,
-			previewLimit(),
-			lines.length,
-			(line) => theme.fg(ctx.isError ? "error" : "dim", line || " "),
-		);
+	const preview = buildPreviewText(
+		lines,
+		true,
+		theme,
+		previewLimit(),
+		lines.length,
+		(line) => theme.fg("dim", line || " "),
+	);
 	return makeText(ctx.lastComponent, withBranch(`${statusText}\n${preview}`, theme));
 }
 
