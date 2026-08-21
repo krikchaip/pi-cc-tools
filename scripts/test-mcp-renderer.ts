@@ -205,8 +205,181 @@ try {
     throw new Error(`wrapped MCP final line lost branch indentation: ${JSON.stringify(wrappedFinalRows)}`);
   }
 
+  const indicatorLine = (raw: string, anchor: string): string => {
+    const index = raw.lastIndexOf(anchor);
+    if (index < 0) throw new Error(`expansion indicator did not render ${JSON.stringify(anchor)}`);
+    const start = raw.lastIndexOf("\n", index) + 1;
+    const end = raw.indexOf("\n", index);
+    return raw.slice(start, end < 0 ? undefined : end);
+  };
+  const assertCollapsedIndicator = (raw: string, anchor: string, checkClosingParenthesis = false): void => {
+    const line = indicatorLine(raw, anchor);
+    const plain = line.replace(/\x1b\[[0-9;]*m/g, "");
+    if (!plain.includes("to expand") || plain.includes("to toggle")) {
+      throw new Error(`collapsed expansion indicator did not describe its state: ${JSON.stringify(plain)}`);
+    }
+    if (checkClosingParenthesis) {
+      const anchorIndex = line.lastIndexOf(anchor);
+      const openingIndex = line.lastIndexOf("(", anchorIndex);
+      const closingIndex = line.indexOf(")", anchorIndex);
+      const foregroundBefore = (index: number): string | undefined => (
+        [...line.slice(0, index).matchAll(/\x1b\[38;(?:2;\d+;\d+;\d+|5;\d+)m/g)].at(-1)?.[0]
+      );
+      const openingForeground = foregroundBefore(openingIndex);
+      const closingForeground = foregroundBefore(closingIndex);
+      if (openingIndex < 0 || closingIndex < 0 || !openingForeground || closingForeground !== openingForeground) {
+        throw new Error(`expansion indicator closing parenthesis color bled: ${JSON.stringify({ plain, openingForeground, closingForeground })}`);
+      }
+    }
+  };
+  const assertExpandedIndicator = (raw: string, anchor: string): void => {
+    const plain = indicatorLine(raw, anchor).replace(/\x1b\[[0-9;]*m/g, "");
+    if (!plain.includes("to collapse") || plain.includes("to expand") || plain.includes("to toggle")) {
+      throw new Error(`expanded expansion indicator did not describe its state: ${JSON.stringify(plain)}`);
+    }
+  };
+  const waitFor = async (ready: () => boolean): Promise<void> => {
+    const deadline = Date.now() + 3000;
+    while (!ready() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+    if (!ready()) throw new Error("timed out waiting for asynchronous tool preview rendering");
+  };
+
+  const write = fakePi.tools.get("write");
+  if (typeof write?.renderResult !== "function") throw new Error("Write renderer was not registered");
+  const diffLines = [
+    { type: "del", content: "const value = 'old';", oldNum: 1, newNum: null },
+    { type: "add", content: "const value = 'new';", oldNum: null, newNum: 1 },
+    ...Array.from({ length: 40 }, (_, index) => ({
+      type: "ctx",
+      content: `context line ${index + 1}`,
+      oldNum: index + 2,
+      newNum: index + 2,
+    })),
+  ];
+  const writeResult = {
+    content: [{ type: "text", text: "Wrote fixture.ts" }],
+    details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 400, lines: diffLines } },
+  };
+  const writeContext = {
+    state: {},
+    isError: false,
+    lastComponent: undefined,
+    args: { path: "fixture.ts", content: "new" },
+    cwd: process.cwd(),
+    expanded: false,
+  } as any;
+  write.renderResult(writeResult, { expanded: false, isPartial: false }, theme, writeContext);
+  await waitFor(() => typeof writeContext.state._wdt === "string" && writeContext.state._wdt.includes("more diff lines"));
+  const writeRaw = write.renderResult(writeResult, { expanded: false, isPartial: false }, theme, writeContext).render(120).join("\n");
+  assertCollapsedIndicator(writeRaw, "more diff lines", true);
+
+  const expandedDiffLines = [
+    ...diffLines,
+    ...Array.from({ length: 180 }, (_, index) => ({
+      type: "ctx",
+      content: `expanded context line ${index + 1}`,
+      oldNum: index + 42,
+      newNum: index + 42,
+    })),
+  ];
+  const createContent = Array.from({ length: 220 }, (_, index) => `created line ${index + 1}`).join("\n");
+  for (const { result, args, stateKey } of [
+    {
+      result: {
+        content: [{ type: "text", text: "Wrote fixture.ts" }],
+        details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 4000, lines: expandedDiffLines } },
+      },
+      args: { path: "fixture.ts", content: "new" },
+      stateKey: "_wdt",
+    },
+    {
+      result: {
+        content: [{ type: "text", text: "Wrote created-fixture.ts" }],
+        details: { _type: "new", lines: 220, filePath: "created-fixture.ts" },
+      },
+      args: { path: "created-fixture.ts", content: createContent },
+      stateKey: "_nft",
+    },
+  ]) {
+    const context = {
+      state: {},
+      isError: false,
+      lastComponent: undefined,
+      args,
+      cwd: process.cwd(),
+      expanded: true,
+    } as any;
+    write.renderResult(result, { expanded: true, isPartial: false }, theme, context);
+    await waitFor(() => typeof context.state[stateKey] === "string" && context.state[stateKey].includes("more diff lines"));
+    const raw = write.renderResult(result, { expanded: true, isPartial: false }, theme, context).render(120).join("\n");
+    assertExpandedIndicator(raw, "more diff lines");
+  }
+
+  const bash = fakePi.tools.get("bash");
+  if (typeof bash?.renderResult !== "function") throw new Error("Bash renderer was not registered");
+  const bashContext = {
+    state: {},
+    isError: false,
+    lastComponent: undefined,
+    args: { command: "printf fixture" },
+    cwd: process.cwd(),
+    expanded: false,
+    executionStarted: true,
+  } as any;
+  const bashRaw = bash.renderResult(
+    { content: [{ type: "text", text: Array.from({ length: 8 }, (_, index) => `line ${index + 1}`).join("\n") }], details: {} },
+    { expanded: false, isPartial: true },
+    theme,
+    bashContext,
+  ).render(120).join("\n");
+  assertCollapsedIndicator(bashRaw, "earlier lines", true);
+
+  const cappedOutput = Array.from({ length: 20 }, (_, index) => `result line ${index + 1}`).join("\n");
+  for (const { name, args } of [
+    { name: "read", args: { path: "fixture.ts" } },
+    { name: "grep", args: { pattern: "result", path: "." } },
+    { name: "bash", args: { command: "printf fixture" } },
+  ]) {
+    const tool = fakePi.tools.get(name);
+    if (typeof tool?.renderResult !== "function") throw new Error(`${name} renderer was not registered`);
+    const raw = tool.renderResult(
+      { content: [{ type: "text", text: cappedOutput }], details: {} },
+      { expanded: true, isPartial: false },
+      theme,
+      {
+        state: {},
+        isError: false,
+        lastComponent: undefined,
+        args,
+        cwd: process.cwd(),
+        expanded: true,
+        executionStarted: true,
+      } as any,
+    ).render(120).join("\n");
+    assertExpandedIndicator(raw, "more lines");
+  }
+
   const edit = fakePi.tools.get("edit");
-  if (typeof edit?.renderResult !== "function") throw new Error("Edit renderer was not registered");
+  if (typeof edit?.renderCall !== "function" || typeof edit?.renderResult !== "function") throw new Error("Edit renderer was not registered");
+  const editArgs = {
+    path: "missing-fixture.ts",
+    edits: Array.from({ length: 4 }, (_, index) => ({ oldText: `old ${index}`, newText: `new ${index}` })),
+  };
+  const editContext = {
+    state: {},
+    isError: false,
+    lastComponent: undefined,
+    args: editArgs,
+    argsComplete: true,
+    cwd: process.cwd(),
+    expanded: false,
+    executionStarted: true,
+  } as any;
+  edit.renderCall(editArgs, theme, editContext);
+  await waitFor(() => typeof editContext.state._ptBody === "string" && editContext.state._ptBody.includes("more edit blocks"));
+  const editRaw = edit.renderCall(editArgs, theme, editContext).render(120).join("\n");
+  assertCollapsedIndicator(editRaw, "more edit blocks");
+
   const editErrorComponent = edit.renderResult(
     {
       content: [{
@@ -313,6 +486,10 @@ try {
   const group = (groupParent as any).children[0];
   group.setExpanded(true);
   const expandedGroupLines = groupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const expandedGroupHeader = expandedGroupLines.find((line: string) => line.includes("to collapse") || line.includes("to toggle"));
+  if (!expandedGroupHeader?.includes("to collapse") || expandedGroupHeader.includes("to toggle")) {
+    throw new Error(`expanded tool group did not describe its collapse action: ${JSON.stringify(expandedGroupHeader)}`);
+  }
   const childCallRow = expandedGroupLines.find((line: string) => line.includes("MCP") && line.includes("get_repository"));
   const nestedResultRow = expandedGroupLines.find((line: string) => line.includes("Repository"));
   const childFirstCharacterColumn = childCallRow?.indexOf("●") ?? -1;

@@ -1234,7 +1234,7 @@ function hintSeparator(theme: Theme | undefined, color: "muted" | "warning"): st
 	return theme ? theme.fg(color, " • ") : " • ";
 }
 
-function expandHint(theme: Theme | undefined, action: "expand" | "collapse" | "toggle" = "toggle"): string {
+function expandHint(theme: Theme | undefined, action: "expand" | "collapse" = "expand"): string {
 	return `${hintSeparator(theme, "muted")}${configuredKeyHint("app.tools.expand", "ctrl+o", `to ${action}`)}`;
 }
 
@@ -1243,7 +1243,7 @@ function deepExpandHint(theme: Theme | undefined, separatorColor: "muted" | "war
 }
 
 function toolOutputDetailHint(theme: Theme | undefined, expanded: boolean, hasMore = false): string {
-	if (!expanded) return expandHint(theme, "toggle");
+	if (!expanded) return expandHint(theme, "expand");
 	const parts = [expandHint(theme, "collapse")];
 	if (hasMore || extraToolOutputExpanded) parts.push(deepExpandHint(theme));
 	return parts.join("");
@@ -3100,14 +3100,16 @@ function collapsedPreviewCount(expanded: boolean, fallback: number): number {
 
 function buildPreviewText(
 	lines: string[],
-	expanded: boolean,
+	detailExpanded: boolean,
 	theme: Theme,
 	fallbackCollapsed = 8,
 	totalLineCount = lines.length,
 	styleLine?: (line: string) => string,
+	indicatorState?: { toolExpanded: boolean },
 ): string {
 	if (lines.length === 0 && totalLineCount === 0) return theme.fg("muted", "(no output)");
-	const maxLines = collapsedPreviewCount(expanded, fallbackCollapsed);
+	const maxLines = collapsedPreviewCount(detailExpanded, fallbackCollapsed);
+	const toolExpanded = indicatorState?.toolExpanded ?? detailExpanded;
 	// Only style/join the lines we will actually display. Callers used to map
 	// theme.fg over the entire output array first, which scaled with full tool
 	// output even when only 8–10 lines were shown.
@@ -3119,9 +3121,9 @@ function buildPreviewText(
 	}
 	const remaining = Math.max(0, totalLineCount - limit);
 	if (remaining > 0) {
-		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines`)}${toolOutputDetailHint(theme, expanded, true)}${theme.fg("muted", ")")}`;
+		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines`)}${toolOutputDetailHint(theme, toolExpanded, true)}${theme.fg("muted", ")")}`;
 	}
-	if (expanded && totalLineCount > maxLines) {
+	if (detailExpanded && totalLineCount > maxLines) {
 		text += `\n${theme.fg("warning", `(display capped at ${maxLines} lines`)}${deepExpandHint(theme, "warning")}${theme.fg("warning", ")")}`;
 	}
 	return text;
@@ -4086,10 +4088,14 @@ function diffSummaryWithMeta(added: number, removed: number, hunks: number, mode
 	return extras.length ? `${base} ${FG_DIM}•${D_RST} ${extras.join(` ${FG_DIM}•${D_RST} `)}` : base;
 }
 
-function collapsedDiffHint(remainingLines: number, hiddenHunks: number): string {
+interface DiffRenderState {
+	toolExpanded: boolean;
+}
+
+function collapsedDiffHint(remainingLines: number, hiddenHunks: number, state: DiffRenderState): string {
 	const width = termW();
 	const candidates = [
-		`… (${remainingLines} more diff lines${hiddenHunks > 0 ? ` • ${hiddenHunks} more hunks` : ""} • ${keyHint("app.tools.expand", "to toggle")})`,
+		`… (${remainingLines} more diff lines${hiddenHunks > 0 ? ` • ${hiddenHunks} more hunks` : ""}${toolOutputDetailHint(undefined, state.toolExpanded, true)}${BG_BASE}${FG_DIM})`,
 		`… (${remainingLines} more lines${hiddenHunks > 0 ? ` • ${hiddenHunks} hunks` : ""})`,
 		`… (+${remainingLines}${hiddenHunks > 0 ? ` • +${hiddenHunks}h` : ""})`,
 		"…",
@@ -4367,6 +4373,7 @@ function plainWordDiff(oldText: string, newText: string): { old: string; new: st
 async function renderUnified(
 	diff: ParsedDiff,
 	language: BundledLanguage | undefined,
+	state: DiffRenderState,
 	max = MAX_RENDER_LINES,
 	dc: DiffColors = DEFAULT_DIFF_COLORS,
 	width = termW(),
@@ -4458,19 +4465,20 @@ async function renderUnified(
 	}
 
 	out.push(diffRule(tw));
-	if (diff.lines.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(diff.lines.length - vis.length, 0)}${D_RST}`);
+	if (diff.lines.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(diff.lines.length - vis.length, 0, state)}${D_RST}`);
 	return out.join("\n");
 }
 
 async function renderSplit(
 	diff: ParsedDiff,
 	language: BundledLanguage | undefined,
+	state: DiffRenderState,
 	max = MAX_PREVIEW_LINES,
 	dc: DiffColors = DEFAULT_DIFF_COLORS,
 	width = termW(),
 ): Promise<string> {
 	const tw = width;
-	if (!shouldUseSplit(diff, tw, max)) return renderUnified(diff, language, max, dc, width);
+	if (!shouldUseSplit(diff, tw, max)) return renderUnified(diff, language, state, max, dc, width);
 	if (!diff.lines.length) return "";
 
 	type Row = { left: DiffLine | null; right: DiffLine | null };
@@ -4595,7 +4603,7 @@ async function renderSplit(
 	}
 
 	out.push(`${diffRule(half)}${FG_RULE}┊${D_RST}${diffRule(half)}`);
-	if (rows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(rows.length - vis.length, 0)}${D_RST}`);
+	if (rows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(rows.length - vis.length, 0, state)}${D_RST}`);
 	return out.join("\n");
 }
 
@@ -4774,7 +4782,7 @@ function renderEditPreviewBody(
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		const line = lines[0] ?? getFirstChangedNewLine(diff);
-		renderSplit(diff, language, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, branchWidth)
+		renderSplit(diff, language, { toolExpanded: ctx.expanded }, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, branchWidth)
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}\n${rendered}`;
@@ -4795,7 +4803,7 @@ function renderEditPreviewBody(
 		: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
 	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
 		const line = lines[index] ?? getFirstChangedNewLine(diff);
-		return renderSplit(diff, language, previewLines, dc, branchWidth)
+		return renderSplit(diff, language, { toolExpanded: ctx.expanded }, previewLines, dc, branchWidth)
 			.then((rendered) => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)}\n${rendered}`)
 			.catch(() => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)} ${summarizeDiff(diff.added, diff.removed)}`);
 	})
@@ -4803,7 +4811,7 @@ function renderEditPreviewBody(
 			if (ctx.state._pk !== key) return;
 			const remainder = operations.length - maxShown;
 			const suffix = remainder > 0
-				? `\n${theme.fg("muted", `… ${remainder} more edit blocks${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
+				? `\n${theme.fg("muted", `… ${remainder} more edit blocks`)}${toolOutputDetailHint(theme, ctx.expanded, true)}`
 				: "";
 			ctx.state._ptBody = `${operations.length} edits ${summary}\n\n${sections.join("\n\n")}${suffix}`;
 			ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
@@ -5200,7 +5208,7 @@ function runningPreviewBlock(
 	const previewTotal = options.tail && !expanded ? previewSource.length : totalLineCount;
 	let preview = buildPreviewText(previewSource, expanded, theme, limit, previewTotal, styleLine);
 	if (options.tail && !expanded && totalLineCount > previewSource.length) {
-		preview = `${theme.fg("muted", `... (${totalLineCount - previewSource.length} earlier lines${toolOutputDetailHint(theme, expanded, true)})`)}\n${preview}`;
+		preview = `${theme.fg("muted", `... (${totalLineCount - previewSource.length} earlier lines`)}${toolOutputDetailHint(theme, expanded, true)}${theme.fg("muted", ")")}\n${preview}`;
 	}
 	return withBranch(preview, theme);
 }
@@ -5596,7 +5604,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 		const dc = resolveDiffColors(theme);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
-			renderSplit(change.diff, change.language, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, diffWidth)
+			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded }, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, diffWidth)
 				.then((rendered) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`;
@@ -5615,7 +5623,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 				? Math.max(6, Math.floor(MAX_RENDER_LINES / Math.max(1, maxShown)))
 				: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
 			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change, index) =>
-				renderSplit(change.diff, change.language, previewLines, dc, diffWidth)
+				renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded }, previewLines, dc, diffWidth)
 					.then((rendered) => `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`)
 					.catch(() => `${index + 1}. ${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`),
 			)
@@ -5623,7 +5631,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					const remainder = preview.changes.length - maxShown;
 					const suffix = remainder > 0
-						? `\n${theme.fg("muted", `… ${remainder} more file patches${toolOutputDetailHint(theme, ctx.expanded, true)}`)}`
+						? `\n${theme.fg("muted", `… ${remainder} more file patches`)}${toolOutputDetailHint(theme, ctx.expanded, true)}`
 						: "";
 					const summary = `${preview.changes.length} files ${preview.summary}`;
 					ctx.state._applyPatchPreviewBody = `${summary}\n\n${sections.join("\n\n")}${suffix}`;
@@ -6548,7 +6556,7 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${lines.length} lines loaded`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			text += `\n${buildPreviewText(lines, false, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "))}`;
+			text += `\n${buildPreviewText(lines, false, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "), { toolExpanded: expanded })}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});
@@ -6610,7 +6618,7 @@ export default function (pi: ExtensionAPI) {
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(text, theme));
 			const collapsed = bashCollapsedLimit();
 			if (rewrite) text += `\n${formatRtkRewriteDetails(rewrite, theme)}`;
-			text += `\n${buildPreviewText(nonEmpty.lines, false, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line))}`;
+			text += `\n${buildPreviewText(nonEmpty.lines, false, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line), { toolExpanded: expanded })}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});
@@ -6650,7 +6658,7 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${matches.length} matches`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			text += `\n${buildPreviewText(matches, false, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line))}`;
+			text += `\n${buildPreviewText(matches, false, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line), { toolExpanded: expanded })}`;
 			return makeText(ctx.lastComponent, withBranch(text, theme));
 		},
 	});
@@ -6826,7 +6834,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.state._wdk = key;
 					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
 					const dc = resolveDiffColors(theme);
-					renderSplit(d.diff, d.language, previewLines, dc, diffWidth)
+					renderSplit(d.diff, d.language, { toolExpanded: ctx.expanded }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._wdk !== key) return;
 							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
@@ -6854,7 +6862,7 @@ export default function (pi: ExtensionAPI) {
 					ctx.state._nfk = pk;
 					ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
 					const dc = resolveDiffColors(theme);
-					renderUnified(syntheticDiff, lang(d.filePath), previewLines, dc, diffWidth)
+					renderUnified(syntheticDiff, lang(d.filePath), { toolExpanded: ctx.expanded }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._nfk !== pk) return;
 							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
