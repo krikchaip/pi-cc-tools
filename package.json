@@ -36,8 +36,9 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "test": "node --experimental-strip-types --test scripts/bash-command.test.ts",
-    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck extensions/index.ts extensions/spinner.ts",
+    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/index.ts extensions/spinner.ts scripts/test-generic-errors.ts",
+    "test": "node --experimental-strip-types --test scripts/bash-command.test.ts && npm run test:generic-errors",
+    "test:generic-errors": "bun scripts/test-generic-errors.ts",
     "test:mcp-renderer": "bun scripts/test-mcp-renderer.ts",
     "test:shell-settings": "bun scripts/test-shell-settings.ts",
     "pack:dry-run": "npm pack --dry-run",
