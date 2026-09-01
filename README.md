@@ -32,6 +32,7 @@ Claude Code inspired tool rendering for Pi — Shiki-powered diffs, status dots,
 - **Light Ghostty-sync themes** — edit/write diffs use `github-light` highlighting and light-tinted diff rows; tool pending dots use softer chrome colors
 - **Transparent edit/write diffs** with universal red/green diff colors
 - **Grouped consecutive tool calls** with a compact status header and per-tool glance rows (set `groupToolCalls: false` to disable)
+- **Optional fullscreen click expansion** for local tool headers, summaries, collapse controls, and progressive more-detail rows (set `clickExpansion: true` to enable)
 - **Extra detail toggle** with `Ctrl+Shift+O`, increasing expanded preview caps without making the default view heavy
 - **Mermaid diagrams** — preserves Pi 0.84's Unicode diagram renderer in styled assistant messages
 - **Terminal LaTeX** — renders standard math delimiters plus `latex`/`tex` fenced blocks as readable Unicode math
@@ -51,6 +52,7 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "expandedPreviewMaxLines": 4000,
   "extraExpandedPreviewMaxLines": 12000,
   "extraToolOutputExpanded": false,
+  "clickExpansion": false,
   "groupToolCalls": true,
   "bashOutputMode": "opencode",
   "bashCollapsedLines": 10,
@@ -119,12 +121,18 @@ The selection is persisted as `spinnerVerbColor` / `spinnerStatusColor` in `~/.p
 Use `/cc-tools` to control tool UI at runtime:
 
 ```text
-/cc-tools status          # show style, grouping, and extra-detail state
+/cc-tools status          # show style, grouping, click, and extra-detail state
 /cc-tools outlines        # tool style: outlines, transparent, or default
 /cc-tools group toggle    # toggle grouped adjacent/concurrent tool calls
 /cc-tools group off       # disable grouping (also ungroups current grouped rows)
+/cc-tools click on        # enable local click expansion in fullscreen mode
+/cc-tools click off       # disable click UI and collapse local click expansions
+/cc-tools click toggle    # toggle the current click setting
+/cc-tools click status    # report the current click setting
 /cc-tools detail toggle   # same mode as Ctrl+Shift+O
 ```
+
+Local click expansion preserves each renderer's normal first expanded view. For example, Read and Grep first show `previewLines`, and Bash first shows `bashCollapsedLines`. A truncation row keeps separate `click to collapse` and `click for more detail` actions. More-detail clicks then advance one execution through `expandedPreviewMaxLines` and `extraExpandedPreviewMaxLines`. In a tool group, local clicks change one child. The configured global expand key still expands or collapses all children and restores the keyboard labels.
 
 ### Output modes
 
@@ -140,9 +148,10 @@ Use `/cc-tools` to control tool UI at runtime:
 | Setting | Default | Description |
 |---------|---------|-------------|
 | `previewLines` | `8` | Lines shown in collapsed preview mode |
-| `expandedPreviewMaxLines` | `4000` | Max lines when expanded with Ctrl+O |
-| `extraExpandedPreviewMaxLines` | `12000` | Max lines after Ctrl+Shift+O extra-detail mode |
+| `expandedPreviewMaxLines` | `4000` | Standard expanded cap; also the first local more-detail layer after a short normal preview |
+| `extraExpandedPreviewMaxLines` | `12000` | Extra-detail cap; also the second local more-detail layer when content remains |
 | `extraToolOutputExpanded` | `false` | Start with Ctrl+Shift+O extra-detail mode enabled |
+| `clickExpansion` | `false` | Enable local click anchors in fullscreen mode. Global expanded mode restores baseline keyboard labels. |
 | `groupToolCalls` | `true` | Group adjacent/concurrent tool calls under a compact status header |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |
 | `liveToolPreview` | `true` | Show a small live output preview while tools are still running |

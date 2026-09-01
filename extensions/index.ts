@@ -13,6 +13,7 @@ import type {
 import {
 	AssistantMessageComponent,
 	CustomMessageComponent,
+	InteractiveMode,
 	ToolExecutionComponent,
 	UserMessageComponent,
 	keyHint,
@@ -42,6 +43,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import * as PiTui from "@earendil-works/pi-tui";
 
 import * as Diff from "diff";
 import type { BundledLanguage, BundledTheme } from "shiki";
@@ -68,7 +70,19 @@ const TOOL_IMAGE_EXPAND_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-r
 const CUSTOM_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-custom-message-render");
 const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-message-render");
 const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifications-v2");
+const TOOL_GROUP_MOUSE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-mouse-patch");
+const TOOL_GROUP_MODE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-mode-patch");
+const TOOL_CLICK_ANCHORS = Symbol.for("pi-claude-style-tools:tool-click-anchors");
+const TOOL_CLICK_OWNER = Symbol.for("pi-claude-style-tools:tool-click-owner");
+const TOOL_CLICK_GLOBAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-global-expanded");
+const TOOL_CLICK_LOCAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-local-expanded");
+const TOOL_CLICK_DETAIL_LEVEL = Symbol.for("pi-claude-style-tools:tool-click-detail-level");
+const CLICK_HINT_OPEN = "\uE100";
+const CLICK_HINT_SEPARATOR = "\uE101";
+const CLICK_HINT_CLOSE = "\uE102";
 const WRAP_MARK = "\u200B";
+const HEADER_WRAP_MARK = "\uE103";
+const CLICK_CONTROL_BREAK_MARK = "\uE104";
 const LEGACY_WRAP_MARK = "\uE000";
 const KITTY_IMAGE_PREFIX = "\x1b_G";
 const ITERM2_IMAGE_PREFIX = "\x1b]1337;File=";
@@ -93,6 +107,8 @@ interface SettingsFile {
 	expandedPreviewMaxLines?: number;
 	extraExpandedPreviewMaxLines?: number;
 	extraToolOutputExpanded?: boolean;
+	/** Enable local click expansion anchors in Fullscreen TUI mode. Defaults to false. */
+	clickExpansion?: boolean;
 	groupToolCalls?: boolean;
 	bashOutputMode?: "opencode" | "summary" | "preview";
 	bashCollapsedLines?: number;
@@ -845,9 +861,90 @@ function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecu
 	return value instanceof ToolExecutionComponent && !NON_GROUPABLE_TOOL_NAMES.has(getToolName(value));
 }
 
+type ToolGroupClickAnchor = {
+	line: number;
+	start: number;
+	end: number;
+	tool: any;
+	action: ToolClickAction;
+};
+
+function hasNativeMouseDispatch(): boolean {
+	return "MouseRegion" in PiTui;
+}
+
+type ToolClickDetailLevel = 0 | 1 | 2;
+
+type ToolClickStateSnapshot = {
+	expanded: boolean;
+	locallyExpanded: boolean;
+	detailLevel: ToolClickDetailLevel;
+};
+
+type ReversibleNativeClick = {
+	timer: ReturnType<typeof setTimeout>;
+	rollback(): void;
+};
+
+function captureToolClickState(tool: any): ToolClickStateSnapshot {
+	return {
+		expanded: tool?.expanded === true,
+		locallyExpanded: tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true,
+		detailLevel: toolLocalDetailLevel(tool),
+	};
+}
+
+function restoreToolClickState(tool: any, snapshot: ToolClickStateSnapshot): void {
+	if (!tool || typeof tool !== "object") return;
+	if (snapshot.locallyExpanded) tool[TOOL_CLICK_LOCAL_EXPANDED] = true;
+	else delete tool[TOOL_CLICK_LOCAL_EXPANDED];
+	if (tool.rendererState) setToolLocalDetailLevel(tool, snapshot.detailLevel);
+	clearToolRenderCache(tool);
+	if (tool.expanded !== snapshot.expanded) tool.setExpanded?.(snapshot.expanded);
+	else tool.updateDisplay?.();
+	tool.ui?.requestRender?.();
+}
+
+// A single click repaints immediately. This window exists only so a later
+// double/triple-click can restore the pre-click geometry for text selection.
+const NATIVE_CLICK_TIMERS = new WeakMap<object, ReversibleNativeClick>();
+function scheduleNativeSingleClick(
+	owner: object,
+	clickCount: number,
+	activate: () => boolean,
+	rollback: () => void,
+): any {
+	const pending = NATIVE_CLICK_TIMERS.get(owner);
+	if (pending) {
+		clearTimeout(pending.timer);
+		NATIVE_CLICK_TIMERS.delete(owner);
+		if (clickCount > 1) pending.rollback();
+	}
+	if (clickCount > 1) return undefined;
+	if (!activate()) return undefined;
+	const entry: ReversibleNativeClick = {
+		timer: undefined as unknown as ReturnType<typeof setTimeout>,
+		rollback,
+	};
+	entry.timer = setTimeout(() => {
+		if (NATIVE_CLICK_TIMERS.get(owner) !== entry) return;
+		NATIVE_CLICK_TIMERS.delete(owner);
+	}, 510);
+	unrefTimer(entry.timer);
+	NATIVE_CLICK_TIMERS.set(owner, entry);
+	return { handled: true };
+}
+
+function toolGroupClickGuidance(): string {
+	const theme = getGlobalPiTheme() as Theme | undefined;
+	if (!theme || typeof theme.fg !== "function") return " • click any for details";
+	return `${theme.fg("muted", " • ")}${theme.fg("dim", "click")}${theme.fg("muted", " any for details")}`;
+}
+
 class ToolGroupComponent extends Container {
 	private tools: any[] = [];
 	private expanded = false;
+	private clickAnchors: ToolGroupClickAnchor[] = [];
 	// Memoize full group output. Grouped history is the long-chat bottleneck:
 	// each warm frame used to re-render every child tool, re-branch lines, and
 	// re-clamp every row even when nothing changed.
@@ -856,6 +953,7 @@ class ToolGroupComponent extends Container {
 	private cachedEpoch?: number;
 	private cachedMode?: string;
 	private cachedExpanded?: boolean;
+	private cachedClickState?: string;
 	private cachedBlinkPhase?: boolean;
 	private cachedStatusKey?: string;
 	private cachedToolCount?: number;
@@ -863,10 +961,12 @@ class ToolGroupComponent extends Container {
 
 	private clearRenderCache(): void {
 		this.dirty = true;
+		this.clickAnchors = [];
 		this.cachedWidth = undefined;
 		this.cachedEpoch = undefined;
 		this.cachedMode = undefined;
 		this.cachedExpanded = undefined;
+		this.cachedClickState = undefined;
 		this.cachedBlinkPhase = undefined;
 		this.cachedStatusKey = undefined;
 		this.cachedToolCount = undefined;
@@ -901,9 +1001,15 @@ class ToolGroupComponent extends Container {
 		ACTIVE_TOOL_GROUPS.add(this);
 		this.tools.push(tool);
 		tool[COMPONENT_PARENT] = this;
+		// A new execution inherits the global group mode, not a locally expanded sibling.
+		tool.setExpanded?.(this.expanded);
 		// Don't cascade invalidate into every child — only drop our own cache.
 		// Child tools already rebuild via their own updateDisplay path.
 		this.clearRenderCache();
+	}
+
+	forEachTool(visitor: (tool: any) => void): void {
+		for (const tool of this.tools) visitor(tool);
 	}
 
 	releaseTools(): any[] {
@@ -929,9 +1035,57 @@ class ToolGroupComponent extends Container {
 		this.clearRenderCache();
 	}
 
+	private clickAnchorsEnabled(): boolean {
+		return !this.expanded && this.tools.some((tool) => toolClickExpansionActive(tool));
+	}
+
+	private clickTargetAtPoint(x: number, y: number): ToolGroupClickAnchor | undefined {
+		if (!this.clickAnchorsEnabled()) return undefined;
+		return this.clickAnchors.find((anchor) => (
+			y === anchor.line && x >= anchor.start && x < anchor.end
+		));
+	}
+
+	toolAtPoint(x: number, y: number): any | undefined {
+		return this.clickTargetAtPoint(x, y)?.tool;
+	}
+
+	actionAtPoint(x: number, y: number): ToolClickAction | undefined {
+		return this.clickTargetAtPoint(x, y)?.action;
+	}
+
+	toggleToolAtPoint(x: number, y: number): boolean {
+		const target = this.clickTargetAtPoint(x, y);
+		if (!target || !activateToolClickAction(target.tool, target.action)) return false;
+		this.clearRenderCache();
+		return true;
+	}
+
+	// Pi releases with MouseRegion export normalized local mouse events through
+	// component dispatch. Older releases use the raw SGR adapter installed below.
+	handleMouse(event: any): any {
+		if (
+			!hasNativeMouseDispatch()
+			|| event?.type !== "click"
+			|| event?.button !== "left"
+			|| event?.dragged === true
+			|| Boolean(event?.url)
+		) return undefined;
+		const tool = this.toolAtPoint(event.x, event.y);
+		if (!tool) return undefined;
+		const snapshot = captureToolClickState(tool);
+		return scheduleNativeSingleClick(
+			this,
+			Number(event.clickCount ?? 1),
+			() => this.toggleToolAtPoint(event.x, event.y),
+			() => restoreToolClickState(tool, snapshot),
+		);
+	}
+
 	render(width: number): string[] {
 		if (this.tools.length === 0) return [];
 		const safeWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
+		const clickState = `${clickVisualEpoch}:${this.clickAnchorsEnabled() ? 1 : 0}`;
 		// Fast path: settled groups with a valid memo skip ALL child walks.
 		// Child mutations mark dirty via clearToolRenderCache → invalidate().
 		if (
@@ -941,6 +1095,7 @@ class ToolGroupComponent extends Container {
 			&& this.cachedEpoch === _toolBranchVisualEpoch
 			&& this.cachedMode === toolBackgroundMode
 			&& this.cachedExpanded === this.expanded
+			&& this.cachedClickState === clickState
 		) {
 			return this.cachedLines;
 		}
@@ -966,14 +1121,20 @@ class ToolGroupComponent extends Container {
 		if (status.success) countParts.push(statusText("success", status.success));
 		if (status.error) countParts.push(statusText("error", status.error));
 		const countsText = countParts.join(`${TRANSPARENT_RESET} • `);
-		const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${toolOutputDetailHint(undefined, this.expanded, true)}`;
+		const clicksEnabled = this.clickAnchorsEnabled();
+		const detailHint = clicksEnabled
+			? toolGroupClickGuidance()
+			: baselineToolOutputDetailHint(undefined, this.expanded, true);
+		const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${detailHint}`;
 		const lines = [" ".repeat(safeWidth), clampLineWidth(summary, safeWidth)];
 		const childWidth = Math.max(1, safeWidth - 6);
 		const total = this.tools.length;
+		this.clickAnchors = [];
 
 		for (let index = 0; index < total; index++) {
 			const tool = this.tools[index];
-			const rawLines = this.expanded
+			const childExpanded = this.expanded || Boolean(tool.expanded);
+			const rawLines = childExpanded
 				? getExpandedToolGroupLines(tool, childWidth, groupedName ? label : undefined)
 				: [getCompactToolLine(tool, childWidth, groupedName ? label : undefined)];
 			const branched = formatBranchedToolLines(
@@ -984,6 +1145,38 @@ class ToolGroupComponent extends Container {
 				getToolStatusForGroup(tool),
 				{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
 			);
+			if (clicksEnabled && branched.length > 0) {
+				const callRows = tool.callRendererComponent instanceof ToolText
+					? tool.callRendererComponent.getSemanticRows().filter((row: ToolTextSemanticRow) => row.action === "header").length
+					: 0;
+				const headerRows = childExpanded ? Math.max(1, callRows) : branched.length;
+				for (let row = 0; row < Math.min(headerRows, branched.length); row++) {
+					const start = clickAnchorStart(branched[row]);
+					const end = visibleWidth(stripAnsi(branched[row]).trimEnd());
+					if (end > start) this.clickAnchors.push({ line: lines.length + row, start, end, tool, action: "header" });
+				}
+				if (childExpanded && tool.resultRendererComponent instanceof ToolText) {
+					for (const semantic of tool.resultRendererComponent.getSemanticRows()) {
+						if (semantic.action === "header") continue;
+						const needle = semantic.anchorText ?? stripAnsi(semantic.text).trim();
+						if (!needle) continue;
+						// Group formatting removes nested status bullets. Use the visible click phrase
+						// as a matching fallback, but keep the full semantic row as the action area.
+						const clickPhrase = /click (?:to (?:expand|collapse)|for (?:more|less) detail)/.exec(needle)?.[0];
+						const row = branched.findIndex((line, lineIndex) => {
+							if (lineIndex < headerRows) return false;
+							const plain = stripAnsi(line);
+							return plain.includes(needle) || (clickPhrase !== undefined && plain.includes(clickPhrase));
+						});
+						if (row < 0) continue;
+						const plain = stripAnsi(branched[row]);
+						const targetIndex = semantic.anchorText ? plain.indexOf(semantic.anchorText) : -1;
+						const start = targetIndex >= 0 ? visibleWidth(plain.slice(0, targetIndex)) : clickAnchorStart(branched[row]);
+						const end = targetIndex >= 0 ? start + visibleWidth(semantic.anchorText!) : visibleWidth(plain.trimEnd());
+						if (end > start) this.clickAnchors.push({ line: lines.length + row, start, end, tool, action: semantic.action });
+					}
+				}
+			}
 			for (let i = 0; i < branched.length; i++) {
 				lines.push(clampLineWidth(branched[i], safeWidth));
 			}
@@ -996,6 +1189,7 @@ class ToolGroupComponent extends Container {
 			this.cachedEpoch = _toolBranchVisualEpoch;
 			this.cachedMode = toolBackgroundMode;
 			this.cachedExpanded = this.expanded;
+			this.cachedClickState = clickState;
 			this.cachedBlinkPhase = true;
 			this.cachedStatusKey = status.key;
 			this.cachedToolCount = total;
@@ -1007,8 +1201,301 @@ class ToolGroupComponent extends Container {
 	}
 }
 
+type SgrMouseEvent = {
+	button: number;
+	x: number;
+	y: number;
+	release: boolean;
+};
+
+type ToolGroupMouseTarget = {
+	component: any;
+	action: ToolClickAction;
+	activate(): boolean;
+};
+
+type ToolGroupLayoutBox = {
+	component: unknown;
+	rect: { x: number; y: number; width: number; height: number };
+	clip: { x: number; y: number; width: number; height: number };
+	children: ToolGroupLayoutBox[];
+};
+
+type ToolGroupFullscreenRenderer = {
+	currentLayout?: { root: ToolGroupLayoutBox };
+	hasOverlay?: () => boolean;
+	hasOverlayEntries?: boolean;
+	handleViewportInput(data: string): unknown;
+	requestRender(): void;
+	selectionAnchor?: unknown;
+	selectionFocus?: unknown;
+	selectionGranularity?: string;
+	selectionInitialRange?: unknown;
+	selectionPressActive?: boolean;
+	selectionDragged?: boolean;
+	pressedUrl?: string;
+	stopSelectionAutoScroll?: () => void;
+};
+
+type ToolGroupInteractiveMode = {
+	renderer: ToolGroupFullscreenRenderer;
+	ui: { [TOOL_CLICK_GLOBAL_EXPANDED]?: boolean };
+	toolOutputExpanded?: boolean;
+	documentContainer: { render(width: number): string[] };
+	headerContainer: { render(width: number): string[] };
+	loadedResourcesContainer: { render(width: number): string[] };
+	chatContainer: { children: any[] };
+	renderInitialMessages(): void;
+	setToolsExpanded(expanded: boolean): void;
+	switchTuiMode(mode: "regular" | "fullscreen", restoreProgress?: boolean, startRenderer?: boolean): boolean;
+};
+
+let activeClickInteractiveMode: ToolGroupInteractiveMode | undefined;
+
+type ToolGroupMousePatchState = {
+	modes: WeakMap<object, ToolGroupInteractiveMode>;
+	press?: { x: number; y: number; target?: ToolGroupMouseTarget; moved: boolean; blocked: boolean };
+	pendingClick?: {
+		timer: ReturnType<typeof setTimeout>;
+		target: ToolGroupMouseTarget;
+		renderer: ToolGroupFullscreenRenderer;
+		x: number;
+		y: number;
+		rollback(): void;
+	};
+	targetAt?: (
+		renderer: ToolGroupFullscreenRenderer,
+		mode: ToolGroupInteractiveMode,
+		x: number,
+		y: number,
+	) => ToolGroupMouseTarget | undefined;
+};
+
+function parseToolGroupSgrMouseEvent(data: string): SgrMouseEvent | undefined {
+	const match = /^\x1b\[<(\d+);(\d+);(\d+)([Mm])$/.exec(data);
+	if (!match) return undefined;
+	return {
+		button: Number.parseInt(match[1], 10),
+		x: Number.parseInt(match[2], 10) - 1,
+		y: Number.parseInt(match[3], 10) - 1,
+		release: match[4] === "m",
+	};
+}
+
+function toolGroupBoxContains(box: ToolGroupLayoutBox["rect"], x: number, y: number): boolean {
+	return x >= box.x && x < box.x + box.width && y >= box.y && y < box.y + box.height;
+}
+
+function findToolGroupLayoutBox(
+	box: ToolGroupLayoutBox,
+	component: unknown,
+): ToolGroupLayoutBox | undefined {
+	if (box.component === component) return box;
+	for (const child of box.children ?? []) {
+		const match = findToolGroupLayoutBox(child, component);
+		if (match) return match;
+	}
+	return undefined;
+}
+
+function toolGroupAtScreenPoint(
+	renderer: ToolGroupFullscreenRenderer,
+	mode: ToolGroupInteractiveMode,
+	x: number,
+	y: number,
+): ToolGroupMouseTarget | undefined {
+	const frame = renderer.currentLayout;
+	if (!frame || renderer.hasOverlay?.() || renderer.hasOverlayEntries) return undefined;
+	const documentBox = findToolGroupLayoutBox(frame.root, mode.documentContainer);
+	if (!documentBox || !toolGroupBoxContains(documentBox.clip, x, y)) return undefined;
+
+	const width = documentBox.rect.width;
+	let row = documentBox.rect.y
+		+ mode.headerContainer.render(width).length
+		+ mode.loadedResourcesContainer.render(width).length;
+	for (const component of mode.chatContainer.children) {
+		const height = component.render(width).length;
+		const localX = x - documentBox.rect.x;
+		const localY = y - row;
+		if (isToolGroupComponent(component)) {
+			const tool = component.toolAtPoint(localX, localY);
+			const action = component.actionAtPoint(localX, localY);
+			if (tool && action) {
+				return {
+					component: tool,
+					action,
+					activate: () => component.toggleToolAtPoint(localX, localY),
+				};
+			}
+		} else if (component instanceof ToolExecutionComponent) {
+			const action = (component as any).clickActionAtPoint?.(localX, localY) as ToolClickAction | undefined;
+			if (action) {
+				return {
+					component,
+					action,
+					activate: () => (component as any).activateClickAction?.(action) === true,
+				};
+			}
+		}
+		row += height;
+	}
+	return undefined;
+}
+
+function clearToolGroupMouseSelection(renderer: ToolGroupFullscreenRenderer): void {
+	renderer.stopSelectionAutoScroll?.();
+	renderer.selectionPressActive = false;
+	renderer.selectionAnchor = undefined;
+	renderer.selectionFocus = undefined;
+	renderer.selectionGranularity = "character";
+	renderer.selectionInitialRange = undefined;
+	renderer.selectionDragged = false;
+	renderer.pressedUrl = undefined;
+}
+
+function installToolGroupMouseAdapter(): void {
+	const nativeMouseDispatch = hasNativeMouseDispatch();
+	const fullscreenPrototype = (PiTui as any).TuiAltScreen?.prototype as (
+		ToolGroupFullscreenRenderer & { [TOOL_GROUP_MOUSE_PATCH_FLAG]?: ToolGroupMousePatchState }
+	) | undefined;
+	if (!fullscreenPrototype) return;
+
+	let state = fullscreenPrototype[TOOL_GROUP_MOUSE_PATCH_FLAG];
+	if (!state) {
+		state = { modes: new WeakMap() };
+		fullscreenPrototype[TOOL_GROUP_MOUSE_PATCH_FLAG] = state;
+		if (!nativeMouseDispatch) {
+		const originalHandleViewportInput = fullscreenPrototype.handleViewportInput;
+		fullscreenPrototype.handleViewportInput = function (this: ToolGroupFullscreenRenderer, data: string) {
+			const event = parseToolGroupSgrMouseEvent(data);
+			const mode = state!.modes.get(this);
+			const isLeftButton = event !== undefined && (event.button & 3) === 0;
+			if (event && isLeftButton && !event.release && (event.button & 32) === 0) {
+				const pending = state!.pendingClick;
+				if (pending && pending.x === event.x && pending.y === event.y) {
+					clearTimeout(pending.timer);
+					state!.pendingClick = undefined;
+					pending.rollback();
+					// Rebuild geometry before Pi resolves the second press as a word or
+					// line selection. doRender is synchronous in the raw-SGR host.
+					(this as any).doRender?.();
+				}
+				state!.press = {
+					x: event.x,
+					y: event.y,
+					target: mode ? state!.targetAt?.(this, mode, event.x, event.y) : undefined,
+					moved: false,
+					blocked: false,
+				};
+			} else if (event && (event.button & 32) !== 0 && state!.press) {
+				if (event.x !== state!.press.x || event.y !== state!.press.y) state!.press.moved = true;
+			}
+
+			const result = originalHandleViewportInput.call(this, data);
+			if (event && isLeftButton && !event.release && (event.button & 32) === 0 && state!.press) {
+				state!.press.blocked = this.selectionGranularity !== "character" || Boolean(this.pressedUrl);
+			}
+			if (event?.release) {
+				const press = state!.press;
+				state!.press = undefined;
+				const target = mode ? state!.targetAt?.(this, mode, event.x, event.y) : undefined;
+				if (
+					isLeftButton
+					&& press
+					&& !press.moved
+					&& !press.blocked
+					&& this.selectionGranularity === "character"
+					&& press.x === event.x
+					&& press.y === event.y
+					&& press.target?.component === target?.component
+					&& press.target?.action === target?.action
+					&& target
+				) {
+					const snapshot = captureToolClickState(target.component);
+					clearToolGroupMouseSelection(this);
+					if (target.activate()) {
+						this.requestRender();
+						const pending = {
+							timer: undefined as unknown as ReturnType<typeof setTimeout>,
+							target,
+							renderer: this,
+							x: event.x,
+							y: event.y,
+							rollback: () => restoreToolClickState(target.component, snapshot),
+						};
+						pending.timer = setTimeout(() => {
+							if (state!.pendingClick !== pending) return;
+							state!.pendingClick = undefined;
+						}, 510);
+						unrefTimer(pending.timer);
+						state!.pendingClick = pending;
+					}
+				}
+			}
+			return result;
+		};
+		}
+	}
+	state.targetAt = toolGroupAtScreenPoint;
+
+	const interactivePrototype = InteractiveMode.prototype as any;
+	if (interactivePrototype[TOOL_GROUP_MODE_PATCH_FLAG]) return;
+	interactivePrototype[TOOL_GROUP_MODE_PATCH_FLAG] = state;
+	const originalRenderInitialMessages = interactivePrototype.renderInitialMessages;
+	interactivePrototype.renderInitialMessages = function (this: ToolGroupInteractiveMode) {
+		this.ui[TOOL_CLICK_GLOBAL_EXPANDED] = this.toolOutputExpanded === true;
+		activeClickInteractiveMode = this;
+		state!.modes.set(this.renderer, this);
+		return originalRenderInitialMessages.apply(this, arguments as any);
+	};
+	const originalSetToolsExpanded = interactivePrototype.setToolsExpanded;
+	interactivePrototype.setToolsExpanded = function (this: ToolGroupInteractiveMode, expanded: boolean) {
+		const changed = this.toolOutputExpanded !== expanded;
+		this.ui[TOOL_CLICK_GLOBAL_EXPANDED] = expanded;
+		const result = originalSetToolsExpanded.apply(this, arguments as any);
+		if (changed) resetLocalClickStates(this, false);
+		else clickVisualEpoch++;
+		return result;
+	};
+	const originalSwitchTuiMode = interactivePrototype.switchTuiMode;
+	interactivePrototype.switchTuiMode = function (this: ToolGroupInteractiveMode) {
+		const switched = originalSwitchTuiMode.apply(this, arguments as any);
+		if (switched) {
+			activeClickInteractiveMode = this;
+			this.ui[TOOL_CLICK_GLOBAL_EXPANDED] = this.toolOutputExpanded === true;
+			state!.modes.set(this.renderer, this);
+		}
+		return switched;
+	};
+}
+
 function isToolGroupComponent(value: unknown): value is ToolGroupComponent {
 	return value instanceof ToolGroupComponent;
+}
+
+function forEachModeTool(mode: ToolGroupInteractiveMode | undefined, visitor: (tool: any) => void): void {
+	if (!mode) return;
+	for (const component of mode.chatContainer.children) {
+		if (component instanceof ToolExecutionComponent) visitor(component);
+		else if (isToolGroupComponent(component)) component.forEachTool(visitor);
+	}
+}
+
+function resetLocalClickStates(mode: ToolGroupInteractiveMode | undefined, collapseLocal: boolean): void {
+	const groups = new Set<ToolGroupComponent>();
+	forEachModeTool(mode, (tool) => {
+		const locallyExpanded = tool[TOOL_CLICK_LOCAL_EXPANDED] === true;
+		const detailLevel = toolLocalDetailLevel(tool);
+		delete tool[TOOL_CLICK_LOCAL_EXPANDED];
+		setToolLocalDetailLevel(tool, 0);
+		if (collapseLocal && locallyExpanded) tool.setExpanded?.(false);
+		else if (detailLevel > 0) tool.updateDisplay?.();
+		clearToolRenderCache(tool);
+		const parent = tool[COMPONENT_PARENT];
+		if (isToolGroupComponent(parent)) groups.add(parent);
+	});
+	for (const group of groups) group.invalidate();
+	clickVisualEpoch++;
 }
 
 function isIgnorableToolSeparator(value: unknown): boolean {
@@ -1137,12 +1624,14 @@ function patchGlobalToolBorders(): void {
 			syncToolOutputPad(this, outputPad);
 			const cached = (this as any)[TOOL_RENDER_CACHE];
 			const branchKey = toolBranchRenderCacheKey();
+			const clickKey = toolClickStateKey(this);
 			if (
 				cached?.width === width
 				&& cached?.mode === toolBackgroundMode
 				&& cached?.outputPad === outputPad
 				&& cached?.branchKey === branchKey
 				&& cached?.branchEpoch === _toolBranchVisualEpoch
+				&& cached?.clickKey === clickKey
 			) {
 				return cached.lines;
 			}
@@ -1156,6 +1645,7 @@ function patchGlobalToolBorders(): void {
 			outputPad: readPiOutputPad(),
 			branchKey: toolBranchRenderCacheKey(),
 			branchEpoch: _toolBranchVisualEpoch,
+			clickKey: toolClickStateKey(this),
 		};
 		if (toolBackgroundMode === "default") {
 			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
@@ -1213,6 +1703,17 @@ function hashText(text: string): string {
 }
 
 let extraToolOutputExpanded = false;
+let localDetailRenderTool: any;
+let clickVisualEpoch = 0;
+
+type ToolClickAction = "header" | "expand" | "detail" | "detail-extra";
+
+type ToolClickAnchor = {
+	line: number;
+	start: number;
+	end: number;
+	action: ToolClickAction;
+};
 
 function syncExtraToolDetailMode(): void {
 	extraToolOutputExpanded = readSettings().extraToolOutputExpanded === true;
@@ -1221,6 +1722,64 @@ function syncExtraToolDetailMode(): void {
 function setExtraToolDetailMode(enabled: boolean): void {
 	extraToolOutputExpanded = enabled;
 	writeSettingsKey("extraToolOutputExpanded", enabled);
+	clickVisualEpoch++;
+}
+
+function clickExpansionEnabled(): boolean {
+	return readSettings().clickExpansion === true;
+}
+
+function toolGlobalExpansionActive(tool: any): boolean {
+	return tool?.ui?.[TOOL_CLICK_GLOBAL_EXPANDED] === true;
+}
+
+function toolClickExpansionActive(tool: any): boolean {
+	return clickExpansionEnabled()
+		&& tool?.ui?.mode === "fullscreen"
+		&& !toolGlobalExpansionActive(tool);
+}
+
+function normalizeToolClickDetailLevel(value: unknown): ToolClickDetailLevel {
+	return value === 1 || value === 2 ? value : 0;
+}
+
+function toolLocalDetailLevel(tool: any): ToolClickDetailLevel {
+	return normalizeToolClickDetailLevel(tool?.rendererState?.[TOOL_CLICK_DETAIL_LEVEL]);
+}
+
+function setToolLocalDetailLevel(tool: any, level: ToolClickDetailLevel): void {
+	if (!tool?.rendererState) return;
+	if (level === 0) delete tool.rendererState[TOOL_CLICK_DETAIL_LEVEL];
+	else tool.rendererState[TOOL_CLICK_DETAIL_LEVEL] = level;
+}
+
+function toolUsesTieredTextPreview(tool: any): boolean {
+	return tool?.toolName === "read" || tool?.toolName === "grep" || tool?.toolName === "bash";
+}
+
+function toolSupportsProgressiveLocalDetail(tool: any): boolean {
+	const name = typeof tool?.toolName === "string" ? tool.toolName.toLowerCase() : "";
+	return toolUsesTieredTextPreview(tool)
+		|| name === "write"
+		|| name === "edit"
+		|| name === "apply_patch"
+		|| name === "find"
+		|| name === "ls"
+		|| name === "tasklist";
+}
+
+function tieredToolNormalPreviewLimit(tool: any): number {
+	return tool?.toolName === "bash" ? bashCollapsedLimit() : previewLimit();
+}
+
+function nextToolLocalDetailLevel(tool: any): ToolClickDetailLevel {
+	const current = toolLocalDetailLevel(tool);
+	if (toolSupportsProgressiveLocalDetail(tool)) return current === 0 ? 1 : 2;
+	return current === 0 ? 2 : 0;
+}
+
+function toolClickStateKey(tool: any): string {
+	return `${clickVisualEpoch}:${toolClickExpansionActive(tool) ? 1 : 0}:${toolLocalDetailLevel(tool)}`;
 }
 
 function configuredKeyHint(binding: Parameters<typeof keyText>[0], fallbackKey: string, description: string): string {
@@ -1238,15 +1797,99 @@ function expandHint(theme: Theme | undefined, action: "expand" | "collapse" = "e
 	return `${hintSeparator(theme, "muted")}${configuredKeyHint("app.tools.expand", "ctrl+o", `to ${action}`)}`;
 }
 
-function deepExpandHint(theme: Theme | undefined, separatorColor: "muted" | "warning" = "muted"): string {
+function baselineDeepExpandHint(theme: Theme | undefined, separatorColor: "muted" | "warning" = "muted"): string {
 	return `${hintSeparator(theme, separatorColor)}${rawKeyHint("ctrl+shift+o", extraToolOutputExpanded ? "less detail" : "more detail")}`;
 }
 
-function toolOutputDetailHint(theme: Theme | undefined, expanded: boolean, hasMore = false): string {
+function encodedClickHint(action: "expand" | "detail" | "detail-extra" | "none", fallback: string): string {
+	return `${CLICK_HINT_OPEN}${action}${CLICK_HINT_SEPARATOR}${fallback}${CLICK_HINT_CLOSE}`;
+}
+
+function deepExpandHint(
+	theme: Theme | undefined,
+	separatorColor: "muted" | "warning" = "muted",
+	progressiveDetail = false,
+): string {
+	return encodedClickHint(progressiveDetail ? "detail" : "detail-extra", baselineDeepExpandHint(theme, separatorColor));
+}
+
+function localCollapseActionHint(theme: Theme | undefined): string {
+	return encodedClickHint("expand", expandHint(theme, "collapse"));
+}
+
+function baselineToolOutputDetailHint(theme: Theme | undefined, expanded: boolean, hasMore = false): string {
 	if (!expanded) return expandHint(theme, "expand");
 	const parts = [expandHint(theme, "collapse")];
-	if (hasMore || extraToolOutputExpanded) parts.push(deepExpandHint(theme));
+	if (hasMore || extraToolOutputExpanded) parts.push(baselineDeepExpandHint(theme));
 	return parts.join("");
+}
+
+function toolOutputDetailHint(
+	theme: Theme | undefined,
+	expanded: boolean,
+	hasMore = false,
+	localDetailEnabled = true,
+	progressiveDetail = false,
+): string {
+	const fallback = baselineToolOutputDetailHint(theme, expanded, hasMore);
+	if (!expanded) return encodedClickHint("expand", fallback);
+	if (!hasMore && !extraToolOutputExpanded) return encodedClickHint("none", fallback);
+	if (progressiveDetail) {
+		return encodedClickHint(localDetailEnabled ? "detail" : "none", fallback);
+	}
+	const collapse = encodedClickHint("expand", expandHint(theme, "collapse"));
+	const detail = localDetailEnabled
+		? encodedClickHint("detail-extra", baselineDeepExpandHint(theme))
+		: baselineDeepExpandHint(theme);
+	return `${collapse}${detail}`;
+}
+
+function clickHintText(action: "expand" | "detail" | "detail-extra", tool: any): string {
+	const theme = getGlobalPiTheme() as Theme | undefined;
+	const separator = theme ? theme.fg("muted", " • ") : " • ";
+	const click = theme ? theme.fg("dim", "click") : "click";
+	const description = action === "expand"
+		? tool?.expanded === true ? " to collapse" : " to expand"
+		: action === "detail-extra" && toolLocalDetailLevel(tool) === 2 ? " for less detail" : " for more detail";
+	return `${separator}${click}${theme ? theme.fg("muted", description) : description}`;
+}
+
+type ResolvedClickAnchor = { action: "expand" | "detail" | "detail-extra"; text: string };
+
+function resolveClickHints(text: string, tool: any): { text: string; anchors: ResolvedClickAnchor[] } {
+	let output = "";
+	let cursor = 0;
+	const anchors: ResolvedClickAnchor[] = [];
+	while (cursor < text.length) {
+		const open = text.indexOf(CLICK_HINT_OPEN, cursor);
+		if (open < 0) {
+			output += text.slice(cursor);
+			break;
+		}
+		output += text.slice(cursor, open);
+		const separator = text.indexOf(CLICK_HINT_SEPARATOR, open + CLICK_HINT_OPEN.length);
+		const close = separator < 0 ? -1 : text.indexOf(CLICK_HINT_CLOSE, separator + CLICK_HINT_SEPARATOR.length);
+		if (separator < 0 || close < 0) {
+			output += text.slice(open);
+			break;
+		}
+		const action = text.slice(open + CLICK_HINT_OPEN.length, separator) as "expand" | "detail" | "detail-extra" | "none";
+		const fallback = text.slice(separator + CLICK_HINT_SEPARATOR.length, close);
+		if (!toolClickExpansionActive(tool)) {
+			output += fallback;
+		} else if (action === "expand") {
+			const hint = clickHintText("expand", tool);
+			output += hint;
+			anchors.push({ action: "expand", text: stripAnsi(hint).trim() });
+		} else if ((action === "detail" || action === "detail-extra") && (!extraToolOutputExpanded || tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true)) {
+			const hint = clickHintText(action, tool);
+			if (anchors.some((anchor) => anchor.action === "expand")) output += CLICK_CONTROL_BREAK_MARK;
+			output += hint;
+			anchors.push({ action, text: stripAnsi(hint).trim() });
+		}
+		cursor = close + CLICK_HINT_CLOSE.length;
+	}
+	return { text: output, anchors };
 }
 
 function clearStateKeys(state: Record<string, unknown> | undefined, ...keys: string[]): void {
@@ -2248,9 +2891,14 @@ function patchToolRenderCacheInvalidation(): void {
 			if (method === "updateDisplay" || method === "updateResult" || method === "invalidate") {
 				syncLiveToolRenderState(this);
 			}
-			const result = original.apply(this, args);
-			clearToolRenderCache(this);
-			return result;
+			const previousDetailTool = localDetailRenderTool;
+			if (method === "updateDisplay") localDetailRenderTool = this;
+			try {
+				return original.apply(this, args);
+			} finally {
+				localDetailRenderTool = previousDetailTool;
+				clearToolRenderCache(this);
+			}
 		};
 	}
 
@@ -2292,6 +2940,72 @@ function patchReadImageExpansion(): void {
 	proto[TOOL_IMAGE_EXPAND_PATCH_FLAG] = true;
 }
 
+function clickAnchorStart(line: string): number {
+	const plain = stripAnsi(line);
+	const leading = plain.match(/^\s*/)?.[0] ?? "";
+	let start = visibleWidth(leading);
+	let rest = plain.slice(leading.length);
+	let branch = /^(?:├|└|│)(?:─{1,2})?\s+/.exec(rest);
+	while (branch) {
+		start += visibleWidth(branch[0]);
+		rest = rest.slice(branch[0].length);
+		branch = /^(?:├|└|│)(?:─{1,2})?\s+/.exec(rest);
+	}
+	const status = /^[●⬤•·✓✗○◐]\s+/.exec(rest);
+	if (status) start += visibleWidth(status[0]);
+	return start;
+}
+
+function updateToolClickAnchors(tool: any, rendered: string[]): void {
+	if (!toolClickExpansionActive(tool)) {
+		tool[TOOL_CLICK_ANCHORS] = [];
+		return;
+	}
+	const components = [tool.callRendererComponent, tool.resultRendererComponent]
+		.filter((component): component is ToolText => component instanceof ToolText);
+	const anchors: ToolClickAnchor[] = [];
+	for (const component of components) {
+		for (const semantic of component.getSemanticRows()) {
+			const needle = semantic.anchorText ?? stripAnsi(semantic.text).trim();
+			if (!needle) continue;
+			const matched = rendered.findIndex((line) => stripAnsi(line).includes(needle));
+			if (matched < 0) continue;
+			const plain = stripAnsi(rendered[matched]);
+			const targetIndex = semantic.anchorText ? plain.indexOf(semantic.anchorText) : -1;
+			const start = targetIndex >= 0 ? visibleWidth(plain.slice(0, targetIndex)) : clickAnchorStart(rendered[matched]);
+			const end = targetIndex >= 0 ? start + visibleWidth(semantic.anchorText!) : visibleWidth(plain.trimEnd());
+			if (end > start) anchors.push({ line: matched, start, end, action: semantic.action });
+		}
+	}
+	tool[TOOL_CLICK_ANCHORS] = anchors;
+}
+
+function activateToolClickAction(tool: any, action: ToolClickAction): boolean {
+	if (!toolClickExpansionActive(tool)) return false;
+	if (action === "detail" || action === "detail-extra") {
+		if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
+		tool[TOOL_CLICK_LOCAL_EXPANDED] = true;
+		const nextLevel = action === "detail-extra"
+			? toolLocalDetailLevel(tool) === 2 ? 0 : 2
+			: nextToolLocalDetailLevel(tool);
+		setToolLocalDetailLevel(tool, nextLevel);
+		clearToolRenderCache(tool);
+		tool.updateDisplay?.();
+	} else {
+		const next = !Boolean(tool.expanded);
+		if (next) {
+			tool[TOOL_CLICK_LOCAL_EXPANDED] = true;
+		} else {
+			delete tool[TOOL_CLICK_LOCAL_EXPANDED];
+			setToolLocalDetailLevel(tool, 0);
+		}
+		clearToolRenderCache(tool);
+		tool.setExpanded?.(next);
+	}
+	tool.ui?.requestRender?.();
+	return true;
+}
+
 function patchToolExecutionRenderers(): void {
 	const proto = ToolExecutionComponent.prototype as any;
 	if (proto[TOOL_EXECUTION_PATCH_FLAG]) return;
@@ -2305,9 +3019,44 @@ function patchToolExecutionRenderers(): void {
 	if (typeof originalRender === "function") {
 		proto.render = function patchedToolExecutionRender(width: number): string[] {
 			syncToolOutputPad(this, readPiOutputPad());
-			return originalRender.call(this, width);
+			for (const component of [this.callRendererComponent, this.resultRendererComponent]) {
+				if (component instanceof ToolText) (component as any)[TOOL_CLICK_OWNER] = this;
+			}
+			const rendered = originalRender.call(this, width);
+			updateToolClickAnchors(this, rendered);
+			return rendered;
 		};
 	}
+
+	proto.clickActionAtPoint = function clickActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+		if (!toolClickExpansionActive(this)) return undefined;
+		return (this[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined)?.find((anchor) => (
+			y === anchor.line && x >= anchor.start && x < anchor.end
+		))?.action;
+	};
+
+	proto.activateClickAction = function activateClickAction(action: ToolClickAction): boolean {
+		return activateToolClickAction(this, action);
+	};
+
+	proto.handleMouse = function handleToolMouse(event: any): any {
+		if (
+			!hasNativeMouseDispatch()
+			|| event?.type !== "click"
+			|| event?.button !== "left"
+			|| event?.dragged === true
+			|| Boolean(event?.url)
+		) return undefined;
+		const action = this.clickActionAtPoint(event.x, event.y);
+		if (!action) return undefined;
+		const snapshot = captureToolClickState(this);
+		return scheduleNativeSingleClick(
+			this,
+			Number(event.clickCount ?? 1),
+			() => this.activateClickAction(action),
+			() => restoreToolClickState(this, snapshot),
+		);
+	};
 
 	if (typeof originalHasRendererDefinition === "function") {
 		proto.hasRendererDefinition = function patchedHasRendererDefinition() {
@@ -2395,7 +3144,7 @@ function toolHeader(tool: string, summary: string, theme: Theme, prefix = "", tr
 	applyThemePaletteIfNeeded(theme);
 	const label = theme.fg("toolTitle", theme.bold(tool));
 	const body = summary
-		? `${label} ${WRAP_MARK}${theme.fg("accent", summary)}`
+		? `${label} ${HEADER_WRAP_MARK}${theme.fg("accent", summary)}`
 		: label;
 	return trailing ? `${prefix}${body}${trailing}` : `${prefix}${body}`;
 }
@@ -2693,6 +3442,18 @@ function withFinalBranchBlock(content: string, theme: Theme, isError = false): s
 	return [branchLead(first, true, theme), ...middle, branchLead(last, false, theme)].join("\n");
 }
 
+function appendLocalCollapseAction(content: string, theme: Theme, enabled: boolean): string {
+	return enabled ? `${content}\n${localCollapseActionHint(theme)}` : content;
+}
+
+function withProgressivePreviewBranch(content: string, theme: Theme, finalCollapse: boolean): string {
+	return finalCollapse ? withFinalBranchBlock(content, theme) : withBranch(content, theme);
+}
+
+function withContinuedProgressiveBranch(content: string, theme: Theme, finalCollapse: boolean): string {
+	return finalCollapse ? withFinalBranchBlock(content, theme) : withBranch(content, theme, false, true);
+}
+
 function indentBranchBlock(block: string): string {
 	return block
 		.split("\n")
@@ -2960,16 +3721,14 @@ function markedContinuationPrefix(prefix: string): string {
 }
 
 function stripWrapMarks(text: string): string {
-	return text.replaceAll(WRAP_MARK, "").replaceAll(LEGACY_WRAP_MARK, "");
+	return text.replaceAll(WRAP_MARK, "").replaceAll(HEADER_WRAP_MARK, "").replaceAll(LEGACY_WRAP_MARK, "");
 }
 
 function findWrapMark(line: string): { index: number; mark: string } | undefined {
-	const current = line.indexOf(WRAP_MARK);
-	const legacy = line.indexOf(LEGACY_WRAP_MARK);
-	if (current === -1 && legacy === -1) return undefined;
-	if (current === -1) return { index: legacy, mark: LEGACY_WRAP_MARK };
-	if (legacy === -1 || current < legacy) return { index: current, mark: WRAP_MARK };
-	return { index: legacy, mark: LEGACY_WRAP_MARK };
+	return [WRAP_MARK, HEADER_WRAP_MARK, LEGACY_WRAP_MARK]
+		.map((mark) => ({ index: line.indexOf(mark), mark }))
+		.filter((candidate) => candidate.index >= 0)
+		.sort((left, right) => left.index - right.index)[0];
 }
 
 function wrapMarkedLine(line: string, width: number): string[] {
@@ -2984,13 +3743,32 @@ function wrapMarkedLine(line: string, width: number): string[] {
 	return wrapped.map((part, index) => (index === 0 ? `${prefix}${part}` : `${continuation}${part}`));
 }
 
+type ToolTextSemanticRow = {
+	line: number;
+	text: string;
+	action: ToolClickAction;
+	anchorText?: string;
+};
+
+function findToolExecutionAncestor(value: any): any | undefined {
+	if (value?.[TOOL_CLICK_OWNER] instanceof ToolExecutionComponent) return value[TOOL_CLICK_OWNER];
+	let current = value;
+	for (let depth = 0; current && depth < 8; depth++) {
+		if (current instanceof ToolExecutionComponent) return current;
+		current = current[COMPONENT_PARENT];
+	}
+	return undefined;
+}
+
 class ToolText extends Text {
 	private value = "";
 	private followPiOutputPad = false;
 	private toolCachedValue?: string;
 	private toolCachedWidth?: number;
 	private toolCachedPaddingX?: number;
+	private toolCachedClickKey?: string;
 	private toolCachedLines?: string[];
+	private semanticRows: ToolTextSemanticRow[] = [];
 
 	constructor(text = "") {
 		super("", 0, 0);
@@ -3009,15 +3787,23 @@ class ToolText extends Text {
 		this.invalidate();
 	}
 
+	getSemanticRows(): ToolTextSemanticRow[] {
+		return this.semanticRows;
+	}
+
 	invalidate(): void {
 		this.toolCachedValue = undefined;
 		this.toolCachedWidth = undefined;
 		this.toolCachedPaddingX = undefined;
+		this.toolCachedClickKey = undefined;
 		this.toolCachedLines = undefined;
+		this.semanticRows = [];
 	}
 
 	render(width: number): string[] {
 		const branchKey = toolBranchRenderCacheKey();
+		const tool = findToolExecutionAncestor(this);
+		const clickKey = tool ? toolClickStateKey(tool) : "none";
 		const requestedPaddingX = this.followPiOutputPad ? readPiOutputPad() : 0;
 		const paddingX = width > requestedPaddingX * 2 ? requestedPaddingX : 0;
 		if (
@@ -3025,6 +3811,7 @@ class ToolText extends Text {
 			&& this.toolCachedValue === this.value
 			&& this.toolCachedWidth === width
 			&& this.toolCachedPaddingX === paddingX
+			&& this.toolCachedClickKey === clickKey
 			&& (this as any)._toolBranchCacheKey === branchKey
 			&& (this as any)._toolBranchCacheEpoch === _toolBranchVisualEpoch
 		) return this.toolCachedLines;
@@ -3032,19 +3819,56 @@ class ToolText extends Text {
 			this.toolCachedValue = this.value;
 			this.toolCachedWidth = width;
 			this.toolCachedPaddingX = paddingX;
+			this.toolCachedClickKey = clickKey;
 			this.toolCachedLines = [];
+			this.semanticRows = [];
 			return this.toolCachedLines;
 		}
 		const contentWidth = Math.max(1, width - paddingX * 2);
 		const horizontalPad = " ".repeat(paddingX);
-		const lines = this.value.replace(/\t/g, "   ").split("\n");
-		const rendered = lines
-			.flatMap((line) => wrapMarkedLine(line, contentWidth))
-			.map((line) => `${horizontalPad}${padToWidth(line, contentWidth)}${horizontalPad}`);
+		const logicalLines = this.value.replace(/\t/g, "   ").split("\n");
+		const rendered: string[] = [];
+		const semanticRows: ToolTextSemanticRow[] = [];
+		for (const logicalLine of logicalLines) {
+			const header = logicalLine.includes(HEADER_WRAP_MARK);
+			const resolved = resolveClickHints(logicalLine, tool);
+			const breakIndex = resolved.text.indexOf(CLICK_CONTROL_BREAK_MARK);
+			let resolvedText = resolved.text.replace(CLICK_CONTROL_BREAK_MARK, "");
+			if (breakIndex >= 0) {
+				const before = resolved.text.slice(0, breakIndex);
+				const after = resolved.text.slice(breakIndex + CLICK_CONTROL_BREAK_MARK.length);
+				const usedWidth = visibleWidth(stripWrapMarks(before)) % contentWidth;
+				if (usedWidth + visibleWidth(after) > contentWidth) resolvedText = `${before}\n  ${after}`;
+			}
+			for (const resolvedLine of resolvedText.split("\n")) {
+				const wrapped = wrapMarkedLine(resolvedLine, contentWidth);
+				for (const part of wrapped) {
+					const line = `${horizontalPad}${padToWidth(part, contentWidth)}${horizontalPad}`;
+					const lineIndex = rendered.length;
+					rendered.push(line);
+					if (header) semanticRows.push({ line: lineIndex, text: line, action: "header" });
+					const partText = stripAnsi(part);
+					for (const anchor of resolved.anchors) {
+						if (resolved.anchors.length === 1) {
+							semanticRows.push({ line: lineIndex, text: line, action: anchor.action });
+							continue;
+						}
+						const target = toolSupportsProgressiveLocalDetail(tool)
+							? anchor.action === "expand" ? "click to collapse" : "click for more detail"
+							: anchor.action === "expand" ? "collapse" : "detail";
+						if (partText.includes(target)) {
+							semanticRows.push({ line: lineIndex, text: line, action: anchor.action, anchorText: target });
+						}
+					}
+				}
+			}
+		}
 		this.toolCachedValue = this.value;
 		this.toolCachedWidth = width;
 		this.toolCachedPaddingX = paddingX;
+		this.toolCachedClickKey = clickKey;
 		this.toolCachedLines = rendered;
+		this.semanticRows = semanticRows;
 		(this as any)._toolBranchCacheKey = branchKey;
 		(this as any)._toolBranchCacheEpoch = _toolBranchVisualEpoch;
 		return rendered;
@@ -3067,12 +3891,46 @@ function previewLimit(): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 8;
 }
 
-function expandedPreviewLimit(): number {
+function renderedToolLocalDetailLevel(state?: Record<PropertyKey, unknown>): ToolClickDetailLevel {
+	const explicit = normalizeToolClickDetailLevel(state?.[TOOL_CLICK_DETAIL_LEVEL]);
+	return explicit > 0 ? explicit : toolLocalDetailLevel(localDetailRenderTool);
+}
+
+function progressiveLocalDetailLevelForRender(state?: Record<PropertyKey, unknown>): ToolClickDetailLevel {
+	return toolSupportsProgressiveLocalDetail(localDetailRenderTool)
+		&& localDetailRenderTool?.[TOOL_CLICK_LOCAL_EXPANDED] === true
+		? renderedToolLocalDetailLevel(state)
+		: 0;
+}
+
+function progressiveLocalControlsEnabled(): boolean {
+	return toolSupportsProgressiveLocalDetail(localDetailRenderTool)
+		&& toolClickExpansionActive(localDetailRenderTool);
+}
+
+function configuredExpandedPreviewLimit(extraDetail: boolean): number {
 	const settings = readSettings();
-	const key = extraToolOutputExpanded ? "extraExpandedPreviewMaxLines" : "expandedPreviewMaxLines";
+	const key = extraDetail ? "extraExpandedPreviewMaxLines" : "expandedPreviewMaxLines";
 	const value = settings[key];
-	const fallback = extraToolOutputExpanded ? 12000 : 4000;
+	const fallback = extraDetail ? 12000 : 4000;
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+function expandedPreviewLimit(state?: Record<PropertyKey, unknown>): number {
+	const localLevel = renderedToolLocalDetailLevel(state);
+	if (localLevel > 0) return configuredExpandedPreviewLimit(localLevel >= 2);
+	return configuredExpandedPreviewLimit(extraToolOutputExpanded);
+}
+
+function progressiveExpandedBudget(normalBudget: number, state?: Record<PropertyKey, unknown>): number {
+	const level = progressiveLocalDetailLevelForRender(state);
+	if (level === 0) return normalBudget;
+	return Math.max(normalBudget, configuredExpandedPreviewLimit(level >= 2));
+}
+
+function progressivePreviewLimit(normalLimit: number, state?: Record<PropertyKey, unknown>): number {
+	const level = progressiveLocalDetailLevelForRender(state);
+	return level === 0 ? normalLimit : configuredExpandedPreviewLimit(level >= 2);
 }
 
 function bashCollapsedLimit(): number {
@@ -3094,8 +3952,28 @@ function diffCollapsedLimit(): number {
 	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 24;
 }
 
-function collapsedPreviewCount(expanded: boolean, fallback: number): number {
-	return expanded ? expandedPreviewLimit() : fallback;
+function collapsedPreviewCount(detailExpanded: boolean, fallback: number): number {
+	return detailExpanded ? expandedPreviewLimit() : fallback;
+}
+
+interface PreviewIndicatorState {
+	toolExpanded: boolean;
+	localDetailEnabled?: boolean;
+	progressiveLocalDetail?: boolean;
+	localClickControls?: boolean;
+	finalCollapse?: boolean;
+}
+
+function progressivePreviewIndicator(toolExpanded: boolean, state?: Record<PropertyKey, unknown>): PreviewIndicatorState {
+	const localDetailLevel = progressiveLocalDetailLevelForRender(state);
+	const localClickControls = progressiveLocalControlsEnabled();
+	return {
+		toolExpanded,
+		localDetailEnabled: localDetailLevel < 2,
+		progressiveLocalDetail: true,
+		localClickControls,
+		finalCollapse: localClickControls && localDetailLevel === 2,
+	};
 }
 
 function buildPreviewText(
@@ -3105,11 +3983,13 @@ function buildPreviewText(
 	fallbackCollapsed = 8,
 	totalLineCount = lines.length,
 	styleLine?: (line: string) => string,
-	indicatorState?: { toolExpanded: boolean },
+	indicatorState?: PreviewIndicatorState,
 ): string {
 	if (lines.length === 0 && totalLineCount === 0) return theme.fg("muted", "(no output)");
 	const maxLines = collapsedPreviewCount(detailExpanded, fallbackCollapsed);
 	const toolExpanded = indicatorState?.toolExpanded ?? detailExpanded;
+	const progressiveClick = indicatorState?.progressiveLocalDetail === true && indicatorState.localClickControls === true;
+	const finalCollapse = progressiveClick && indicatorState?.finalCollapse === true;
 	// Only style/join the lines we will actually display. Callers used to map
 	// theme.fg over the entire output array first, which scaled with full tool
 	// output even when only 8–10 lines were shown.
@@ -3121,11 +4001,20 @@ function buildPreviewText(
 	}
 	const remaining = Math.max(0, totalLineCount - limit);
 	if (remaining > 0) {
-		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines`)}${toolOutputDetailHint(theme, toolExpanded, true)}${theme.fg("muted", ")")}`;
+		const detailHint = finalCollapse
+			? ""
+			: progressiveClick
+				? deepExpandHint(theme, "muted", true)
+				: toolOutputDetailHint(theme, toolExpanded, true, indicatorState?.localDetailEnabled !== false, indicatorState?.progressiveLocalDetail === true);
+		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines`)}${detailHint}${theme.fg("muted", ")")}`;
 	}
-	if (detailExpanded && totalLineCount > maxLines) {
-		text += `\n${theme.fg("warning", `(display capped at ${maxLines} lines`)}${deepExpandHint(theme, "warning")}${theme.fg("warning", ")")}`;
+	if (detailExpanded && totalLineCount > maxLines && !finalCollapse) {
+		const capDetailHint = indicatorState?.localDetailEnabled === false
+			? baselineDeepExpandHint(theme, "warning")
+			: deepExpandHint(theme, "warning", indicatorState?.progressiveLocalDetail === true);
+		text += `\n${theme.fg("warning", `(display capped at ${maxLines} lines`)}${capDetailHint}${theme.fg("warning", ")")}`;
 	}
+	if (finalCollapse) text += `${text ? "\n" : ""}${localCollapseActionHint(theme)}`;
 	return text;
 }
 
@@ -3346,6 +4235,7 @@ const MAX_TERM_WIDTH = 210;
 const DEFAULT_TERM_WIDTH = 200;
 const MAX_PREVIEW_LINES = 60;
 const MAX_RENDER_LINES = 150;
+
 const MAX_HL_CHARS = 32_000;
 const CACHE_LIMIT = 48;
 const DIFF_RENDER_CONCURRENCY = 2;
@@ -4090,12 +4980,14 @@ function diffSummaryWithMeta(added: number, removed: number, hunks: number, mode
 
 interface DiffRenderState {
 	toolExpanded: boolean;
+	localDetailEnabled?: boolean;
+	progressiveLocalDetail?: boolean;
 }
 
 function collapsedDiffHint(remainingLines: number, hiddenHunks: number, state: DiffRenderState): string {
 	const width = termW();
 	const candidates = [
-		`… (${remainingLines} more diff lines${hiddenHunks > 0 ? ` • ${hiddenHunks} more hunks` : ""}${toolOutputDetailHint(undefined, state.toolExpanded, true)}${BG_BASE}${FG_DIM})`,
+		`… (${remainingLines} more diff lines${hiddenHunks > 0 ? ` • ${hiddenHunks} more hunks` : ""}${toolOutputDetailHint(undefined, state.toolExpanded, true, state.localDetailEnabled !== false, state.progressiveLocalDetail === true)}${BG_BASE}${FG_DIM})`,
 		`… (${remainingLines} more lines${hiddenHunks > 0 ? ` • ${hiddenHunks} hunks` : ""})`,
 		`… (+${remainingLines}${hiddenHunks > 0 ? ` • +${hiddenHunks}h` : ""})`,
 		"…",
@@ -4779,31 +5671,35 @@ function renderEditPreviewBody(
 ): void {
 	const dc = resolveDiffColors(theme);
 	const branchWidth = branchDiffWidth();
+	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+	const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		const line = lines[0] ?? getFirstChangedNewLine(diff);
-		renderSplit(diff, language, { toolExpanded: ctx.expanded }, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, branchWidth)
+		const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_PREVIEW_LINES, ctx.state) : 32;
+		renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}\n${rendered}`;
-				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 				safeInvalidate(ctx);
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}`;
-				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 				safeInvalidate(ctx);
 			});
 		return;
 	}
 	const maxShown = ctx.expanded ? operations.length : Math.min(operations.length, 3);
+	const totalBudget = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : MAX_PREVIEW_LINES;
 	const previewLines = ctx.expanded
-		? Math.max(6, Math.floor(MAX_RENDER_LINES / Math.max(1, maxShown)))
+		? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
 		: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
 	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
 		const line = lines[index] ?? getFirstChangedNewLine(diff);
-		return renderSplit(diff, language, { toolExpanded: ctx.expanded }, previewLines, dc, branchWidth)
+		return renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
 			.then((rendered) => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)}\n${rendered}`)
 			.catch(() => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)} ${summarizeDiff(diff.added, diff.removed)}`);
 	})
@@ -4811,16 +5707,16 @@ function renderEditPreviewBody(
 			if (ctx.state._pk !== key) return;
 			const remainder = operations.length - maxShown;
 			const suffix = remainder > 0
-				? `\n${theme.fg("muted", `… ${remainder} more edit blocks`)}${toolOutputDetailHint(theme, ctx.expanded, true)}`
+				? `\n${theme.fg("muted", `… ${remainder} more edit blocks`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
 				: "";
 			ctx.state._ptBody = `${operations.length} edits ${summary}\n\n${sections.join("\n\n")}${suffix}`;
-			ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 			safeInvalidate(ctx);
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
 			ctx.state._ptBody = `${operations.length} edits ${summary}`;
-			ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 			safeInvalidate(ctx);
 		});
 }
@@ -5206,11 +6102,26 @@ function runningPreviewBlock(
 	// For tail previews the "earlier lines" prefix owns the remaining count — pass
 	// previewSource.length so buildPreviewText doesn't also append "more lines".
 	const previewTotal = options.tail && !expanded ? previewSource.length : totalLineCount;
-	let preview = buildPreviewText(previewSource, expanded, theme, limit, previewTotal, styleLine);
+	const rendererTool = localDetailRenderTool;
+	const tieredLocalExpansion = toolUsesTieredTextPreview(rendererTool)
+		&& rendererTool?.[TOOL_CLICK_LOCAL_EXPANDED] === true;
+	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx?.state);
+	const previewExpanded = tieredLocalExpansion ? localDetailLevel > 0 : expanded;
+	const normalLimit = tieredLocalExpansion ? tieredToolNormalPreviewLimit(rendererTool) : limit;
+	const indicator = tieredLocalExpansion ? progressivePreviewIndicator(expanded, ctx.state) : undefined;
+	let preview = buildPreviewText(
+		previewSource,
+		previewExpanded,
+		theme,
+		normalLimit,
+		previewTotal,
+		styleLine,
+		indicator,
+	);
 	if (options.tail && !expanded && totalLineCount > previewSource.length) {
 		preview = `${theme.fg("muted", `... (${totalLineCount - previewSource.length} earlier lines`)}${toolOutputDetailHint(theme, expanded, true)}${theme.fg("muted", ")")}\n${preview}`;
 	}
-	return withBranch(preview, theme);
+	return withProgressivePreviewBranch(preview, theme, indicator?.finalCollapse === true);
 }
 
 function buildPersistentBashPreview(lines: string[], theme: Theme): string {
@@ -5596,34 +6507,38 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	ctx.state._openAiPatchFiles = preview.changes.map((change) => change.displayPath);
 
 	const diffWidth = branchDiffWidth();
-	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
+	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+	const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+	const normalBudget = preview.changes.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
+	const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
+	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
 	if (ctx.state._applyPatchPreviewKey !== key) {
 		ctx.state._applyPatchPreviewKey = key;
 		ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
-		ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+		ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 		const dc = resolveDiffColors(theme);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
-			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded }, ctx.expanded ? MAX_PREVIEW_LINES : 32, dc, diffWidth)
+			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, ctx.expanded ? totalBudget : 32, dc, diffWidth)
 				.then((rendered) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`;
-					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
-					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx);
 				});
 		} else {
 			const maxShown = ctx.expanded ? preview.changes.length : Math.min(preview.changes.length, 3);
 			const previewLines = ctx.expanded
-				? Math.max(6, Math.floor(MAX_RENDER_LINES / Math.max(1, maxShown)))
+				? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
 				: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
 			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change, index) =>
-				renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded }, previewLines, dc, diffWidth)
+				renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 					.then((rendered) => `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`)
 					.catch(() => `${index + 1}. ${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`),
 			)
@@ -5631,17 +6546,17 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					const remainder = preview.changes.length - maxShown;
 					const suffix = remainder > 0
-						? `\n${theme.fg("muted", `… ${remainder} more file patches`)}${toolOutputDetailHint(theme, ctx.expanded, true)}`
+						? `\n${theme.fg("muted", `… ${remainder} more file patches`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
 						: "";
 					const summary = `${preview.changes.length} files ${preview.summary}`;
 					ctx.state._applyPatchPreviewBody = `${summary}\n\n${sections.join("\n\n")}${suffix}`;
-					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${preview.changes.length} files ${preview.summary}`;
-					ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
+					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx);
 				});
 		}
@@ -6005,11 +6920,19 @@ function renderTaskListResult(lines: string[], expanded: boolean, theme: Theme, 
 		return makeText(ctx.lastComponent, withBranch(`${summary}${toolOutputDetailHint(theme, expanded)}`, theme));
 	}
 
-	const shown = tasks.slice(0, previewLimit());
+	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+	const shown = tasks.slice(0, progressivePreviewLimit(previewLimit(), ctx.state));
 	const preview = shown.map((task) => `${theme.fg("accent", `#${task.id}`)} ${formatTaskStatus(task.status, theme)} ${theme.fg("dim", task.subject)}`);
 	const remaining = tasks.length - shown.length;
-	if (remaining > 0) preview.push(theme.fg("muted", `… ${remaining} more tasks`));
-	return makeText(ctx.lastComponent, withBranch(`${summary}\n${preview.join("\n")}`, theme));
+	const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+	if (remaining > 0) {
+		const controls = progressiveLocalControlsEnabled()
+			? toolOutputDetailHint(theme, expanded, true, localDetailLevel < 2, true)
+			: "";
+		preview.push(`${theme.fg("muted", `… ${remaining} more tasks`)}${controls}`);
+	}
+	if (finalCollapse) preview.push(localCollapseActionHint(theme));
+	return makeText(ctx.lastComponent, withProgressivePreviewBranch(`${summary}\n${preview.join("\n")}`, theme, finalCollapse));
 }
 
 function getFirstImageBlock(result: any): { data: string; mimeType: string } | undefined {
@@ -6111,6 +7034,7 @@ export default function (pi: ExtensionAPI) {
 	patchToolRenderCacheInvalidation();
 	patchReadImageExpansion();
 	patchContainerParentTracking();
+	installToolGroupMouseAdapter();
 	patchGlobalToolBorders();
 	patchCustomMessageRender();
 	patchUserMessageRender();
@@ -6134,7 +7058,7 @@ export default function (pi: ExtensionAPI) {
 	// /cc-tools command — control tool chrome, grouping, and detail level.
 	const TOOL_MODES = ["outlines", "transparent", "default"] as const;
 	const TOOL_BOOL_MODES = ["on", "off", "toggle", "status"] as const;
-	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "branch", "status"] as const;
+	const TOOL_SUBCOMMANDS = [...TOOL_MODES, "group", "detail", "click", "branch", "status"] as const;
 	const booleanMode = (raw: string | undefined, current: boolean): boolean | "status" | undefined => {
 		const mode = raw || "toggle";
 		if (mode === "on") return true;
@@ -6157,13 +7081,14 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.notify([
 			`Tool style: ${toolBackgroundMode}`,
 			`Tool grouping: ${toolGroupingEnabled() ? "on" : "off"}`,
+			`Click expansion: ${clickExpansionEnabled() ? "on" : "off"}`,
 			`Extra detail: ${extraToolOutputExpanded ? "on" : "off"} (${rawKeyHint("ctrl+shift+o", "toggle")})`,
 			branchLine,
 			`  /cc-tools branch <0-255> | theme | fixed | reset`,
 		].join("\n"), "info");
 	};
 	pi.registerCommand("cc-tools", {
-		description: "Control tool UI: style, grouped rows, and Ctrl+Shift+O extra-detail mode",
+		description: "Control tool UI: style, grouping, click expansion, and extra detail",
 		getArgumentCompletions(prefix) {
 			const parts = prefix.trimStart().split(/\s+/);
 			const first = parts[0] ?? "";
@@ -6176,6 +7101,7 @@ export default function (pi: ExtensionAPI) {
 						description:
 							m === "group" ? "Toggle grouped adjacent/concurrent tool rows"
 							: m === "detail" ? "Toggle Ctrl+Shift+O extra-detail mode"
+							: m === "click" ? "Toggle local click expansion in fullscreen mode"
 							: m === "branch" ? "├ └ │ gray (0-255), theme, fixed, or reset"
 							: m === "status" ? "Show tool UI settings"
 							: m === "outlines" ? "Horizontal rules around each tool (default)"
@@ -6190,7 +7116,7 @@ export default function (pi: ExtensionAPI) {
 					.filter((o) => o.startsWith(second))
 					.map((o) => ({ value: `branch ${o}`, label: o, description: "Branch connector color" }));
 			}
-			if (first === "group" || first === "detail" || first === "extra") {
+			if (first === "group" || first === "detail" || first === "extra" || first === "click") {
 				const second = parts[1] ?? "";
 				return TOOL_BOOL_MODES
 					.filter((m) => m.startsWith(second))
@@ -6221,6 +7147,28 @@ export default function (pi: ExtensionAPI) {
 				if (ctx.hasUI) {
 					ctx.ui.setToolsExpanded(ctx.ui.getToolsExpanded());
 					ctx.ui.notify(`Tool grouping: ${next ? "on" : "off"}${next ? " (future adjacent tool rows)" : ""}`, "info");
+				}
+				return;
+			}
+
+			if (sub === "click") {
+				const current = clickExpansionEnabled();
+				const next = booleanMode(parts[1], current);
+				if (next === undefined) {
+					if (ctx.hasUI) ctx.ui.notify(`Usage: /cc-tools click ${TOOL_BOOL_MODES.join("|")}`, "error");
+					return;
+				}
+				if (next === "status") {
+					if (ctx.hasUI) ctx.ui.notify(`Click expansion: ${current ? "on" : "off"}`, "info");
+					return;
+				}
+				writeSettingsKey("clickExpansion", next);
+				if (!next) resetLocalClickStates(activeClickInteractiveMode, true);
+				else clickVisualEpoch++;
+				if (ctx.hasUI) {
+					(ctx.ui as any).invalidate?.();
+					(ctx.ui as any).requestRender?.();
+					ctx.ui.notify(`Click expansion: ${next ? "on" : "off"}`, "info");
 				}
 				return;
 			}
@@ -6281,7 +7229,7 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (!(TOOL_MODES as readonly string[]).includes(sub)) {
-				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools branch 72, or /cc-tools group toggle.`, "error");
+				if (ctx.hasUI) ctx.ui.notify(`Unknown option "${sub}". Try /cc-tools status, /cc-tools click toggle, or /cc-tools group toggle.`, "error");
 				return;
 			}
 			toolBackgroundOverride = sub as typeof toolBackgroundMode;
@@ -6559,8 +7507,10 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${lines.length} lines loaded`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			text += `\n${buildPreviewText(lines, false, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "), { toolExpanded: expanded })}`;
-			return makeText(ctx.lastComponent, withBranch(text, theme));
+			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+		const indicator = progressivePreviewIndicator(expanded, ctx.state);
+		text += `\n${buildPreviewText(lines, localDetailLevel > 0, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "), indicator)}`;
+			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
 	});
 
@@ -6615,14 +7565,18 @@ export default function (pi: ExtensionAPI) {
 			let text = exitCode === null || exitCode === 0 ? theme.fg("success", "Done") : theme.fg("error", `Exit ${exitCode}`);
 			text += theme.fg("muted", ` (${nonEmpty.total} lines)`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " [truncated]");
-			const persistentPreview = shouldPreserveBashPreview(ctx) ? buildPersistentBashPreview(nonEmpty.lines, theme) : "";
+			const persistentPreview = !progressiveLocalControlsEnabled() && shouldPreserveBashPreview(ctx)
+				? buildPersistentBashPreview(nonEmpty.lines, theme)
+				: "";
 			if (!expanded && persistentPreview) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}\n${persistentPreview}`, theme));
 			if (!expanded && nonEmpty.total > 0) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(text, theme));
 			const collapsed = bashCollapsedLimit();
 			if (rewrite) text += `\n${formatRtkRewriteDetails(rewrite, theme)}`;
-			text += `\n${buildPreviewText(nonEmpty.lines, false, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line), { toolExpanded: expanded })}`;
-			return makeText(ctx.lastComponent, withBranch(text, theme));
+			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+		const indicator = progressivePreviewIndicator(expanded, ctx.state);
+		text += `\n${buildPreviewText(nonEmpty.lines, localDetailLevel > 0, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line), indicator)}`;
+			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
 	});
 
@@ -6661,8 +7615,10 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${matches.length} matches`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
-			text += `\n${buildPreviewText(matches, false, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line), { toolExpanded: expanded })}`;
-			return makeText(ctx.lastComponent, withBranch(text, theme));
+			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+		const indicator = progressivePreviewIndicator(expanded, ctx.state);
+		text += `\n${buildPreviewText(matches, localDetailLevel > 0, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line), indicator)}`;
+			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
 	});
 
@@ -6700,7 +7656,8 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${items.length} files`);
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			// Expanded: grouped find results with icons
-			const maxShow = previewLimit();
+			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+			const maxShow = progressivePreviewLimit(previewLimit(), ctx.state);
 			const shown = items.slice(0, maxShow);
 			const findLines: string[] = [];
 			for (let i = 0; i < shown.length; i++) {
@@ -6709,11 +7666,16 @@ export default function (pi: ExtensionAPI) {
 				findLines.push(`  ${icon}${theme.fg("dim", item)}`);
 			}
 			const remaining = items.length - shown.length;
+			const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
 			if (remaining > 0) {
-				findLines.push(`  ${theme.fg("muted", `… ${remaining} more files`)}`);
+				const controls = progressiveLocalControlsEnabled()
+					? toolOutputDetailHint(theme, expanded, true, localDetailLevel < 2, true)
+					: "";
+				findLines.push(`  ${theme.fg("muted", `… ${remaining} more files`)}${controls}`);
 			}
+			if (finalCollapse) findLines.push(localCollapseActionHint(theme));
 			text += `\n${findLines.join('\n')}`;
-			return makeText(ctx.lastComponent, withBranch(text, theme));
+			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, finalCollapse));
 		},
 	});
 
@@ -6747,7 +7709,8 @@ export default function (pi: ExtensionAPI) {
 			let text = theme.fg("muted", `${items.length} entries`);
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			// Expanded: tree-view with icons
-			const maxShow = previewLimit();
+			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+			const maxShow = progressivePreviewLimit(previewLimit(), ctx.state);
 			const shown = items.slice(0, maxShow);
 			const treeLines: string[] = [];
 			for (let i = 0; i < shown.length; i++) {
@@ -6760,11 +7723,16 @@ export default function (pi: ExtensionAPI) {
 				treeLines.push(`${prefix}${icon}${name}`);
 			}
 			const remaining = items.length - shown.length;
+			const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
 			if (remaining > 0) {
-				treeLines.push(`${FG_RULE}\u2514\u2500\u2500${D_RST} ${theme.fg("muted", `\u2026 ${remaining} more entries`)}`);
+				const controls = progressiveLocalControlsEnabled()
+					? toolOutputDetailHint(theme, expanded, true, localDetailLevel < 2, true)
+					: "";
+				treeLines.push(`${FG_RULE}\u2514\u2500\u2500${D_RST} ${theme.fg("muted", `\u2026 ${remaining} more entries`)}${controls}`);
 			}
+			if (finalCollapse) treeLines.push(localCollapseActionHint(theme));
 			text += `\n${treeLines.join('\n')}`;
-			return makeText(ctx.lastComponent, withBranch(text, theme));
+			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, finalCollapse));
 		},
 	});
 
@@ -6827,20 +7795,22 @@ export default function (pi: ExtensionAPI) {
 			}
 			const d = (result as any).details;
 			if (d?._type === "diff") {
-				const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
+				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+				const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : diffCollapsedLimit();
 				const hunks = d.diff?.lines?.filter((l: any) => l.type === "sep").length + (d.diff?.lines?.length ? 1 : 0);
 				const diffWidth = branchDiffWidth();
 				const mode = shouldUseSplit(d.diff, diffWidth, previewLines) ? "split" : "unified";
 				const richSummary = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
-				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}`;
+				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._wdk !== key) {
 					ctx.state._wdk = key;
 					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
 					const dc = resolveDiffColors(theme);
-					renderSplit(d.diff, d.language, { toolExpanded: ctx.expanded }, previewLines, dc, diffWidth)
+					renderSplit(d.diff, d.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._wdk !== key) return;
-							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
+							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
 							safeInvalidate(ctx);
 						})
 						.catch(() => {
@@ -6858,17 +7828,19 @@ export default function (pi: ExtensionAPI) {
 				const contentHash = hashText(content);
 				const syntheticDiff = getCachedParsedDiff(ctx, `nf-diff:${d.filePath}:${contentHash}`, "", content);
 				const richSummary = diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file");
-				const previewLines = ctx.expanded ? MAX_RENDER_LINES : diffCollapsedLimit();
+				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+				const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : diffCollapsedLimit();
 				const diffWidth = branchDiffWidth();
-				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
+				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._nfk !== pk) {
 					ctx.state._nfk = pk;
 					ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
 					const dc = resolveDiffColors(theme);
-					renderUnified(syntheticDiff, lang(d.filePath), { toolExpanded: ctx.expanded }, previewLines, dc, diffWidth)
+					renderUnified(syntheticDiff, lang(d.filePath), { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._nfk !== pk) return;
-							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${rendered}`, theme);
+							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
 							safeInvalidate(ctx);
 						})
 						.catch(() => {
@@ -6933,7 +7905,10 @@ export default function (pi: ExtensionAPI) {
 			const hdr = toolHeader("Edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
 			const diffWidth = branchDiffWidth();
-			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}`;
+			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+			const normalBudget = operations.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
+			const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
+			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
 			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
 				ctx.state._pk = key;

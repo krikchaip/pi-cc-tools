@@ -1,0 +1,167 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen test for per-execution click expansion in a tool group.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set session_fixture [file join $repo_dir "e2e" "fixtures" "tool-group-click-session.jsonl"]
+set switch_fixture [file join $repo_dir "e2e" "fixtures" "switch-to-fullscreen.ts"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set start_tui_mode [expr {[info exists env(START_TUI_MODE)] ? $env(START_TUI_MODE) : "fullscreen"}]
+set scratch "/tmp/pi-cc-tools-click-e2e-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set session_path [file join $scratch "session.jsonl"]
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $session_fixture "r"]
+set session_content [read $fixture]
+close $fixture
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-click-e2e" $cwd] $session_content]
+close $session
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+set keybindings [open [file join $agent "keybindings.json"] "w"]
+puts $keybindings {{"app.tools.expand":["alt+j"]}}
+close $keybindings
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_output {} {
+  set saved_timeout $::timeout
+  set ::timeout 0
+  expect {
+    -re {.+} { exp_continue }
+    timeout {}
+    eof {}
+  }
+  set ::timeout $saved_timeout
+}
+
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+set command [list env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=100 LINES=40 PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path]
+if {[info exists env(SWITCH_TO_FULLSCREEN)]} {
+  lappend command -e $switch_fixture
+}
+lappend command --tui-mode $start_tui_mode
+spawn {*}$command
+stty columns 100 rows 40
+
+if {![wait_for 10 {click.*any for details}]} {
+  puts stderr "collapsed tool group did not show click guidance"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+after 300
+log_file
+log_file -noappend [file join $scratch "wrong-target.ansi"]
+# The branch connector is outside the first execution's anchor.
+send -- "\033\[<0;2;3M\033\[<0;2;3m"
+if {[wait_for 1 {FIRST_EXECUTION_DETAILS}]} {
+  puts stderr "branch connector click expanded the first execution"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+
+log_file
+log_file -noappend [file join $scratch "local-expanded.ansi"]
+# The first execution's semantic header starts after its status dot at terminal column 6.
+send -- "\033\[<0;6;3M\033\[<0;6;3m"
+if {![wait_for 5 {FIRST_EXECUTION_DETAILS}]} {
+  puts stderr "first execution did not expand from its click anchor"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+if {[wait_for 1 {SECOND_EXECUTION_DETAILS}]} {
+  puts stderr "first execution click also expanded the second execution"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+
+log_file
+log_file -noappend [file join $scratch "local-collapsed.ansi"]
+send -- "\033\[<0;6;3M\033\[<0;6;3m"
+after 600
+drain_output
+# If the first execution collapsed, the second anchor is now on row 4.
+send -- "\033\[<0;6;4M\033\[<0;6;4m"
+if {![wait_for 5 {SECOND_EXECUTION_DETAILS}]} {
+  puts stderr "first execution did not collapse or second execution did not expand independently"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+# Collapse the second execution from its unchanged call row.
+send -- "\033\[<0;6;4M\033\[<0;6;4m"
+after 600
+drain_output
+
+log_file
+log_file -noappend [file join $scratch "global-expanded.ansi"]
+# The isolated keymap binds Pi's global tool expansion action to Option+J.
+send -- "\033j"
+if {![wait_for 5 {option\+j.*to collapse}]} {
+  puts stderr "global expanded mode did not restore the Option+J collapse hint"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+if {![wait_for 5 {FIRST_EXECUTION_DETAILS}]} {
+  puts stderr "global expansion did not show the first execution"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+if {![wait_for 5 {SECOND_EXECUTION_DETAILS}]} {
+  puts stderr "global expansion did not override the second execution"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+
+log_file
+log_file -noappend [file join $scratch "global-collapsed.ansi"]
+send -- "\033j"
+if {![wait_for 5 {click.*any for details}]} {
+  puts stderr "global collapse did not restore click guidance"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+
+after 200
+send "\003\003"
+catch {close}
+puts "ARTIFACTS $scratch"

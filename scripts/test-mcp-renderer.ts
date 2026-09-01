@@ -9,8 +9,15 @@ const realHome = process.env.HOME;
 const realAgentDir = process.env.PI_CODING_AGENT_DIR;
 const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-cc-tools-mcp-renderer-"));
 const tempAgentDir = path.join(tempHome, "agent");
+const tempPiDir = path.join(tempHome, ".pi");
 fs.mkdirSync(tempAgentDir);
+fs.mkdirSync(tempPiDir);
 fs.writeFileSync(path.join(tempAgentDir, "settings.json"), JSON.stringify({ outputPad: 0 }));
+fs.writeFileSync(path.join(tempPiDir, "settings.json"), JSON.stringify({
+  clickExpansion: true,
+  expandedPreviewMaxLines: 10,
+  extraExpandedPreviewMaxLines: 15,
+}));
 process.env.HOME = tempHome;
 process.env.PI_CODING_AGENT_DIR = tempAgentDir;
 
@@ -238,10 +245,10 @@ try {
       throw new Error(`expanded expansion indicator did not describe its state: ${JSON.stringify(plain)}`);
     }
   };
-  const waitFor = async (ready: () => boolean): Promise<void> => {
-    const deadline = Date.now() + 3000;
+  const waitFor = async (ready: () => boolean, description = "asynchronous tool preview rendering"): Promise<void> => {
+    const deadline = Date.now() + 5000;
     while (!ready() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
-    if (!ready()) throw new Error("timed out waiting for asynchronous tool preview rendering");
+    if (!ready()) throw new Error(`timed out waiting for ${description}`);
   };
 
   const write = fakePi.tools.get("write");
@@ -450,6 +457,208 @@ try {
     throw new Error(`MCP renderer ignored outputPad 0: ${JSON.stringify(repositoryRow)}`);
   }
 
+  const readDefinition = fakePi.tools.get("read");
+  const readExecution = new ToolExecutionComponent(
+    "read",
+    "read_click_fixture",
+    { path: "fixture.ts" },
+    {},
+    readDefinition,
+    { mode: "fullscreen", requestRender() {} } as any,
+    process.cwd(),
+  ) as any;
+  readExecution.markExecutionStarted();
+  readExecution.setArgsComplete();
+  readExecution.updateResult({ content: [{ type: "text", text: cappedOutput }], isError: false }, false);
+  readExecution.setExpanded(true);
+  const readRows = readExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const readExpanded = readRows.join("\n");
+  if (!readExpanded.includes("result line 8") || readExpanded.includes("result line 9")) {
+    throw new Error(`standalone first expansion did not stop at the normal 8-line preview: ${JSON.stringify(readExpanded)}`);
+  }
+  const standaloneActionX = (row: number, action: string): number => (
+    Array.from({ length: 120 }, (_, x) => x).find((x) => readExecution.clickActionAtPoint(x, row) === action) ?? -1
+  );
+  const detailRow = readRows.findIndex((line: string, index: number) => (
+    line.includes("more lines")
+    && !line.includes("click to collapse")
+    && line.includes("click for more detail")
+    && standaloneActionX(index, "expand") < 0
+    && standaloneActionX(index, "detail") >= 0
+  ));
+  const detailStart = detailRow < 0 ? -1 : readRows[detailRow].indexOf("...");
+  const detailEnd = detailRow < 0 ? -1 : readRows[detailRow].trimEnd().length;
+  const detailCoversFullRow = detailRow >= 0
+    && detailStart >= 0
+    && Array.from({ length: detailEnd - detailStart }, (_, offset) => detailStart + offset)
+      .every((x) => readExecution.clickActionAtPoint(x, detailRow) === "detail")
+    && readExecution.clickActionAtPoint(Math.max(0, detailStart - 1), detailRow) !== "detail"
+    && readExecution.clickActionAtPoint(detailEnd, detailRow) !== "detail";
+  if (!detailCoversFullRow) {
+    throw new Error(`standalone hidden-content row did not bind one full-row detail anchor: ${JSON.stringify({ readRows, detailRow, detailStart, detailEnd, actions: readRows.map((_: string, index: number) => [index, standaloneActionX(index, "expand"), standaloneActionX(index, "detail")]) })}`);
+  }
+  if (!readExecution.activateClickAction("detail")) {
+    throw new Error("standalone standard-detail action did not activate");
+  }
+  const standardReadRows = readExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const standardRead = standardReadRows.join("\n");
+  if (!standardRead.includes("result line 10") || standardRead.includes("result line 11")) {
+    throw new Error(`standalone first detail action did not stop at expandedPreviewMaxLines=10: ${JSON.stringify(standardRead)}`);
+  }
+  const extraDetailRow = standardReadRows.findIndex((line: string, index: number) => (
+    line.includes("more lines")
+    && line.includes("click for more detail")
+    && standaloneActionX(index, "detail") >= 0
+  ));
+  if (extraDetailRow < 0 || !readExecution.activateClickAction("detail")) {
+    throw new Error(`standalone standard-detail layer did not preserve its extra-detail gate: ${JSON.stringify(standardReadRows)}`);
+  }
+  const extraDetailedReadRows = readExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const extraDetailedRead = extraDetailedReadRows.join("\n");
+  if (!extraDetailedRead.includes("result line 15") || extraDetailedRead.includes("result line 16")) {
+    throw new Error(`standalone second detail action did not stop at extraExpandedPreviewMaxLines=15: ${JSON.stringify(extraDetailedRead)}`);
+  }
+  const finalReadSummary = extraDetailedReadRows.find((line: string) => line.includes("20 lines loaded"));
+  const finalReadPayload = extraDetailedReadRows.find((line: string) => line.includes("result line 1"));
+  const finalReadCollapseRow = extraDetailedReadRows.findIndex((line: string) => line.includes("click to collapse"));
+  const finalCollapseStart = finalReadCollapseRow < 0 ? -1 : standaloneActionX(finalReadCollapseRow, "expand");
+  const finalCollapseEnd = finalReadCollapseRow < 0 ? -1 : extraDetailedReadRows[finalReadCollapseRow].trimEnd().length;
+  if (
+    !finalReadSummary?.trimStart().startsWith("├")
+    || !finalReadPayload?.trimStart().startsWith("│")
+    || finalReadCollapseRow < 0
+    || !extraDetailedReadRows[finalReadCollapseRow].trimStart().startsWith("└")
+    || finalCollapseStart < 0
+    || !Array.from({ length: finalCollapseEnd - finalCollapseStart }, (_, offset) => finalCollapseStart + offset)
+      .every((x) => readExecution.clickActionAtPoint(x, finalReadCollapseRow) === "expand")
+  ) {
+    throw new Error(`standalone final detail layer did not end with a full-row branched collapse action: ${JSON.stringify(extraDetailedReadRows)}`);
+  }
+  if (!readExecution.activateClickAction("expand") || readExecution.expanded) {
+    throw new Error("standalone final collapse action did not collapse the execution");
+  }
+  const readPeer = new ToolExecutionComponent(
+    "read",
+    "read_click_fixture_2",
+    { path: "peer.ts" },
+    {},
+    readDefinition,
+    { mode: "fullscreen", requestRender() {} } as any,
+    process.cwd(),
+  ) as any;
+  readPeer.markExecutionStarted();
+  readPeer.setArgsComplete();
+  readPeer.updateResult({ content: [{ type: "text", text: cappedOutput }], isError: false }, false);
+  const { Container: ReadContainer } = await import("../node_modules/@earendil-works/pi-tui/dist/tui.js");
+  const readGroupParent = new ReadContainer();
+  readGroupParent.addChild(readExecution);
+  readGroupParent.addChild(readPeer);
+  const readGroup = (readGroupParent as any).children[0];
+  readGroupParent.render(120);
+  if (!readGroup.toggleToolAtPoint(5, 2)) {
+    throw new Error("grouped Read header did not expand its selected execution");
+  }
+  const groupedActionX = (row: number, action: string): number => (
+    Array.from({ length: 120 }, (_, x) => x).find((x) => readGroup.actionAtPoint(x, row) === action) ?? -1
+  );
+  const expandedReadGroupRows = readGroupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const groupedDetailRow = expandedReadGroupRows.findIndex((line: string, index: number) => (
+    line.includes("more lines") && groupedActionX(index, "detail") >= 0
+  ));
+  const groupedDetailX = groupedDetailRow < 0 ? -1 : groupedActionX(groupedDetailRow, "detail");
+  if (groupedDetailRow < 0 || groupedDetailX < 0 || !readGroup.toggleToolAtPoint(groupedDetailX, groupedDetailRow)) {
+    throw new Error(`expanded tool group did not bind its standard-detail row: ${JSON.stringify(expandedReadGroupRows)}`);
+  }
+  const standardReadGroupRows = readGroupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const standardReadGroup = standardReadGroupRows.join("\n");
+  if (!standardReadGroup.includes("result line 10") || standardReadGroup.includes("result line 11")) {
+    throw new Error(`grouped first detail action did not stop at expandedPreviewMaxLines=10: ${JSON.stringify(standardReadGroup)}`);
+  }
+  const groupedExtraDetailRow = standardReadGroupRows.findIndex((line: string, index: number) => (
+    line.includes("more lines") && groupedActionX(index, "detail") >= 0
+  ));
+  const groupedExtraDetailX = groupedExtraDetailRow < 0 ? -1 : groupedActionX(groupedExtraDetailRow, "detail");
+  if (groupedExtraDetailRow < 0 || groupedExtraDetailX < 0 || !readGroup.toggleToolAtPoint(groupedExtraDetailX, groupedExtraDetailRow)) {
+    throw new Error(`grouped standard-detail layer did not preserve its extra-detail gate: ${JSON.stringify(standardReadGroupRows)}`);
+  }
+  const extraDetailedReadGroupRows = readGroupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const extraDetailedReadGroup = extraDetailedReadGroupRows.join("\n");
+  if (!extraDetailedReadGroup.includes("result line 15") || extraDetailedReadGroup.includes("result line 16")) {
+    throw new Error(`grouped second detail action did not stop at extraExpandedPreviewMaxLines=15: ${JSON.stringify(extraDetailedReadGroup)}`);
+  }
+  const groupedCollapseRow = extraDetailedReadGroupRows.findIndex((line: string) => line.includes("click to collapse"));
+  const groupedCollapseX = groupedCollapseRow < 0 ? -1 : groupedActionX(groupedCollapseRow, "expand");
+  if (groupedCollapseRow < 0 || groupedCollapseX < 0 || !readGroup.toggleToolAtPoint(groupedCollapseX, groupedCollapseRow)) {
+    const rowActions = groupedCollapseRow < 0
+      ? []
+      : Array.from({ length: 120 }, (_, x) => [x, readGroup.actionAtPoint(x, groupedCollapseRow)]).filter(([, action]) => action);
+    throw new Error(`grouped final detail layer did not expose a clickable collapse row: ${JSON.stringify({ rows: extraDetailedReadGroupRows, groupedCollapseRow, rowActions, semantics: readExecution.resultRendererComponent?.getSemanticRows?.().map((row: any) => ({ ...row, text: row.text.replace(/\x1b\[[0-9;]*m/g, "") })) })}`);
+  }
+
+  fs.writeFileSync(path.join(tempPiDir, "settings.json"), JSON.stringify({
+    clickExpansion: true,
+    expandedPreviewMaxLines: 200,
+    extraExpandedPreviewMaxLines: 240,
+  }));
+  await new Promise((resolve) => setTimeout(resolve, 5100));
+  const writeExecution = new ToolExecutionComponent(
+    "write",
+    "write_click_fixture",
+    { path: "fixture.ts", content: "new" },
+    {},
+    write,
+    { mode: "fullscreen", requestRender() {} } as any,
+    process.cwd(),
+  ) as any;
+  writeExecution.markExecutionStarted();
+  writeExecution.setArgsComplete();
+  writeExecution.updateResult({
+    content: [{ type: "text", text: "Wrote fixture.ts" }],
+    details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 4000, lines: expandedDiffLines } },
+    isError: false,
+  }, false);
+  writeExecution.setExpanded(true);
+  await waitFor(
+    () => typeof writeExecution.rendererState._wdt === "string"
+      && writeExecution.rendererState._wdt.includes("more diff lines")
+      && writeExecution.rendererState._wdk.endsWith(":150"),
+    "expanded Write diff at its normal 150-line render cap",
+  );
+  const writeExecutionRows = writeExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const writeDetailActionX = (row: number): number => (
+    Array.from({ length: 120 }, (_, x) => x).find((x) => writeExecution.clickActionAtPoint(x, row) === "detail") ?? -1
+  );
+  const writeDetailRow = writeExecutionRows.findIndex((line: string, index: number) => (
+    line.includes("more diff lines") && writeDetailActionX(index) >= 0
+  ));
+  if (writeDetailRow < 0 || !writeExecution.activateClickAction("detail")) {
+    throw new Error(`expanded Write diff did not bind its standard-detail row: ${JSON.stringify(writeExecutionRows)}`);
+  }
+  const detailLevelSymbol = Symbol.for("pi-claude-style-tools:tool-click-detail-level");
+  if (writeExecution.rendererState[detailLevelSymbol] !== 1) {
+    throw new Error("Write standard-detail activation did not persist level 1");
+  }
+  await waitFor(
+    () => typeof writeExecution.rendererState._wdk === "string"
+      && writeExecution.rendererState._wdk.endsWith(":200"),
+    `standard-detail Write diff at its configured 200-line render cap (key: ${writeExecution.rendererState._wdk})`,
+  );
+  const standardWriteRows = writeExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+  const writeExtraDetailRow = standardWriteRows.findIndex((line: string, index: number) => (
+    line.includes("more diff lines") && writeDetailActionX(index) >= 0
+  ));
+  if (writeExtraDetailRow < 0 || !writeExecution.activateClickAction("detail")) {
+    throw new Error(`standard-detail Write diff did not preserve its extra-detail row: ${JSON.stringify(standardWriteRows)}`);
+  }
+  if (writeExecution.rendererState[detailLevelSymbol] !== 2) {
+    throw new Error("Write extra-detail activation did not persist level 2");
+  }
+  await waitFor(
+    () => typeof writeExecution.rendererState._wdk === "string"
+      && writeExecution.rendererState._wdk.endsWith(":240"),
+    `extra-detail Write diff at its configured 240-line render cap (key: ${writeExecution.rendererState._wdk})`,
+  );
+
   fs.writeFileSync(path.join(tempAgentDir, "settings.json"), JSON.stringify({ outputPad: 1 }));
   await new Promise((resolve) => setTimeout(resolve, 300));
   const directPadded = render(fields);
@@ -484,7 +693,51 @@ try {
   }
   groupParent.render(120);
   const group = (groupParent as any).children[0];
+  const regularCollapsedGroup = groupParent.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  if (regularCollapsedGroup.includes("click any for details")) {
+    throw new Error("regular TUI mode advertised inactive tool-group click anchors");
+  }
+
+  (execution as any).ui.mode = "fullscreen";
+  (groupedPeer as any).ui.mode = "fullscreen";
+  group.invalidate();
+  const clickableGroupRaw = groupParent.render(120).join("\n");
+  const clickableGroup = clickableGroupRaw.replace(/\x1b\[[0-9;]*m/g, "");
+  if (!clickableGroup.includes("click any for details")) {
+    throw new Error("fullscreen collapsed tool group did not show click guidance");
+  }
+  const styledGroupGuidance = `${theme.fg("muted", " • ")}${theme.fg("dim", "click")}${theme.fg("muted", " any for details")}`;
+  if (!clickableGroupRaw.includes(styledGroupGuidance)) {
+    throw new Error("tool-group click guidance did not dim only `click`");
+  }
+  if (group.toolAtPoint(4, 2) !== undefined || group.toolAtPoint(5, 2) !== execution) {
+    throw new Error("tool-group click anchor did not exclude the branch connector and status indicator");
+  }
+  if (!group.toggleToolAtPoint(5, 2)) {
+    throw new Error("first tool-group click anchor did not toggle its execution");
+  }
+  const locallyExpandedGroup = groupParent.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  if ((locallyExpandedGroup.match(/Repository/g) ?? []).length !== 1 || !(execution as any).expanded || (groupedPeer as any).expanded) {
+    throw new Error("tool-group click did not expand only the selected execution");
+  }
+
   group.setExpanded(true);
+  const groupedThird = new ToolExecutionComponent(
+    "mcp",
+    "call_fixture_3",
+    { server: "github", tool: "get_repository" },
+    {},
+    legacyDefinition,
+    { mode: "fullscreen", requestRender() {} } as any,
+    process.cwd(),
+  );
+  groupedThird.markExecutionStarted();
+  groupedThird.setArgsComplete();
+  groupedThird.updateResult({ content: [{ type: "text", text: fields }], isError: false }, false);
+  groupParent.addChild(groupedThird);
+  if (!(groupedThird as any).expanded) {
+    throw new Error("new grouped execution did not inherit global expanded mode");
+  }
   const expandedGroupLines = groupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
   const expandedGroupHeader = expandedGroupLines.find((line: string) => line.includes("to collapse") || line.includes("to toggle"));
   if (!expandedGroupHeader?.includes("to collapse") || expandedGroupHeader.includes("to toggle")) {
@@ -496,6 +749,14 @@ try {
   const nestedGuideColumn = nestedResultRow ? Math.max(nestedResultRow.indexOf("├"), nestedResultRow.indexOf("└")) : -1;
   if (childFirstCharacterColumn < 0 || nestedGuideColumn !== childFirstCharacterColumn) {
     throw new Error(`grouped nested guide was not below the child row's first character: ${JSON.stringify({ childCallRow, nestedResultRow })}`);
+  }
+  group.setExpanded(false);
+  if ((execution as any).expanded || (groupedPeer as any).expanded || (groupedThird as any).expanded) {
+    throw new Error("global collapse did not reset all per-execution expansion state");
+  }
+  const resetGroup = groupParent.render(120).join("\n").replace(/\x1b\[[0-9;]*m/g, "");
+  if (!resetGroup.includes("click any for details") || resetGroup.includes("Repository")) {
+    throw new Error("global collapse did not restore compact clickable group rows");
   }
 
   const wrappedGroupText = [

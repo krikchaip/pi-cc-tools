@@ -7,6 +7,7 @@
   "expandedPreviewMaxLines": 4000,
   "extraExpandedPreviewMaxLines": 12000,
   "extraToolOutputExpanded": false,
+  "clickExpansion": false,
   "groupToolCalls": true,
   "bashOutputMode": "opencode",
   "bashCollapsedLines": 10,
