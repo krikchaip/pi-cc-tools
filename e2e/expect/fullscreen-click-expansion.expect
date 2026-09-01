@@ -1,0 +1,234 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for standalone cc-tools click expansion.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set session_fixture [file join $repo_dir "e2e" "fixtures" "fullscreen-click-expansion-session.jsonl"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-fullscreen-click-e2e-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set session_path [file join $scratch "session.jsonl"]
+set columns 60
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $session_fixture "r"]
+set session_content [read $fixture]
+close $fixture
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-fullscreen-click-e2e" $cwd] $session_content]
+close $session
+
+set keybindings [open [file join $agent "keybindings.json"] "w"]
+puts $keybindings {{"app.tools.expand":["alt+j"]}}
+close $keybindings
+
+proc write_settings {agent home click_setting} {
+  if {$click_setting eq "enabled"} {
+    set json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":6,"extraExpandedPreviewMaxLines":10}}
+  } else {
+    set json {{"quietStartup":true,"theme":"dark","outputPad":0}}
+  }
+  foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+    set settings [open $path "w"]
+    puts $settings $json
+    close $settings
+  }
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_output {} {
+  set saved_timeout $::timeout
+  set ::timeout 0
+  expect {
+    -re {.+} { exp_continue }
+    timeout {}
+    eof {}
+  }
+  set ::timeout $saved_timeout
+}
+
+proc spawn_pi {cwd home agent pi_bin session_path extension_path columns rows} {
+  global spawn_id
+  cd $cwd
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+    $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+    -e $extension_path --tui-mode fullscreen
+  stty columns $columns rows $rows
+}
+
+# Missing clickExpansion must preserve the baseline keyboard hint.
+write_settings $agent $home disabled
+log_file -noappend [file join $scratch "disabled.ansi"]
+spawn_pi $cwd $home $agent $pi_bin $session_path $extension_path $columns $rows
+if {![wait_for 10 {option\+j.*to expand}]} {
+  puts stderr "default-disabled mode did not preserve the Option+J expand hint"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {102;102;102mclick.*to expand}]} {
+  puts stderr "default-disabled mode exposed click expansion guidance"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+send "\003\003"
+catch {close}
+wait
+log_file
+
+# Explicit clickExpansion=true must replace the standalone keyboard hint.
+write_settings $agent $home enabled
+log_file -noappend [file join $scratch "enabled-collapsed.ansi"]
+spawn_pi $cwd $home $agent $pi_bin $session_path $extension_path $columns $rows
+if {![wait_for 10 {102;102;102mclick.*to expand}]} {
+  puts stderr "enabled standalone execution did not show click-to-expand guidance"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {option\+j.*to expand}]} {
+  puts stderr "enabled standalone execution still advertised Option+J"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# At 60 columns, the shell spacer/border use rows 1-2, the logical header wraps
+# to rows 3-4, and its result summary is row 5.
+log_file
+log_file -noappend [file join $scratch "expanded-from-summary.ansi"]
+send -- "\033\[<0;12;5M\033\[<0;12;5m"
+if {![wait_for 5 {standalone detail 03}]} {
+  puts stderr "standalone execution did not expand from its semantic result summary"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {click.*for more detail}]} {
+  puts stderr "expanded standalone result did not expose its more-detail anchor"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# At this width, the first truncation action wraps to row 10. Click 2 advances
+# only to expandedPreviewMaxLines=6 and keeps the extra-detail gate.
+send -- "\033\[<0;12;10M\033\[<0;12;10m"
+if {![wait_for 5 {standalone detail 06}]} {
+  puts stderr "standalone standard-detail row did not stop at its 6-line cap"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {click.*for more detail}]} {
+  puts stderr "standard-detail layer did not preserve its extra-detail anchor"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Three additional payload rows move the wrapped action to row 13. Click 3
+# advances to extraExpandedPreviewMaxLines=10, not beyond it.
+send -- "\033\[<0;12;13M\033\[<0;12;13m"
+if {![wait_for 5 {standalone detail 10}]} {
+  puts stderr "standalone extra-detail row did not reach its 10-line cap"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Disabling click expansion must reset both local expansion levels immediately.
+send -- "/cc-tools click off\r"
+if {![wait_for 5 {option\+j.*to expand}]} {
+  puts stderr "/cc-tools click off did not restore baseline keyboard guidance"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {Click expansion: off}]} {
+  puts stderr "/cc-tools click off did not report the disabled state"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+send -- "/cc-tools click on\r"
+if {![wait_for 5 {102;102;102mclick.*to expand}]} {
+  puts stderr "/cc-tools click on did not restore click guidance"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {Click expansion: on}]} {
+  puts stderr "/cc-tools click on did not report the enabled state"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+send -- "\033\[<0;12;5M\033\[<0;12;5m"
+if {![wait_for 5 {standalone detail 03}]} {
+  puts stderr "standalone execution did not re-expand after command enable"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Row 4 is the wrapped continuation of the logical header and must collapse it.
+log_file
+log_file -noappend [file join $scratch "collapsed-from-wrapped-header.ansi"]
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+if {![wait_for 5 {102;102;102mclick.*to expand}]} {
+  puts stderr "wrapped standalone header did not collapse its execution"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {standalone detail 03}]} {
+  puts stderr "standalone detail remained visible after wrapped-header collapse"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+after 200
+send "\003\003"
+catch {close}
+puts "ARTIFACTS $scratch"

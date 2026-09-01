@@ -1,0 +1,175 @@
+#!/usr/bin/expect -f
+# Red-capable real-Pi fullscreen regression for final collapse rows and full-row anchors.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set fixture_dir [file join $repo_dir "e2e" "fixtures"]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set assert_path [file join $expect_dir "collapse-row-review-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-collapse-row-review-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"bashCollapsedLines":3,"expandedPreviewMaxLines":5,"extraExpandedPreviewMaxLines":10,"groupToolCalls":true}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+set keybindings [open [file join $agent "keybindings.json"] "w"]
+puts $keybindings {{"app.tools.expand":["alt+j"]}}
+close $keybindings
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc stop_pi {} {
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+}
+
+proc start_pi {label fixture_name} {
+  global scratch cwd home agent pi_bin extension_path fixture_dir columns rows spawn_id
+  set fixture_path [file join $fixture_dir $fixture_name]
+  set source [open $fixture_path "r"]
+  set content [read $source]
+  close $source
+  set session_path [file join $scratch "$label-session.jsonl"]
+  set session [open $session_path "w"]
+  puts -nonewline $session [string map [list "/tmp/pi-cc-tools-collapse-row-review" $cwd] $content]
+  close $session
+  cd $cwd
+  log_file -noappend [file join $scratch "$label.ansi"]
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+    $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+    -e $extension_path --tui-mode fullscreen
+  stty columns $columns rows $rows
+}
+
+proc require_ready {pattern label} {
+  if {![wait_for 10 $pattern]} {
+    puts stderr "$label did not become ready"
+    stop_pi
+    exit 1
+  }
+}
+
+proc append_result {path key value} {
+  set out [open $path "a"]
+  puts $out "$key=$value"
+  close $out
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+set geometry_path [file join $scratch "geometry.txt"]
+
+# Capture the collapsed group header with exact ANSI styling.
+start_pi "group" "collapse-row-review-group-session.jsonl"
+# ANSI style changes can split the visible phrase between `click` and `any`.
+require_ready {click.*any for details} "group fixture"
+after 250
+stop_pi
+
+# Capture the first Read expansion before any detail click.
+start_pi "read-normal" "collapse-row-review-read-session.jsonl"
+require_ready {click.*to expand} "Read fixture"
+# At 100 columns: rows 1-2 are shell spacer/border, row 3 is the header,
+# row 4 is the result summary, rows 5-7 are preview payload, row 8 is the action row.
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+require_ready {REVIEW_READ_03} "Read normal expansion"
+if {![wait_for 5 {more lines}]} {
+  puts stderr "Read normal expansion did not render its hidden-content row"
+  stop_pi
+  exit 1
+}
+after 250
+stop_pi
+
+# The full semantic hidden-content row must activate detail from its left text.
+start_pi "read-left-anchor" "collapse-row-review-read-session.jsonl"
+require_ready {click.*to expand} "Read left-anchor fixture"
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+require_ready {REVIEW_READ_03} "Read left-anchor normal expansion"
+send -- "\033\[<0;5;8M\033\[<0;5;8m"
+append_result $geometry_path "READ_LEFT_TEXT_ACTIVATED" [wait_for 2 {REVIEW_READ_05}]
+stop_pi
+
+# The right description text must activate the same detail action.
+start_pi "read-right-anchor" "collapse-row-review-read-session.jsonl"
+require_ready {click.*to expand} "Read right-anchor fixture"
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+require_ready {REVIEW_READ_03} "Read right-anchor normal expansion"
+send -- "\033\[<0;40;8M\033\[<0;40;8m"
+append_result $geometry_path "READ_RIGHT_TEXT_ACTIVATED" [wait_for 2 {REVIEW_READ_05}]
+stop_pi
+
+# Structural branch connector and trailing padding must remain inert.
+foreach {label column key} {
+  read-connector 1 READ_BRANCH_ACTIVATED
+  read-padding 95 READ_PADDING_ACTIVATED
+} {
+  start_pi $label "collapse-row-review-read-session.jsonl"
+  require_ready {click.*to expand} "$label fixture"
+  send -- "\033\[<0;12;4M\033\[<0;12;4m"
+  require_ready {REVIEW_READ_03} "$label normal expansion"
+  send -- "\033\[<0;$column;8M\033\[<0;$column;8m"
+  append_result $geometry_path $key [wait_for 1 {REVIEW_READ_05}]
+  stop_pi
+}
+
+# Reach Read's final local layer and capture the required branched collapse row.
+start_pi "read-final" "collapse-row-review-read-session.jsonl"
+require_ready {click.*to expand} "Read final fixture"
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+require_ready {REVIEW_READ_03} "Read final normal expansion"
+send -- "\033\[<0;43;8M\033\[<0;43;8m"
+require_ready {REVIEW_READ_05} "Read standard detail"
+# Five payload lines put the intermediate hidden-content row at row 10.
+send -- "\033\[<0;43;10M\033\[<0;43;10m"
+require_ready {REVIEW_READ_FINAL} "Read final detail"
+after 250
+# Seven payload lines put the requested final collapse row at row 12.
+send -- "\033\[<0;12;12M\033\[<0;12;12m"
+append_result $geometry_path "READ_FINAL_COLLAPSE_ACTIVATED" [wait_for 2 {click.*to expand}]
+stop_pi
+
+# Reach Bash's final local layer and capture the same required collapse row.
+start_pi "bash-final" "collapse-row-review-bash-session.jsonl"
+require_ready {click.*to expand} "Bash fixture"
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+require_ready {REVIEW_BASH_03} "Bash normal expansion"
+send -- "\033\[<0;43;8M\033\[<0;43;8m"
+require_ready {REVIEW_BASH_05} "Bash standard detail"
+send -- "\033\[<0;43;10M\033\[<0;43;10m"
+require_ready {REVIEW_BASH_FINAL} "Bash final detail"
+after 250
+send -- "\033\[<0;12;12M\033\[<0;12;12m"
+append_result $geometry_path "BASH_FINAL_COLLAPSE_ACTIVATED" [wait_for 2 {click.*to expand}]
+stop_pi
+
+set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status

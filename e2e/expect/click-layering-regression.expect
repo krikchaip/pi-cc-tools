@@ -1,0 +1,146 @@
+#!/usr/bin/expect -f
+# Red-capable real-Pi regression for click latency and one-layer-at-a-time expansion.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set session_fixture [file join $repo_dir "e2e" "fixtures" "click-layering-regression-session.jsonl"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-click-layering-regression-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set session_path [file join $scratch "session.jsonl"]
+set action_log [file join $scratch "click-action.ansi"]
+set columns 60
+set rows 40
+set max_first_paint_ms 350
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $session_fixture "r"]
+set session_content [read $fixture]
+close $fixture
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-click-layering-regression" $cwd] $session_content]
+close $session
+
+# Keep the existing default expanded caps. The click interaction must still stop
+# at a bounded first layer and expose a second semantic detail gate.
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"expandedPreviewMaxLines":4000,"extraExpandedPreviewMaxLines":12000}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+set keybindings [open [file join $agent "keybindings.json"] "w"]
+puts $keybindings {{"app.tools.expand":["alt+j"]}}
+close $keybindings
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc wait_for_transition {seconds pattern started_at elapsed_var} {
+  upvar $elapsed_var elapsed
+  set deadline [expr {$started_at + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern {
+        set elapsed [expr {[clock milliseconds] - $started_at}]
+        return 1
+      }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_for {seconds} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      -re {.+} { exp_continue -continue_timer }
+      timeout {}
+      eof { return }
+    }
+  }
+}
+
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {102;102;102mclick.*to expand}]} {
+  puts stderr "Pi TUI did not reach the collapsed click anchor"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# At 60 columns the wrapped Read header occupies rows 3-4 and its semantic
+# collapsed result summary is row 5. Rotate the log so startup cannot satisfy
+# any transition assertion.
+log_file
+log_file -noappend $action_log
+set clicked_at [clock milliseconds]
+send -- "\033\[<0;12;5M\033\[<0;12;5m"
+set first_paint_ms -1
+set saw_payload [wait_for_transition 6 {LAYER_(FIRST|DEEP)_MARKER|LAYER_LINE_[0-9]+} $clicked_at first_paint_ms]
+drain_for 1
+send "\003\003"
+catch {close}
+log_file
+
+set action [open $action_log "r"]
+set action_output [read $action]
+close $action
+
+set failed 0
+if {!$saw_payload} {
+  puts stderr "REGRESSION: click produced no visible expanded payload within 6 seconds"
+  set failed 1
+} elseif {$first_paint_ms > $max_first_paint_ms} {
+  puts stderr "REGRESSION: first expanded layer painted in ${first_paint_ms}ms; required <= ${max_first_paint_ms}ms"
+  set failed 1
+}
+
+set has_detail_gate [regexp {for more detail} $action_output]
+set leaked_deep_layer [regexp {LAYER_DEEP_MARKER} $action_output]
+if {!$has_detail_gate} {
+  puts stderr "REGRESSION: first click omitted the second-layer 'click for more detail' gate"
+  set failed 1
+}
+if {$leaked_deep_layer} {
+  puts stderr "REGRESSION: first click exposed LAYER_DEEP_MARKER instead of stopping at the first layer"
+  set failed 1
+}
+
+puts "MEASURED_FIRST_PAINT_MS $first_paint_ms"
+puts "FIRST_LAYER_HAS_DETAIL_GATE $has_detail_gate"
+puts "FIRST_LAYER_EXPOSED_DEEP_MARKER $leaked_deep_layer"
+puts "ARTIFACTS $scratch"
+exit $failed
