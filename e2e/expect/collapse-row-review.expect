@@ -139,21 +139,30 @@ foreach {label column key} {
   stop_pi
 }
 
-# Reach Read's final local layer and capture the required branched collapse row.
-start_pi "read-final" "collapse-row-review-read-session.jsonl"
-require_ready {click.*to expand} "Read final fixture"
-send -- "\033\[<0;12;4M\033\[<0;12;4m"
-require_ready {REVIEW_READ_03} "Read final normal expansion"
-send -- "\033\[<0;43;8M\033\[<0;43;8m"
-require_ready {REVIEW_READ_05} "Read standard detail"
-# Five payload lines put the intermediate hidden-content row at row 10.
-send -- "\033\[<0;43;10M\033\[<0;43;10m"
-require_ready {REVIEW_READ_FINAL} "Read final detail"
-after 250
-# Seven payload lines put the requested final collapse row at row 12.
-send -- "\033\[<0;12;12M\033\[<0;12;12m"
-append_result $geometry_path "READ_FINAL_COLLAPSE_ACTIVATED" [wait_for 2 {click.*to expand}]
-stop_pi
+# The full canonical collapse text must activate from each semantic segment.
+# The final row is `└ Output ends here • click to collapse`: columns 3, 20,
+# 22, and 38 target `O`, `•`, the first `c`, and the trailing `e`.
+foreach {label column key} {
+  read-final 3 READ_COLLAPSE_OUTPUT_ACTIVATED
+  read-collapse-bullet 20 READ_COLLAPSE_BULLET_ACTIVATED
+  read-collapse-click 22 READ_COLLAPSE_CLICK_ACTIVATED
+  read-collapse-trailing-e 38 READ_COLLAPSE_TRAILING_E_ACTIVATED
+} {
+  start_pi $label "collapse-row-review-read-session.jsonl"
+  require_ready {click.*to expand} "$label fixture"
+  send -- "\033\[<0;12;4M\033\[<0;12;4m"
+  require_ready {REVIEW_READ_03} "$label normal expansion"
+  send -- "\033\[<0;43;8M\033\[<0;43;8m"
+  require_ready {REVIEW_READ_05} "$label standard detail"
+  # Five payload lines put the intermediate hidden-content row at row 10.
+  send -- "\033\[<0;43;10M\033\[<0;43;10m"
+  require_ready {REVIEW_READ_FINAL} "$label final detail"
+  after 250
+  # Seven payload lines put the final collapse row at row 12.
+  send -- "\033\[<0;$column;12M\033\[<0;$column;12m"
+  append_result $geometry_path $key [wait_for 2 {click.*to expand}]
+  stop_pi
+}
 
 # Reach Bash's final local layer and capture the same required collapse row.
 start_pi "bash-final" "collapse-row-review-bash-session.jsonl"

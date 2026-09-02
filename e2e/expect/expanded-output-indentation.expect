@@ -1,0 +1,122 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for payload indentation across local detail layers.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "expanded-output-indentation-session.jsonl"]
+set assert_path [file join $expect_dir "expanded-output-indentation-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-expanded-output-indentation-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 64
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $fixture_path "r"]
+set content [read $fixture]
+close $fixture
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-expanded-output-indentation" $cwd] $content]
+close $session
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":7,"extraExpandedPreviewMaxLines":12}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_repaint {} {
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not widen Pi PTY: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not restore Pi PTY: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  return 1
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {click.*to expand}]} { fail "indentation fixture did not become ready" $scratch }
+
+# Result summary is row 4. This opens local detail level 0 (three payload lines).
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+if {![wait_for 5 {INDENT_GRANDCHILD_L0}]} { fail "level 0 did not open" $scratch }
+log_file
+log_file -noappend [file join $scratch "level0.ansi"]
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture level 0 repaint" $scratch }
+
+# Level-0 hidden-content action is row 8. It opens seven logical payload lines.
+log_file
+log_file -noappend [file join $scratch "level1.ansi"]
+send -- "\033\[<0;35;8M\033\[<0;35;8m"
+if {![wait_for 5 {INDENT_WRAP_L1}]} { fail "level 1 did not open" $scratch }
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture level 1 repaint" $scratch }
+
+# Preserving four payload-indent columns wraps the long seventh line onto
+# three physical rows. Its next-detail action is therefore row 14.
+log_file
+log_file -noappend [file join $scratch "level2.ansi"]
+send -- "\033\[<0;35;14M\033\[<0;35;14m"
+if {![wait_for 5 {INDENT_FINAL_L2}]} { fail "level 2 did not open" $scratch }
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture level 2 repaint" $scratch }
+
+send "\003\003"
+catch {close}
+catch {wait}
+log_file
+
+set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status

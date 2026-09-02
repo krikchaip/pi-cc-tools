@@ -183,33 +183,47 @@ for key in ("READ_BRANCH_ACTIVATED", "READ_PADDING_ACTIVATED"):
         fail(f"structural area activated detail: {key}={geometry.get(key)!r}")
 
 # The final Read layer must form one result branch ending at its collapse action.
+collapse_copy = "Output ends here • click to collapse"
+collapse_style = re.compile(
+    r"\x1b\[38;2;128;128;128m(?:\x1b\[[0-9;]*m)*Output ends here • "
+    r"(?:\x1b\[[0-9;]*m)*\x1b\[38;2;102;102;102m(?:\x1b\[[0-9;]*m)*click"
+    r"(?:\x1b\[[0-9;]*m)*\x1b\[38;2;128;128;128m(?:\x1b\[[0-9;]*m)* to collapse"
+)
 read_final = read("read-final.ansi")
-read_final_plain = plain(read_final)
 read_summary = rows_with(read_final, "7 lines loaded")
 read_payload = rows_with(read_final, "REVIEW_READ_01")
-read_collapse = rows_with(read_final, "click to collapse")
+read_collapse = rows_with(read_final, collapse_copy)
+if not any(re.match(rf"^\s*└\s+{re.escape(collapse_copy)}$", row) for row in read_collapse):
+    fail("Read final layer does not end with the canonical terminal collapse row", "\n".join(read_collapse))
+if not collapse_style.search(read_final):
+    fail("Read collapse row did not style only `click` as dim", read_final[read_final.rfind("Output ends here") - 300 :])
+
+# Bash must use the same branch, copy, and final collapse action.
+bash_final = read("bash-final.ansi")
+bash_summary = rows_with(bash_final, "Done", "7 lines")
+bash_payload = rows_with(bash_final, "REVIEW_BASH_01")
+bash_collapse = rows_with(bash_final, collapse_copy)
 if not any(re.match(r"^\s*├\s+7 lines loaded", row) for row in read_summary):
     fail("Read final summary does not open a continuing branch", "\n".join(read_summary))
 if not any(re.match(r"^\s*│\s+REVIEW_READ_01", row) for row in read_payload):
     fail("Read final payload does not continue the result branch", "\n".join(read_payload))
-if not any(re.match(r"^\s*└\s+.*click to collapse", row) for row in read_collapse):
-    fail("Read final layer has no terminal branched collapse row", "\n".join(read_collapse))
-if geometry.get("READ_FINAL_COLLAPSE_ACTIVATED") != "1":
-    fail(f"Read final collapse row was not clickable across its text: {geometry.get('READ_FINAL_COLLAPSE_ACTIVATED')!r}")
-
-# Bash must use the same branch and final collapse action.
-bash_final = read("bash-final.ansi")
-bash_summary = rows_with(bash_final, "Done", "7 lines")
-bash_payload = rows_with(bash_final, "REVIEW_BASH_01")
-bash_collapse = rows_with(bash_final, "click to collapse")
 if not any(re.match(r"^\s*├\s+.*Done.*7 lines", row) for row in bash_summary):
     fail("Bash final summary does not open a continuing branch", "\n".join(bash_summary))
 if not any(re.match(r"^\s*│\s+REVIEW_BASH_01", row) for row in bash_payload):
     fail("Bash final payload does not continue the result branch", "\n".join(bash_payload))
-if not any(re.match(r"^\s*└\s+.*click to collapse", row) for row in bash_collapse):
-    fail("Bash final layer has no terminal branched collapse row", "\n".join(bash_collapse))
-if geometry.get("BASH_FINAL_COLLAPSE_ACTIVATED") != "1":
-    fail(f"Bash final collapse row was not clickable across its text: {geometry.get('BASH_FINAL_COLLAPSE_ACTIVATED')!r}")
+if not any(re.match(rf"^\s*└\s+{re.escape(collapse_copy)}$", row) for row in bash_collapse):
+    fail("Bash final layer does not end with the canonical terminal collapse row", "\n".join(bash_collapse))
+if not collapse_style.search(bash_final):
+    fail("Bash collapse row did not style only `click` as dim", bash_final[bash_final.rfind("Output ends here") - 300 :])
+
+for key in (
+    "READ_COLLAPSE_OUTPUT_ACTIVATED",
+    "READ_COLLAPSE_BULLET_ACTIVATED",
+    "READ_COLLAPSE_CLICK_ACTIVATED",
+    "READ_COLLAPSE_TRAILING_E_ACTIVATED",
+):
+    if geometry.get(key) != "1":
+        fail(f"full collapse text did not activate collapse: {key}={geometry.get(key)!r}")
 
 if failures:
     print("\nCOLLAPSE_ROW_REVIEW_FAIL")

@@ -4,7 +4,6 @@ import { basename, dirname, extname, relative, resolve } from "node:path";
 
 import type {
 	BashToolDetails,
-	EditToolDetails,
 	ExtensionAPI,
 	GrepToolDetails,
 	ReadToolDetails,
@@ -29,7 +28,6 @@ import {
 	createWriteTool,
 } from "@earendil-works/pi-coding-agent";
 import {
-	Box,
 	Container,
 	deleteAllKittyImages,
 	getCapabilities,
@@ -85,6 +83,7 @@ const TOOL_CLICK_OWNER = Symbol.for("pi-claude-style-tools:tool-click-owner");
 const TOOL_CLICK_GLOBAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-global-expanded");
 const TOOL_CLICK_LOCAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-local-expanded");
 const TOOL_CLICK_DETAIL_LEVEL = Symbol.for("pi-claude-style-tools:tool-click-detail-level");
+const TOOL_COLLAPSE_PENDING_VIEWPORT = Symbol.for("pi-claude-style-tools:tool-collapse-pending-viewport");
 const CLICK_HINT_OPEN = "\uE100";
 const CLICK_HINT_SEPARATOR = "\uE101";
 const CLICK_HINT_CLOSE = "\uE102";
@@ -652,13 +651,6 @@ function getToolGroupLabel(tools: any[]): string {
 	return sameName ? humanizeToolName(sameName) : "Multiple Tools";
 }
 
-function getToolGroupOverallStatus(tools: any[]): ToolStatus {
-	const counts = countToolStatuses(tools);
-	if (counts.error > 0) return "error";
-	if (counts.pending > 0) return "pending";
-	return "success";
-}
-
 // Claude Code: solid filled circle that is either fully present or fully gone
 // while pending — never a hollow outlined ○. Classic ● + bold is the sweet
 // spot for ordinary tools. Agent-family tools use a breathing size cycle.
@@ -1019,6 +1011,7 @@ type ToolClickStateSnapshot = {
 	expanded: boolean;
 	locallyExpanded: boolean;
 	detailLevel: ToolClickDetailLevel;
+	collapseViewport?: ToolCollapseViewportSnapshot;
 };
 
 type ReversibleNativeClick = {
@@ -1026,16 +1019,20 @@ type ReversibleNativeClick = {
 	rollback(): void;
 };
 
-function captureToolClickState(tool: any): ToolClickStateSnapshot {
+function captureToolClickState(tool: any, action?: ToolClickAction): ToolClickStateSnapshot {
 	return {
 		expanded: tool?.expanded === true,
 		locallyExpanded: tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true,
 		detailLevel: toolLocalDetailLevel(tool),
+		collapseViewport: action && toolClickActionWillCollapse(tool, action)
+			? captureToolCollapseViewport(tool)
+			: undefined,
 	};
 }
 
 function restoreToolClickState(tool: any, snapshot: ToolClickStateSnapshot): void {
 	if (!tool || typeof tool !== "object") return;
+	clearPendingToolCollapseViewport(tool.rendererState);
 	if (snapshot.locallyExpanded) tool[TOOL_CLICK_LOCAL_EXPANDED] = true;
 	else delete tool[TOOL_CLICK_LOCAL_EXPANDED];
 	if (tool.rendererState) setToolLocalDetailLevel(tool, snapshot.detailLevel);
@@ -1043,6 +1040,7 @@ function restoreToolClickState(tool: any, snapshot: ToolClickStateSnapshot): voi
 	if (tool.expanded !== snapshot.expanded) tool.setExpanded?.(snapshot.expanded);
 	else tool.updateDisplay?.();
 	tool.ui?.requestRender?.();
+	if (snapshot.collapseViewport) restoreToolCollapseViewport(snapshot.collapseViewport);
 }
 
 // A single click repaints immediately. This window exists only so a later
@@ -1094,9 +1092,6 @@ class ToolGroupComponent extends Container {
 	private cachedMode?: string;
 	private cachedExpanded?: boolean;
 	private cachedClickState?: string;
-	private cachedBlinkPhase?: boolean;
-	private cachedStatusKey?: string;
-	private cachedToolCount?: number;
 	private cachedLines?: string[];
 
 	private clearRenderCache(): void {
@@ -1107,9 +1102,6 @@ class ToolGroupComponent extends Container {
 		this.cachedMode = undefined;
 		this.cachedExpanded = undefined;
 		this.cachedClickState = undefined;
-		this.cachedBlinkPhase = undefined;
-		this.cachedStatusKey = undefined;
-		this.cachedToolCount = undefined;
 		this.cachedLines = undefined;
 	}
 
@@ -1211,14 +1203,14 @@ class ToolGroupComponent extends Container {
 			|| event?.dragged === true
 			|| Boolean(event?.url)
 		) return undefined;
-		const tool = this.toolAtPoint(event.x, event.y);
-		if (!tool) return undefined;
-		const snapshot = captureToolClickState(tool);
+		const target = this.clickTargetAtPoint(event.x, event.y);
+		if (!target) return undefined;
+		const snapshot = captureToolClickState(target.tool, target.action);
 		return scheduleNativeSingleClick(
 			this,
 			Number(event.clickCount ?? 1),
 			() => this.toggleToolAtPoint(event.x, event.y),
-			() => restoreToolClickState(tool, snapshot),
+			() => restoreToolClickState(target.tool, snapshot),
 		);
 	}
 
@@ -1330,9 +1322,6 @@ class ToolGroupComponent extends Container {
 			this.cachedMode = toolBackgroundMode;
 			this.cachedExpanded = this.expanded;
 			this.cachedClickState = clickState;
-			this.cachedBlinkPhase = true;
-			this.cachedStatusKey = status.key;
-			this.cachedToolCount = total;
 			this.cachedLines = lines;
 		} else {
 			this.clearRenderCache();
@@ -1354,22 +1343,32 @@ type ToolGroupMouseTarget = {
 	activate(): boolean;
 };
 
+type ToolGroupScrollView = {
+	readonly scrollTop: number;
+	readonly isFollowingEnd: boolean;
+	scrollTo(scrollTop: number, options?: { disableFollow?: boolean }): void;
+};
+
 type ToolGroupLayoutBox = {
 	component: unknown;
 	rect: { x: number; y: number; width: number; height: number };
 	clip: { x: number; y: number; width: number; height: number };
 	children: ToolGroupLayoutBox[];
+	scrollView?: ToolGroupScrollView;
 };
 
 type ToolGroupFullscreenRenderer = {
-	currentLayout?: { root: ToolGroupLayoutBox };
+	currentLayout?: { root: ToolGroupLayoutBox; primaryScrollView?: ToolGroupScrollView };
 	hasOverlay?: () => boolean;
 	hasOverlayEntries?: boolean;
 	handleViewportInput(data: string): unknown;
 	requestRender(): void;
+	renderNow?: () => void;
+	doRender?: () => void;
 	selectionAnchor?: unknown;
 	selectionFocus?: unknown;
 	selectionGranularity?: string;
+	lastClick?: { row?: number; wordStart?: number; wordEnd?: number };
 	selectionInitialRange?: unknown;
 	selectionPressActive?: boolean;
 	selectionDragged?: boolean;
@@ -1394,13 +1393,23 @@ let activeClickInteractiveMode: ToolGroupInteractiveMode | undefined;
 
 type ToolGroupMousePatchState = {
 	modes: WeakMap<object, ToolGroupInteractiveMode>;
-	press?: { x: number; y: number; target?: ToolGroupMouseTarget; moved: boolean; blocked: boolean };
+	press?: {
+		x: number;
+		y: number;
+		wordStartX?: number;
+		wordEndX?: number;
+		target?: ToolGroupMouseTarget;
+		moved: boolean;
+		blocked: boolean;
+	};
 	pendingClick?: {
 		timer: ReturnType<typeof setTimeout>;
 		target: ToolGroupMouseTarget;
 		renderer: ToolGroupFullscreenRenderer;
 		x: number;
 		y: number;
+		wordStartX?: number;
+		wordEndX?: number;
 		rollback(): void;
 	};
 	targetAt?: (
@@ -1436,6 +1445,231 @@ function findToolGroupLayoutBox(
 		if (match) return match;
 	}
 	return undefined;
+}
+
+type ToolCollapseViewportSnapshot = {
+	renderer: ToolGroupFullscreenRenderer;
+	mode: ToolGroupInteractiveMode;
+	scrollView: ToolGroupScrollView;
+	anchorComponent: { render(width: number): string[] };
+	scrollTop: number;
+	contentHeight: number;
+	contentWidth: number;
+	wasFollowingEnd: boolean;
+};
+
+type PendingToolCollapseViewport = {
+	snapshot: ToolCollapseViewportSnapshot;
+	claimed: boolean;
+	postCollapse?: {
+		scrollTop: number;
+		isFollowingEnd: boolean;
+		componentHeight: number;
+	};
+};
+
+const PENDING_TOOL_COLLAPSE_VIEWPORTS = new Set<PendingToolCollapseViewport>();
+
+function toolClickActionWillCollapse(tool: any, action: ToolClickAction): boolean {
+	return (action === "expand" && tool?.expanded === true)
+		|| (action === "detail-extra" && toolLocalDetailLevel(tool) === 2);
+}
+
+function isToolGroupScrollView(value: unknown): value is ToolGroupScrollView {
+	const candidate = value as Partial<ToolGroupScrollView> | undefined;
+	return Boolean(candidate)
+		&& Number.isFinite(candidate?.scrollTop)
+		&& typeof candidate?.isFollowingEnd === "boolean"
+		&& typeof candidate?.scrollTo === "function";
+}
+
+function captureToolCollapseViewport(tool: any): ToolCollapseViewportSnapshot | undefined {
+	const mode = activeClickInteractiveMode;
+	const renderer = mode?.renderer;
+	const frame = renderer?.currentLayout;
+	const scrollView = frame?.primaryScrollView;
+	if (!mode || !renderer || !frame?.root || !isToolGroupScrollView(scrollView)) return undefined;
+	try {
+		const documentBox = findToolGroupLayoutBox(frame.root, mode.documentContainer);
+		const contentWidth = documentBox?.rect?.width;
+		const parent = tool?.[COMPONENT_PARENT];
+		const anchorComponent = isToolGroupComponent(parent) ? parent : tool;
+		if (
+			!documentBox
+			|| !Number.isFinite(contentWidth)
+			|| contentWidth! <= 0
+			|| typeof anchorComponent?.render !== "function"
+		) return undefined;
+		const content = mode.documentContainer.render(contentWidth!);
+		if (!Array.isArray(content)) return undefined;
+		return {
+			renderer,
+			mode,
+			scrollView,
+			anchorComponent,
+			scrollTop: scrollView.scrollTop,
+			contentHeight: content.length,
+			contentWidth: contentWidth!,
+			wasFollowingEnd: scrollView.isFollowingEnd,
+		};
+	} catch {
+		// currentLayout is a private Pi field. A changed layout shape must only turn
+		// off viewport compensation; it must not break click expansion.
+		return undefined;
+	}
+}
+
+function collapseViewportTarget(snapshot: ToolCollapseViewportSnapshot): number | undefined {
+	const nextContent = snapshot.mode.documentContainer.render(snapshot.contentWidth);
+	if (!Array.isArray(nextContent)) return undefined;
+	return snapshot.scrollTop - (snapshot.contentHeight - nextContent.length);
+}
+
+function shiftPendingToolCollapseViewports(
+	scrollView: ToolGroupScrollView,
+	beforeScrollTop: number,
+	beforeFollowingEnd: boolean,
+): void {
+	const scrollDelta = scrollView.scrollTop - beforeScrollTop;
+	for (const pending of PENDING_TOOL_COLLAPSE_VIEWPORTS) {
+		const baseline = pending.postCollapse;
+		if (!baseline || pending.snapshot.scrollView !== scrollView) continue;
+		baseline.scrollTop += scrollDelta;
+		if (baseline.isFollowingEnd === beforeFollowingEnd) {
+			baseline.isFollowingEnd = scrollView.isFollowingEnd;
+		}
+	}
+}
+
+function stabilizeToolCollapseViewport(snapshot: ToolCollapseViewportSnapshot): void {
+	const beforeScrollTop = snapshot.scrollView.scrollTop;
+	const beforeFollowingEnd = snapshot.scrollView.isFollowingEnd;
+	try {
+		const target = collapseViewportTarget(snapshot);
+		if (target === undefined || target === snapshot.scrollTop) return;
+		const options = { disableFollow: !snapshot.wasFollowingEnd };
+		snapshot.scrollView.scrollTo(target, options);
+		// Commit the new content height, then apply disableFollow again. ScrollView
+		// cannot suppress follow at the future maximum while it still has the old height.
+		if (renderToolCollapseViewportNow(snapshot)) snapshot.scrollView.scrollTo(target, options);
+		else snapshot.renderer.requestRender();
+	} catch {
+		// Keep collapse functional if Pi changes its private layout or ScrollView API.
+	} finally {
+		shiftPendingToolCollapseViewports(snapshot.scrollView, beforeScrollTop, beforeFollowingEnd);
+	}
+}
+
+function queuePendingToolCollapseViewport(
+	state: any,
+	snapshot: ToolCollapseViewportSnapshot,
+): PendingToolCollapseViewport | undefined {
+	if (!state || typeof state !== "object") return undefined;
+	const pending: PendingToolCollapseViewport = { snapshot, claimed: false };
+	state[TOOL_COLLAPSE_PENDING_VIEWPORT] = pending;
+	PENDING_TOOL_COLLAPSE_VIEWPORTS.add(pending);
+	return pending;
+}
+
+function claimPendingToolCollapseViewport(state: any): PendingToolCollapseViewport | undefined {
+	const pending = state?.[TOOL_COLLAPSE_PENDING_VIEWPORT] as PendingToolCollapseViewport | undefined;
+	if (pending) pending.claimed = true;
+	return pending;
+}
+
+function rememberPendingToolCollapseViewport(
+	state: any,
+	pending: PendingToolCollapseViewport | undefined,
+): void {
+	if (!pending || state?.[TOOL_COLLAPSE_PENDING_VIEWPORT] !== pending) return;
+	if (!pending.claimed) {
+		delete state[TOOL_COLLAPSE_PENDING_VIEWPORT];
+		PENDING_TOOL_COLLAPSE_VIEWPORTS.delete(pending);
+		return;
+	}
+	try {
+		const { snapshot } = pending;
+		const lines = snapshot.anchorComponent.render(snapshot.contentWidth);
+		if (!Array.isArray(lines)) return;
+		pending.postCollapse = {
+			scrollTop: snapshot.scrollView.scrollTop,
+			isFollowingEnd: snapshot.scrollView.isFollowingEnd,
+			componentHeight: lines.length,
+		};
+	} catch {
+		delete state[TOOL_COLLAPSE_PENDING_VIEWPORT];
+		PENDING_TOOL_COLLAPSE_VIEWPORTS.delete(pending);
+	}
+}
+
+function clearPendingToolCollapseViewport(state: any): void {
+	if (!state || typeof state !== "object") return;
+	const pending = state[TOOL_COLLAPSE_PENDING_VIEWPORT] as PendingToolCollapseViewport | undefined;
+	if (pending) PENDING_TOOL_COLLAPSE_VIEWPORTS.delete(pending);
+	delete state[TOOL_COLLAPSE_PENDING_VIEWPORT];
+}
+
+function settlePendingToolCollapseViewport(state: any, pending: PendingToolCollapseViewport | undefined): void {
+	if (!pending || state?.[TOOL_COLLAPSE_PENDING_VIEWPORT] !== pending) return;
+	clearPendingToolCollapseViewport(state);
+	const { snapshot, postCollapse } = pending;
+	if (!postCollapse) return;
+	const beforeScrollTop = snapshot.scrollView.scrollTop;
+	const beforeFollowingEnd = snapshot.scrollView.isFollowingEnd;
+	try {
+		// Do not override a scroll or follow-mode change made while the async diff ran.
+		if (
+			snapshot.scrollView.scrollTop !== postCollapse.scrollTop
+			|| snapshot.scrollView.isFollowingEnd !== postCollapse.isFollowingEnd
+		) return;
+		const lines = snapshot.anchorComponent.render(snapshot.contentWidth);
+		if (!Array.isArray(lines)) return;
+		const heightDelta = lines.length - postCollapse.componentHeight;
+		if (heightDelta === 0) return;
+		// Commit the settled component height before scrolling to a target that can
+		// be outside the placeholder layout's old range.
+		if (!renderToolCollapseViewportNow(snapshot)) return;
+		snapshot.scrollView.scrollTo(postCollapse.scrollTop + heightDelta, {
+			disableFollow: !postCollapse.isFollowingEnd,
+		});
+	} catch {
+		return;
+	} finally {
+		shiftPendingToolCollapseViewports(snapshot.scrollView, beforeScrollTop, beforeFollowingEnd);
+	}
+	if (!renderToolCollapseViewportNow(snapshot)) snapshot.renderer.requestRender();
+}
+
+function renderToolCollapseViewportNow(snapshot: ToolCollapseViewportSnapshot): boolean {
+	const render = typeof snapshot.renderer.renderNow === "function"
+		? snapshot.renderer.renderNow
+		: snapshot.renderer.doRender;
+	if (typeof render !== "function") return false;
+	try {
+		render.call(snapshot.renderer);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function restoreToolCollapseViewport(snapshot: ToolCollapseViewportSnapshot): void {
+	// Double/triple-click restores the pre-click geometry before Pi selects text.
+	// Prefer public renderNow. The guarded doRender fallback supports Pi 0.84.
+	const beforeScrollTop = snapshot.scrollView.scrollTop;
+	const beforeFollowingEnd = snapshot.scrollView.isFollowingEnd;
+	try {
+		if (!renderToolCollapseViewportNow(snapshot)) {
+			snapshot.renderer.requestRender();
+			return;
+		}
+		snapshot.scrollView.scrollTo(snapshot.scrollTop, { disableFollow: !snapshot.wasFollowingEnd });
+		if (!renderToolCollapseViewportNow(snapshot)) snapshot.renderer.requestRender();
+	} catch {
+		return;
+	} finally {
+		shiftPendingToolCollapseViewports(snapshot.scrollView, beforeScrollTop, beforeFollowingEnd);
+	}
 }
 
 function toolGroupAtScreenPoint(
@@ -1512,7 +1746,13 @@ function installToolGroupMouseAdapter(): void {
 			const isLeftButton = event !== undefined && (event.button & 3) === 0;
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0) {
 				const pending = state!.pendingClick;
-				if (pending && pending.x === event.x && pending.y === event.y) {
+				const sameWord = pending
+					&& pending.renderer === this
+					&& pending.y === event.y
+					&& (pending.wordStartX === undefined || pending.wordEndX === undefined
+						? pending.x === event.x
+						: event.x >= pending.wordStartX && event.x < pending.wordEndX);
+				if (pending && sameWord) {
 					clearTimeout(pending.timer);
 					state!.pendingClick = undefined;
 					pending.rollback();
@@ -1534,6 +1774,19 @@ function installToolGroupMouseAdapter(): void {
 			const result = originalHandleViewportInput.call(this, data);
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0 && state!.press) {
 				state!.press.blocked = this.selectionGranularity !== "character" || Boolean(this.pressedUrl);
+				const anchor = this.selectionAnchor as { row?: number; col?: number } | undefined;
+				const click = this.lastClick;
+				if (
+					anchor
+					&& click
+					&& anchor.row === click.row
+					&& typeof anchor.col === "number"
+					&& typeof click.wordStart === "number"
+					&& typeof click.wordEnd === "number"
+				) {
+					state!.press.wordStartX = event.x - (anchor.col - click.wordStart);
+					state!.press.wordEndX = event.x + (click.wordEnd - anchor.col);
+				}
 			}
 			if (event?.release) {
 				const press = state!.press;
@@ -1551,7 +1804,7 @@ function installToolGroupMouseAdapter(): void {
 					&& press.target?.action === target?.action
 					&& target
 				) {
-					const snapshot = captureToolClickState(target.component);
+					const snapshot = captureToolClickState(target.component, target.action);
 					clearToolGroupMouseSelection(this);
 					if (target.activate()) {
 						this.requestRender();
@@ -1561,6 +1814,8 @@ function installToolGroupMouseAdapter(): void {
 							renderer: this,
 							x: event.x,
 							y: event.y,
+							wordStartX: press.wordStartX,
+							wordEndX: press.wordEndX,
 							rollback: () => restoreToolClickState(target.component, snapshot),
 						};
 						pending.timer = setTimeout(() => {
@@ -2010,7 +2265,9 @@ function baselineDeepExpandHint(theme: Theme | undefined, separatorColor: "muted
 	return `${hintSeparator(theme, separatorColor)}${rawKeyHint("ctrl+shift+o", extraToolOutputExpanded ? "less detail" : "more detail")}`;
 }
 
-function encodedClickHint(action: "expand" | "detail" | "detail-extra" | "none", fallback: string): string {
+type EncodedClickHintAction = "expand" | "detail" | "detail-extra" | "collapse-final" | "none";
+
+function encodedClickHint(action: EncodedClickHintAction, fallback: string): string {
 	return `${CLICK_HINT_OPEN}${action}${CLICK_HINT_SEPARATOR}${fallback}${CLICK_HINT_CLOSE}`;
 }
 
@@ -2023,7 +2280,7 @@ function deepExpandHint(
 }
 
 function localCollapseActionHint(theme: Theme | undefined): string {
-	return encodedClickHint("expand", expandHint(theme, "collapse"));
+	return encodedClickHint("collapse-final", expandHint(theme, "collapse"));
 }
 
 function baselineToolOutputDetailHint(theme: Theme | undefined, expanded: boolean, hasMore = false): string {
@@ -2063,7 +2320,20 @@ function clickHintText(action: "expand" | "detail" | "detail-extra", tool: any):
 	return `${separator}${click}${theme ? theme.fg("muted", description) : description}`;
 }
 
-type ResolvedClickAnchor = { action: "expand" | "detail" | "detail-extra"; text: string };
+function finalCollapseHintText(): string {
+	const theme = getGlobalPiTheme() as Theme | undefined;
+	const beforeClick = "Output ends here • ";
+	const click = "click";
+	const afterClick = " to collapse";
+	if (!theme) return `${beforeClick}${click}${afterClick}`;
+	return `${theme.fg("muted", beforeClick)}${theme.fg("dim", click)}${theme.fg("muted", afterClick)}`;
+}
+
+type ResolvedClickAnchor = {
+	action: "expand" | "detail" | "detail-extra";
+	text: string;
+	exactTextSpan?: boolean;
+};
 
 function resolveClickHints(text: string, tool: any): { text: string; anchors: ResolvedClickAnchor[] } {
 	let output = "";
@@ -2082,14 +2352,14 @@ function resolveClickHints(text: string, tool: any): { text: string; anchors: Re
 			output += text.slice(open);
 			break;
 		}
-		const action = text.slice(open + CLICK_HINT_OPEN.length, separator) as "expand" | "detail" | "detail-extra" | "none";
+		const action = text.slice(open + CLICK_HINT_OPEN.length, separator) as EncodedClickHintAction;
 		const fallback = text.slice(separator + CLICK_HINT_SEPARATOR.length, close);
 		if (!toolClickExpansionActive(tool)) {
 			output += fallback;
-		} else if (action === "expand") {
-			const hint = clickHintText("expand", tool);
+		} else if (action === "expand" || action === "collapse-final") {
+			const hint = action === "collapse-final" ? finalCollapseHintText() : clickHintText("expand", tool);
 			output += hint;
-			anchors.push({ action: "expand", text: stripAnsi(hint).trim() });
+			anchors.push({ action: "expand", text: stripAnsi(hint).trim(), exactTextSpan: action === "collapse-final" });
 		} else if ((action === "detail" || action === "detail-extra") && (!extraToolOutputExpanded || tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true)) {
 			const hint = clickHintText(action, tool);
 			if (anchors.some((anchor) => anchor.action === "expand")) output += CLICK_CONTROL_BREAK_MARK;
@@ -2099,13 +2369,6 @@ function resolveClickHints(text: string, tool: any): { text: string; anchors: Re
 		cursor = close + CLICK_HINT_CLOSE.length;
 	}
 	return { text: output, anchors };
-}
-
-function clearStateKeys(state: Record<string, unknown> | undefined, ...keys: string[]): void {
-	if (!state) return;
-	for (const key of keys) {
-		delete state[key];
-	}
 }
 
 function clearToolRenderCache(value: unknown): void {
@@ -2122,9 +2385,10 @@ function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): vo
 	(timer as any)?.unref?.();
 }
 
-function safeInvalidate(ctx: any): void {
+function safeInvalidate(ctx: any, pendingViewport?: PendingToolCollapseViewport): void {
 	try {
 		if (typeof ctx?.invalidate === "function") ctx.invalidate();
+		settlePendingToolCollapseViewport(ctx?.state, pendingViewport);
 	} catch {
 		// Tool render contexts may outlive their row during reload/session switches.
 	}
@@ -2858,7 +3122,7 @@ function stripOsc133Zones(line: string): string {
 }
 
 function stripBackgroundAnsi(text: string): string {
-	return text.replace(/\x1b\[([0-9;]*)m/g, (match, paramsText: string) => {
+	return text.replace(/\x1b\[([0-9;]*)m/g, (_match, paramsText: string) => {
 		const params = paramsText === "" ? ["0"] : paramsText.split(";");
 		const kept: string[] = [];
 		for (let i = 0; i < params.length; i++) {
@@ -3236,6 +3500,13 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 
 function activateToolClickAction(tool: any, action: ToolClickAction): boolean {
 	if (!toolClickExpansionActive(tool)) return false;
+	clearPendingToolCollapseViewport(tool.rendererState);
+	const collapseViewport = toolClickActionWillCollapse(tool, action)
+		? captureToolCollapseViewport(tool)
+		: undefined;
+	const pendingViewport = collapseViewport
+		? queuePendingToolCollapseViewport(tool.rendererState, collapseViewport)
+		: undefined;
 	if (action === "detail" || action === "detail-extra") {
 		if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
 		tool[TOOL_CLICK_LOCAL_EXPANDED] = true;
@@ -3257,6 +3528,8 @@ function activateToolClickAction(tool: any, action: ToolClickAction): boolean {
 		tool.setExpanded?.(next);
 	}
 	tool.ui?.requestRender?.();
+	if (collapseViewport) stabilizeToolCollapseViewport(collapseViewport);
+	rememberPendingToolCollapseViewport(tool.rendererState, pendingViewport);
 	return true;
 }
 
@@ -3303,7 +3576,7 @@ function patchToolExecutionRenderers(): void {
 		) return undefined;
 		const action = this.clickActionAtPoint(event.x, event.y);
 		if (!action) return undefined;
-		const snapshot = captureToolClickState(this);
+		const snapshot = captureToolClickState(this, action);
 		return scheduleNativeSingleClick(
 			this,
 			Number(event.clickCount ?? 1),
@@ -3389,10 +3662,6 @@ function shortPath(cwd: string, filePath: string): string {
 // ---------------------------------------------------------------------------
 // Status dot — flickers green/gray while pending
 // ---------------------------------------------------------------------------
-
-function isBlinkOn(): boolean {
-	return Math.floor(Date.now() / 500) % 2 === 0;
-}
 
 function toolHeader(tool: string, summary: string, theme: Theme, prefix = "", trailing = ""): string {
 	applyThemePaletteIfNeeded(theme);
@@ -3706,12 +3975,6 @@ function trackRtkOriginalBashCommand(toolCallId: unknown, args: unknown): void {
 	}
 }
 
-function forgetRtkBashCommand(toolCallId: unknown): void {
-	if (typeof toolCallId !== "string") return;
-	RTK_ORIGINAL_BASH_COMMANDS.delete(toolCallId);
-	RTK_REWRITES_BY_TOOL_ID.delete(toolCallId);
-}
-
 function clearRtkRewriteState(): void {
 	RTK_ORIGINAL_BASH_COMMANDS.clear();
 	RTK_REWRITES_BY_TOOL_ID.clear();
@@ -3766,7 +4029,7 @@ function withClippedBranch(content: string, theme: Theme, continued = false): st
 	return withBranch(content, theme, false, continued).replaceAll(WRAP_MARK, CLIP_MARK);
 }
 
-function withFinalBranchBlock(content: string, theme: Theme, isError = false): string {
+function withFinalBranchBlock(content: string, theme: Theme): string {
 	if (!content || !content.trim()) return "";
 	const lines = content.split("\n");
 	const first = lines[0] ?? "";
@@ -3936,11 +4199,6 @@ function clearBlinkTimer(ctx: any): void {
 	_scheduleGlobalBlinkTimer();
 }
 
-function pendingToolChromeColor(theme: Theme): "dim" | "muted" | "thinkingText" {
-	if (!themeAdaptiveEnabled()) return "muted";
-	return "dim";
-}
-
 function blinkDot(ctx: any, theme: Theme): string {
 	// Only true in-flight tools arm the blink timer. Idle partials (args still
 	// streaming, or history rows left isPartial without a result) stay static.
@@ -4090,9 +4348,24 @@ function wrapMarkedLine(line: string, width: number): string[] {
 	const body = stripWrapMarks(line.slice(marker.index + marker.mark.length));
 	const prefixWidth = visibleWidth(prefix);
 	const bodyWidth = Math.max(1, width - prefixWidth);
-	const wrapped = wrapTextWithAnsi(body, bodyWidth);
+	// wrapTextWithAnsi keeps leading whitespace only on its first row. Separate
+	// payload indentation from leading SGR codes, then add it back to every row.
+	// Reduce the wrap width by the same amount so continuation rows never clip.
+	const leading = /^((?:\x1b\[[0-9;]*m)*)([ \t]+)/.exec(body);
+	const bodyIndent = leading?.[2] ?? "";
+	const indentWidth = visibleWidth(bodyIndent);
+	const unindentedBody = leading
+		? `${leading[1]}${body.slice(leading[0].length)}`
+		: body;
+	const wrapped = wrapTextWithAnsi(unindentedBody, Math.max(1, bodyWidth - indentWidth));
 	const continuation = markedContinuationPrefix(prefix);
-	return wrapped.map((part, index) => (index === 0 ? `${prefix}${part}` : `${continuation}${part}`));
+	return wrapped.map((part, index) => {
+		const leadingAnsi = /^(?:\x1b\[[0-9;]*m)*/.exec(part)?.[0] ?? "";
+		const indentedPart = bodyIndent
+			? `${leadingAnsi}${bodyIndent}${part.slice(leadingAnsi.length)}`
+			: part;
+		return `${index === 0 ? prefix : continuation}${indentedPart}`;
+	});
 }
 
 type ToolTextSemanticRow = {
@@ -4229,7 +4502,12 @@ class ToolText extends Text {
 					const partText = stripAnsi(part);
 					for (const anchor of resolved.anchors) {
 						if (resolved.anchors.length === 1) {
-							semanticRows.push({ line: lineIndex, text: line, action: anchor.action });
+							semanticRows.push({
+								line: lineIndex,
+								text: line,
+								action: anchor.action,
+								...(anchor.exactTextSpan ? { anchorText: anchor.text } : {}),
+							});
 							continue;
 						}
 						const target = toolSupportsProgressiveLocalDetail(tool)
@@ -4828,20 +5106,6 @@ function liveBranchDisplay(state: Record<string, unknown> | undefined, theme: Th
 	return undefined;
 }
 
-function refreshToolBranchDisplaysInState(state: Record<string, unknown> | undefined, theme: Theme): void {
-	if (!state || typeof state !== "object") return;
-	const body = state._ptBody;
-	if (typeof body === "string" && body.trim() && !body.includes("(rendering")) {
-		state._ptDisplay = indentBranchBlock(withBranch(body, theme, false, true));
-		return;
-	}
-	const display = state._ptDisplay;
-	if (typeof display === "string" && display.trim()) {
-		const stripped = stripBranchMarkupBlock(display);
-		state._ptDisplay = indentBranchBlock(withBranch(stripped, theme, false, true));
-	}
-}
-
 function refreshAllToolBranchVisuals(ctx: any): void {
 	_settingsCache = null;
 	syncToolBackgroundMode();
@@ -4904,17 +5168,6 @@ interface DiffColors {
 let DEFAULT_DIFF_COLORS: DiffColors = { fgAdd: FG_ADD, fgDel: FG_DEL, fgCtx: FG_DIM };
 let autoDerivePending = true;
 let hasExplicitBgConfig = false;
-
-function mixBg(
-	base: { r: number; g: number; b: number },
-	accent: { r: number; g: number; b: number },
-	intensity: number,
-): string {
-	const r = Math.round(base.r + (accent.r - base.r) * intensity);
-	const g = Math.round(base.g + (accent.g - base.g) * intensity);
-	const b = Math.round(base.b + (accent.b - base.b) * intensity);
-	return `\x1b[48;2;${r};${g};${b}m`;
-}
 
 // pi-tool-display tint targets for diff palette derivation
 const ADDITION_TINT_TARGET = { r: 84, g: 190, b: 118 };
@@ -6104,6 +6357,7 @@ function renderEditPreviewBody(
 	diffs: ParsedDiff[],
 	lines: number[],
 	summary: string,
+	pendingViewport?: PendingToolCollapseViewport,
 ): void {
 	const dc = resolveDiffColors(theme);
 	const branchWidth = contextDiffWidth(ctx, 3);
@@ -6120,13 +6374,13 @@ function renderEditPreviewBody(
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}\n${rendered}`;
 				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
-				safeInvalidate(ctx);
+				safeInvalidate(ctx, pendingViewport);
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}`;
 				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
-				safeInvalidate(ctx);
+				safeInvalidate(ctx, pendingViewport);
 			});
 		return;
 	}
@@ -6153,13 +6407,13 @@ function renderEditPreviewBody(
 				: "";
 			ctx.state._ptBody = `${operations.length} edits ${summary}\n\n${sections.join("\n\n")}${suffix}`;
 			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
-			safeInvalidate(ctx);
+			safeInvalidate(ctx, pendingViewport);
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
 			ctx.state._ptBody = `${operations.length} edits ${summary}`;
 			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
-			safeInvalidate(ctx);
+			safeInvalidate(ctx, pendingViewport);
 		});
 }
 
@@ -7003,6 +7257,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 		ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
 		ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 		const dc = resolveDiffColors(theme);
+		const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
 			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
@@ -7010,13 +7265,13 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`;
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
-					safeInvalidate(ctx);
+					safeInvalidate(ctx, pendingViewport);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
-					safeInvalidate(ctx);
+					safeInvalidate(ctx, pendingViewport);
 				});
 		} else {
 			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change, index) =>
@@ -7033,13 +7288,13 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 					const summary = `${preview.changes.length} files ${preview.summary}`;
 					ctx.state._applyPatchPreviewBody = `${summary}\n\n${sections.join("\n\n")}${suffix}`;
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
-					safeInvalidate(ctx);
+					safeInvalidate(ctx, pendingViewport);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${preview.changes.length} files ${preview.summary}`;
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
-					safeInvalidate(ctx);
+					safeInvalidate(ctx, pendingViewport);
 				});
 		}
 	}
@@ -8335,16 +8590,17 @@ export default function (pi: ExtensionAPI) {
 					ctx.state._wdk = key;
 					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
 					const dc = resolveDiffColors(theme);
+					const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 					renderSplit(d.diff, d.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._wdk !== key) return;
 							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
-							safeInvalidate(ctx);
+							safeInvalidate(ctx, pendingViewport);
 						})
 						.catch(() => {
 							if (ctx.state._wdk !== key) return;
 							ctx.state._wdt = withBranch(richSummary, theme);
-							safeInvalidate(ctx);
+							safeInvalidate(ctx, pendingViewport);
 						});
 				}
 				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._wdt ?? withBranch(richSummary, theme));
@@ -8366,16 +8622,17 @@ export default function (pi: ExtensionAPI) {
 					ctx.state._nfk = pk;
 					ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
 					const dc = resolveDiffColors(theme);
+					const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 					renderUnified(syntheticDiff, lang(d.filePath), { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._nfk !== pk) return;
 							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
-							safeInvalidate(ctx);
+							safeInvalidate(ctx, pendingViewport);
 						})
 						.catch(() => {
 							if (ctx.state._nfk !== pk) return;
 							ctx.state._nft = withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme);
-							safeInvalidate(ctx);
+							safeInvalidate(ctx, pendingViewport);
 						});
 				}
 				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._nft ?? withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme));
@@ -8444,16 +8701,17 @@ export default function (pi: ExtensionAPI) {
 				ctx.state._ptBody = theme.fg("muted", "(rendering…)");
 				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
 				const lg = lang(fp);
+				const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 				void computeLocalizedEditDiffs(fp, operations, cwd)
 					.then((localizedDiffs) => {
 						if (ctx.state._pk !== key) return;
 						const diffs = localizedDiffs?.map((entry) => entry.diff) ?? fallbackDiffs;
 						const lines = localizedDiffs?.map((entry) => entry.line) ?? diffs.map((diff) => getFirstChangedNewLine(diff));
-						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, editSummary);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, editSummary, pendingViewport);
 					})
 					.catch(() => {
 						if (ctx.state._pk !== key) return;
-						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary, pendingViewport);
 					});
 			}
 			const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
