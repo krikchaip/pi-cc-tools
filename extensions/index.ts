@@ -3560,6 +3560,13 @@ function clickAnchorStart(line: string): number {
 	return start;
 }
 
+function toolHasEffectiveClickAction(tool: any): boolean {
+	if (tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true) return true;
+	return [tool.callRendererComponent, tool.resultRendererComponent]
+		.filter((component): component is ToolText => component instanceof ToolText)
+		.some((component) => component.hasClickAction(tool));
+}
+
 function updateToolClickAnchors(tool: any, rendered: string[]): void {
 	if (!toolClickExpansionActive(tool)) {
 		tool[TOOL_CLICK_ANCHORS] = [];
@@ -3596,6 +3603,7 @@ function activateToolClickAction(
 	viewportAnchor: ToolViewportAnchor = "top",
 ): boolean {
 	if (!toolClickExpansionActive(tool)) return false;
+	if ((action === "header" || action === "expand") && !toolHasEffectiveClickAction(tool)) return false;
 	if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
 	clearPendingToolCollapseViewport(tool.rendererState);
 	const clickViewport = captureToolCollapseViewport(tool, viewportAnchor);
@@ -4540,6 +4548,10 @@ class ToolText extends Text {
 
 	getSemanticRows(): ToolTextSemanticRow[] {
 		return this.semanticRows;
+	}
+
+	hasClickAction(tool: any): boolean {
+		return this.value.split("\n").some((line) => resolveClickHints(line, tool).anchors.length > 0);
 	}
 
 	invalidate(): void {
