@@ -1,0 +1,168 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for bottom-collapse viewport anchoring.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "collapse-scroll-position-session.jsonl"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-collapse-scroll-position-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":100,"extraExpandedPreviewMaxLines":200,"groupToolCalls":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-collapse-scroll-position" $cwd] $content]
+close $session
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_for {seconds} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      timeout {}
+      eof { return }
+    }
+  }
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+set startup_log [file join $scratch "startup.ansi"]
+log_file -noappend $startup_log
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {UNRELATED_AFTER_FINAL}]} {
+  fail "collapse-scroll fixture did not become ready" $scratch
+}
+# One page-up moves from later transcript content to the collapsed Read.
+send -- "\033\[5~"
+if {![wait_for 2 {click.*to expand}]} {
+  fail "could not scroll to the collapsed Read execution" $scratch
+}
+# At 100x40: header row 12, result summary row 13.
+send -- "\033\[<0;15;13M\033\[<0;15;13m"
+if {![wait_for 3 {click.*for more detail}]} {
+  fail "Read normal preview did not open" $scratch
+}
+# The three-line preview puts its detail gate on row 17.
+send -- "\033\[<0;20;17M\033\[<0;20;17m"
+if {![wait_for 3 {COLLAPSE_SCROLL_PAYLOAD_01}]} {
+  fail "Read final detail layer did not open" $scratch
+}
+# Two page-downs place the final collapse anchor on row 24 while later
+# unrelated transcript content still exists below it.
+send -- "\033\[6~"
+wait_for 1 {COLLAPSE_SCROLL_PAYLOAD}
+send -- "\033\[6~"
+if {![wait_for 2 {click.*to collapse}]} {
+  fail "bottom collapse anchor did not enter the viewport" $scratch
+}
+
+set collapse_log [file join $scratch "collapse.ansi"]
+log_file
+log_file -noappend $collapse_log
+send -- "\033\[<0;25;24M\033\[<0;25;24m"
+if {![wait_for 3 {click.*to expand}]} {
+  fail "collapse jumped away from the clicked tool execution" $scratch
+}
+# Full repaint proves the final terminal viewport, not only transition bytes.
+set pi_pid [exp_pid]
+stty columns 101 rows $rows
+catch {exec kill -WINCH $pi_pid}
+drain_for 1
+stty columns $columns rows $rows
+catch {exec kill -WINCH $pi_pid}
+drain_for 1
+log_file
+
+set capture_file [open $collapse_log "r"]
+fconfigure $capture_file -encoding utf-8
+set capture [read $capture_file]
+close $capture_file
+if {[string first "collapse-scroll-position.txt" $capture] < 0
+    || [string first "to expand" $capture] < 0} {
+  fail "collapsed Read execution is absent from the post-collapse viewport" $scratch
+}
+if {[string first "UNRELATED_AFTER_FINAL" $capture] >= 0} {
+  fail "post-collapse viewport snapped to unrelated later transcript content" $scratch
+}
+if {[string first "COLLAPSE_SCROLL_PAYLOAD" $capture] >= 0} {
+  fail "post-collapse viewport retained expanded payload rows" $scratch
+}
+
+# Adjacent cells in the same word must remain Pi's native double-click word
+# selection. The first click expands immediately; the second press rolls it back.
+set double_log [file join $scratch "double-click.ansi"]
+log_file
+log_file -noappend $double_log
+send -- "\033\[<0;21;24M\033\[<0;21;24m"
+send -- "\033\[<0;22;24M\033\[<0;22;24m"
+drain_for 1
+stty columns 101 rows $rows
+catch {exec kill -WINCH $pi_pid}
+drain_for 1
+stty columns $columns rows $rows
+catch {exec kill -WINCH $pi_pid}
+drain_for 1
+log_file
+set double_file [open $double_log "r"]
+fconfigure $double_file -encoding utf-8
+set double_capture [read $double_file]
+close $double_file
+if {[string first "to expand" $double_capture] < 0
+    || [string first "COLLAPSE_SCROLL_PAYLOAD" $double_capture] >= 0} {
+  fail "same-word double click activated the summary instead of selecting text" $scratch
+}
+
+send "\003\003"
+catch {close}
+catch {wait}
+puts "PASS bottom-collapse viewport remains anchored and double click selects text"
+puts "ARTIFACTS $scratch"
+exit 0
