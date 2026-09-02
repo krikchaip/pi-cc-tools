@@ -1,0 +1,202 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for async Create/Edit/Write click repaint stability.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "async-diff-click-session.jsonl"]
+set assert_path [file join $expect_dir "async-diff-click-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-async-diff-click-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":100,"extraExpandedPreviewMaxLines":200,"groupToolCalls":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-async-diff-click" $cwd] $content]
+close $session
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_repaint {} {
+  wait_for 1 {__PI_CC_TOOLS_ASYNC_DIFF_DRAIN__}
+}
+
+proc settle_async_diff {} {
+  wait_for 2 {__PI_CC_TOOLS_ASYNC_DIFF_SETTLED__}
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not widen Pi PTY: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not restore Pi PTY: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  return 1
+}
+
+proc capture {path columns rows} {
+  log_file
+  log_file -noappend $path
+  if {![force_fullscreen_repaint $columns $rows]} { return 0 }
+  log_file
+  return 1
+}
+
+proc locate {assert_path path pattern} {
+  if {[catch {exec python3 $assert_path locate $path $pattern} result]} { return {} }
+  return $result
+}
+
+proc find_visible {path pattern max_pages columns rows assert_path} {
+  for {set attempt 0} {$attempt <= $max_pages} {incr attempt} {
+    if {![capture $path $columns $rows]} { return {} }
+    set point [locate $assert_path $path $pattern]
+    if {[llength $point] == 2} { return $point }
+    send -- "\033\[5~"
+    drain_repaint
+  }
+  return {}
+}
+
+proc click {x y} {
+  send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {AFTER_EDIT_FINAL}]} { fail "async diff fixture did not become ready" $scratch }
+
+# Find the collapsed Create execution from the end of the transcript.
+set header_before [file join $scratch "header-before-expand.ansi"]
+set header_point [find_visible $header_before "powerline-narrow.expect" 8 $columns $rows $assert_path]
+if {[llength $header_point] != 2} { fail "could not place Create header in viewport" $scratch }
+# Fine-scroll toward later content so the header sits near the viewport top.
+# This exposes both the top anchor and the compact diff boundary at once.
+for {set wheel 0} {$wheel < 9} {incr wheel} {
+  send -- "\033\[<65;50;20M"
+}
+drain_repaint
+if {![capture $header_before $columns $rows]} { fail "could not recapture positioned Create header" $scratch }
+set header_point [locate $assert_path $header_before "powerline-narrow.expect"]
+if {[llength $header_point] != 2} { fail "fine scroll moved Create header out of viewport" $scratch }
+lassign $header_point _header_path_x header_y
+set header_x 5
+
+# Expand and collapse from the top header anchor.
+log_file -noappend [file join $scratch "header-expand-transition.ansi"]
+click $header_x $header_y
+settle_async_diff
+log_file
+if {![capture [file join $scratch "header-after-expand.ansi"] $columns $rows]} { fail "could not capture header expansion" $scratch }
+
+log_file -noappend [file join $scratch "header-collapse-transition.ansi"]
+click $header_x $header_y
+settle_async_diff
+log_file
+if {![capture [file join $scratch "header-after-collapse.ansi"] $columns $rows]} { fail "could not capture header collapse" $scratch }
+
+# Expand and collapse from the result-summary top anchor.
+set summary_before [file join $scratch "summary-before-expand.ansi"]
+if {![capture $summary_before $columns $rows]} { fail "could not capture result summary" $scratch }
+set summary_point [locate $assert_path $summary_before "+33"]
+if {[llength $summary_point] != 2} { fail "could not locate Create result summary" $scratch }
+lassign $summary_point summary_x summary_y
+
+log_file -noappend [file join $scratch "summary-expand-transition.ansi"]
+click $summary_x $summary_y
+settle_async_diff
+log_file
+if {![capture [file join $scratch "summary-after-expand.ansi"] $columns $rows]} { fail "could not capture summary expansion" $scratch }
+
+log_file -noappend [file join $scratch "summary-collapse-transition.ansi"]
+click $summary_x $summary_y
+settle_async_diff
+log_file
+if {![capture [file join $scratch "summary-after-collapse.ansi"] $columns $rows]} { fail "could not capture summary collapse" $scratch }
+
+# Reopen from the summary, place the bottom anchor in view, then collapse it.
+click $summary_x $summary_y
+settle_async_diff
+set bottom_before [file join $scratch "bottom-before-collapse.ansi"]
+set bottom_point {}
+for {set attempt 0} {$attempt < 6 && [llength $bottom_point] != 2} {incr attempt} {
+  if {![capture $bottom_before $columns $rows]} { fail "could not capture bottom-anchor search" $scratch }
+  set bottom_point [locate $assert_path $bottom_before "click to collapse"]
+  if {[llength $bottom_point] != 2} {
+    send -- "\033\[6~"
+    drain_repaint
+  }
+}
+if {[llength $bottom_point] != 2} { fail "could not place Create bottom anchor in viewport" $scratch }
+lassign $bottom_point bottom_x bottom_y
+
+log_file -noappend [file join $scratch "bottom-collapse-transition.ansi"]
+click $bottom_x $bottom_y
+if {![wait_for 4 {more diff lines}]} { fail "Create bottom anchor did not collapse" $scratch }
+log_file
+if {![capture [file join $scratch "bottom-after-collapse.ansi"] $columns $rows]} { fail "could not capture bottom collapse" $scratch }
+
+send "\003\003"
+catch {close}
+catch {wait}
+log_file
+
+set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status

@@ -561,6 +561,13 @@ await withRendererHarness(
       ) {
         throw new Error(`paired Write summary was not clickable: ${JSON.stringify(collapsedPairedWriteRows)}`);
       }
+      const immediatePairedWriteRows = pairedWriteExecution.render(180).map((line: string) => plain(line));
+      if (
+        immediatePairedWriteRows.some((line: string) => line.includes("rendering diff"))
+        || !immediatePairedWriteRows.some((line: string) => line.includes("old paired line 1"))
+      ) {
+        throw new Error(`paired Write replaced its stable preview during async expansion: ${JSON.stringify(immediatePairedWriteRows)}`);
+      }
       const collapseText = "Output ends here • click to collapse";
       await waitFor(
         () => pairedWriteExecution.render(180).some((line: string) => plain(line).includes(collapseText)),
@@ -608,6 +615,13 @@ await withRendererHarness(
         )
       ) {
         throw new Error(`new-file Write summary was not clickable: ${JSON.stringify(collapsedNewFileRows)}`);
+      }
+      const immediateNewFileRows = newFileWriteExecution.render(120).map((line: string) => plain(line));
+      if (
+        immediateNewFileRows.some((line: string) => line.includes("rendering diff"))
+        || !immediateNewFileRows.some((line: string) => line.includes("new file line 1"))
+      ) {
+        throw new Error(`new-file Write replaced its stable preview during async expansion: ${JSON.stringify(immediateNewFileRows)}`);
       }
       const collapseText = "Output ends here • click to collapse";
       await waitFor(
@@ -971,8 +985,21 @@ await withRendererHarness(
       ) {
         throw new Error(`async Edit summary was not clickable: ${JSON.stringify(collapsedAsyncEditRows)}`);
       }
+      const immediateExpandedEditRows = asyncEditExecution.render(120).map((line: string) => plain(line));
+      if (
+        immediateExpandedEditRows.some((line: string) => line.includes("rendering"))
+        || !immediateExpandedEditRows.some((line: string) => line.includes("old async line 1"))
+      ) {
+        throw new Error(`Edit replaced its stable preview during async expansion: ${JSON.stringify(immediateExpandedEditRows)}`);
+      }
       await waitFor(
-        () => asyncEditExecution.render(120).some((line: string) => plain(line).includes("more diff lines")),
+        () => asyncEditExecution.rendererState?._ptAsyncRenderPending !== true
+          && asyncEditExecution.render(120).some((line: string, row: number) => (
+            plain(line).includes("more diff lines")
+            && Array.from({ length: 120 }, (_, x) => x).some(
+              (x) => asyncEditExecution.clickActionAtPoint(x, row) === "detail",
+            )
+          )),
         "normal expanded async Edit preview",
       );
       const normalAsyncEditRows = asyncEditExecution.render(120).map((line: string) => plain(line));
@@ -985,6 +1012,13 @@ await withRendererHarness(
       if (asyncEditDetailRow < 0 || !asyncEditExecution.activateClickAction("detail")) {
         throw new Error(`normal async Edit preview lacked a detail action: ${JSON.stringify(normalAsyncEditRows)}`);
       }
+      const immediateDetailedEditRows = asyncEditExecution.render(120).map((line: string) => plain(line));
+      if (
+        immediateDetailedEditRows.some((line: string) => line.includes("rendering"))
+        || !immediateDetailedEditRows.some((line: string) => line.includes("old async line 1"))
+      ) {
+        throw new Error(`Edit replaced its stable preview during async detail expansion: ${JSON.stringify(immediateDetailedEditRows)}`);
+      }
       const collapseText = "Output ends here • click to collapse";
       await waitFor(
         () => asyncEditExecution.render(120).some((line: string) => plain(line).includes(collapseText)),
@@ -994,6 +1028,23 @@ await withRendererHarness(
       if (detailedAsyncEditRows.some((line: string) => line.includes("more diff lines"))) {
         throw new Error(`async Edit level 1 did not retain its configured 200-line budget: ${JSON.stringify(detailedAsyncEditRows)}`);
       }
+      if (!asyncEditExecution.activateClickAction("expand", "bottom")) {
+        throw new Error("async Edit bottom anchor did not start collapse");
+      }
+      const immediateCollapsedEditRows = asyncEditExecution.render(120).map((line: string) => plain(line));
+      if (
+        immediateCollapsedEditRows.some((line: string) => line.includes("rendering"))
+        || !immediateCollapsedEditRows.some((line: string) => line.includes("old async line 80"))
+      ) {
+        throw new Error(`Edit replaced its stable preview during async bottom collapse: ${JSON.stringify(immediateCollapsedEditRows)}`);
+      }
+      if (asyncEditExecution.activateClickAction("expand", "bottom")) {
+        throw new Error("pending Edit bottom anchor re-expanded the execution");
+      }
+      await waitFor(
+        () => asyncEditExecution.render(120).some((line: string) => plain(line).includes("more diff lines")),
+        "async Edit bottom collapse completion",
+      );
     }
 
     {
