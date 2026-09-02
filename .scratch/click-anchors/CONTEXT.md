@@ -33,7 +33,7 @@ The execution summary row and every physical terminal row created when that logi
 _Avoid_: First line, top two lines
 
 **Result summary row**:
-A renderer-declared row below a standalone header block that summarizes status, counts, or a diff without exposing raw payload.
+A renderer-declared row beneath an execution summary that summarizes status, counts, or a diff without exposing raw payload. It can appear in a standalone tool execution or a tool group. During click expansion, it is a stable expansion anchor: it expands a collapsed execution and collapses an expanded execution.
 _Avoid_: Second line, payload row
 
 **Action row**:
@@ -74,6 +74,13 @@ _Avoid_: Global expansion mode
 **Local detail state**:
 The normal-detail or more-detail state of one tool execution, changed without changing its peers.
 _Avoid_: Extra detail setting
+
+**Returned content**:
+The content already present in one tool result. Source content that requires another tool execution, such as a later Read offset, is outside the current returned content.
+
+**Effective final detail layer**:
+The first more-detail state at which no more returned content can be revealed. It can occur before the highest configured detail level. A content-exhausted normal preview is not an effective final detail layer.
+_Avoid_: Level 2, maximum level
 
 **Expansion target**:
 The one tool execution whose expanded state changes when its click anchor is activated.
