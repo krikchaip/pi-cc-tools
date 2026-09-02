@@ -851,6 +851,7 @@ type ToolGroupClickAnchor = {
 	end: number;
 	tool: any;
 	action: ToolClickAction;
+	viewportAnchor: ToolViewportAnchor;
 };
 
 function hasNativeMouseDispatch(): boolean {
@@ -868,17 +869,31 @@ type ToolClickStateSnapshot = {
 
 type ReversibleNativeClick = {
 	timer: ReturnType<typeof setTimeout>;
+	owner: object;
 	rollback(): void;
+	state?: ToolGroupMousePatchState;
+	renderer?: ToolGroupFullscreenRenderer;
+	x?: number;
+	y?: number;
+	wordStartX?: number;
+	wordEndX?: number;
 };
 
-function captureToolClickState(tool: any, action?: ToolClickAction): ToolClickStateSnapshot {
+let activeNativeMouseDispatch: {
+	state: ToolGroupMousePatchState;
+	renderer: ToolGroupFullscreenRenderer;
+} | undefined;
+
+function captureToolClickState(
+	tool: any,
+	action?: ToolClickAction,
+	viewportAnchor: ToolViewportAnchor = "top",
+): ToolClickStateSnapshot {
 	return {
 		expanded: tool?.expanded === true,
 		locallyExpanded: tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true,
 		detailLevel: toolLocalDetailLevel(tool),
-		collapseViewport: action && toolClickActionWillCollapse(tool, action)
-			? captureToolCollapseViewport(tool)
-			: undefined,
+		collapseViewport: action ? captureToolCollapseViewport(tool, viewportAnchor) : undefined,
 	};
 }
 
@@ -898,6 +913,13 @@ function restoreToolClickState(tool: any, snapshot: ToolClickStateSnapshot): voi
 // A single click repaints immediately. This window exists only so a later
 // double/triple-click can restore the pre-click geometry for text selection.
 const NATIVE_CLICK_TIMERS = new WeakMap<object, ReversibleNativeClick>();
+
+function clearReversibleNativeClick(entry: ReversibleNativeClick): void {
+	clearTimeout(entry.timer);
+	if (NATIVE_CLICK_TIMERS.get(entry.owner) === entry) NATIVE_CLICK_TIMERS.delete(entry.owner);
+	if (entry.state?.nativePendingClick === entry) delete entry.state.nativePendingClick;
+}
+
 function scheduleNativeSingleClick(
 	owner: object,
 	clickCount: number,
@@ -906,22 +928,30 @@ function scheduleNativeSingleClick(
 ): any {
 	const pending = NATIVE_CLICK_TIMERS.get(owner);
 	if (pending) {
-		clearTimeout(pending.timer);
-		NATIVE_CLICK_TIMERS.delete(owner);
+		clearReversibleNativeClick(pending);
 		if (clickCount > 1) pending.rollback();
 	}
 	if (clickCount > 1) return undefined;
 	if (!activate()) return undefined;
+	const dispatch = activeNativeMouseDispatch;
+	const press = dispatch?.state.press;
 	const entry: ReversibleNativeClick = {
 		timer: undefined as unknown as ReturnType<typeof setTimeout>,
+		owner,
 		rollback,
+		...(dispatch && press ? {
+			state: dispatch.state,
+			renderer: dispatch.renderer,
+			x: press.x,
+			y: press.y,
+			wordStartX: press.wordStartX,
+			wordEndX: press.wordEndX,
+		} : {}),
 	};
-	entry.timer = setTimeout(() => {
-		if (NATIVE_CLICK_TIMERS.get(owner) !== entry) return;
-		NATIVE_CLICK_TIMERS.delete(owner);
-	}, 510);
+	entry.timer = setTimeout(() => clearReversibleNativeClick(entry), 510);
 	unrefTimer(entry.timer);
 	NATIVE_CLICK_TIMERS.set(owner, entry);
+	if (entry.state) entry.state.nativePendingClick = entry;
 	return { handled: true };
 }
 
@@ -1023,24 +1053,16 @@ class ToolGroupComponent extends Container {
 		return !this.expanded && this.tools.some((tool) => toolClickExpansionActive(tool));
 	}
 
-	private clickTargetAtPoint(x: number, y: number): ToolGroupClickAnchor | undefined {
+	clickAnchorAtPoint(x: number, y: number): ToolGroupClickAnchor | undefined {
 		if (!this.clickAnchorsEnabled()) return undefined;
 		return this.clickAnchors.find((anchor) => (
 			y === anchor.line && x >= anchor.start && x < anchor.end
 		));
 	}
 
-	toolAtPoint(x: number, y: number): any | undefined {
-		return this.clickTargetAtPoint(x, y)?.tool;
-	}
-
-	actionAtPoint(x: number, y: number): ToolClickAction | undefined {
-		return this.clickTargetAtPoint(x, y)?.action;
-	}
-
 	toggleToolAtPoint(x: number, y: number): boolean {
-		const target = this.clickTargetAtPoint(x, y);
-		if (!target || !activateToolClickAction(target.tool, target.action)) return false;
+		const target = this.clickAnchorAtPoint(x, y);
+		if (!target || !activateToolClickAction(target.tool, target.action, target.viewportAnchor)) return false;
 		this.clearRenderCache();
 		return true;
 	}
@@ -1055,9 +1077,9 @@ class ToolGroupComponent extends Container {
 			|| event?.dragged === true
 			|| Boolean(event?.url)
 		) return undefined;
-		const target = this.clickTargetAtPoint(event.x, event.y);
+		const target = this.clickAnchorAtPoint(event.x, event.y);
 		if (!target) return undefined;
-		const snapshot = captureToolClickState(target.tool, target.action);
+		const snapshot = captureToolClickState(target.tool, target.action, target.viewportAnchor);
 		return scheduleNativeSingleClick(
 			this,
 			Number(event.clickCount ?? 1),
@@ -1137,7 +1159,14 @@ class ToolGroupComponent extends Container {
 				for (let row = 0; row < Math.min(headerRows, branched.length); row++) {
 					const start = clickAnchorStart(branched[row]);
 					const end = visibleWidth(stripAnsi(branched[row]).trimEnd());
-					if (end > start) this.clickAnchors.push({ line: lines.length + row, start, end, tool, action: "header" });
+					if (end > start) this.clickAnchors.push({
+					line: lines.length + row,
+					start,
+					end,
+					tool,
+					action: "header",
+					viewportAnchor: "top",
+				});
 				}
 				if (childExpanded && tool.resultRendererComponent instanceof ToolText) {
 					for (const semantic of tool.resultRendererComponent.getSemanticRows()) {
@@ -1157,7 +1186,14 @@ class ToolGroupComponent extends Container {
 						const targetIndex = semantic.anchorText ? plain.indexOf(semantic.anchorText) : -1;
 						const start = targetIndex >= 0 ? visibleWidth(plain.slice(0, targetIndex)) : clickAnchorStart(branched[row]);
 						const end = targetIndex >= 0 ? start + visibleWidth(semantic.anchorText!) : visibleWidth(plain.trimEnd());
-						if (end > start) this.clickAnchors.push({ line: lines.length + row, start, end, tool, action: semantic.action });
+						if (end > start) this.clickAnchors.push({
+					line: lines.length + row,
+					start,
+					end,
+					tool,
+					action: semantic.action,
+					viewportAnchor: semantic.viewportAnchor,
+				});
 					}
 				}
 			}
@@ -1192,6 +1228,7 @@ type SgrMouseEvent = {
 type ToolGroupMouseTarget = {
 	component: any;
 	action: ToolClickAction;
+	viewportAnchor: ToolViewportAnchor;
 	activate(): boolean;
 };
 
@@ -1245,6 +1282,7 @@ let activeClickInteractiveMode: ToolGroupInteractiveMode | undefined;
 
 type ToolGroupMousePatchState = {
 	modes: WeakMap<object, ToolGroupInteractiveMode>;
+	nativePendingClick?: ReversibleNativeClick;
 	press?: {
 		x: number;
 		y: number;
@@ -1304,6 +1342,7 @@ type ToolCollapseViewportSnapshot = {
 	mode: ToolGroupInteractiveMode;
 	scrollView: ToolGroupScrollView;
 	anchorComponent: { render(width: number): string[] };
+	viewportAnchor: ToolViewportAnchor;
 	scrollTop: number;
 	contentHeight: number;
 	contentWidth: number;
@@ -1322,11 +1361,6 @@ type PendingToolCollapseViewport = {
 
 const PENDING_TOOL_COLLAPSE_VIEWPORTS = new Set<PendingToolCollapseViewport>();
 
-function toolClickActionWillCollapse(tool: any, action: ToolClickAction): boolean {
-	return (action === "expand" && tool?.expanded === true)
-		|| (action === "detail-extra" && toolLocalDetailLevel(tool) === 2);
-}
-
 function isToolGroupScrollView(value: unknown): value is ToolGroupScrollView {
 	const candidate = value as Partial<ToolGroupScrollView> | undefined;
 	return Boolean(candidate)
@@ -1335,7 +1369,10 @@ function isToolGroupScrollView(value: unknown): value is ToolGroupScrollView {
 		&& typeof candidate?.scrollTo === "function";
 }
 
-function captureToolCollapseViewport(tool: any): ToolCollapseViewportSnapshot | undefined {
+function captureToolCollapseViewport(
+	tool: any,
+	viewportAnchor: ToolViewportAnchor,
+): ToolCollapseViewportSnapshot | undefined {
 	const mode = activeClickInteractiveMode;
 	const renderer = mode?.renderer;
 	const frame = renderer?.currentLayout;
@@ -1359,6 +1396,7 @@ function captureToolCollapseViewport(tool: any): ToolCollapseViewportSnapshot | 
 			mode,
 			scrollView,
 			anchorComponent,
+			viewportAnchor,
 			scrollTop: scrollView.scrollTop,
 			contentHeight: content.length,
 			contentWidth: contentWidth!,
@@ -1372,9 +1410,30 @@ function captureToolCollapseViewport(tool: any): ToolCollapseViewportSnapshot | 
 }
 
 function collapseViewportTarget(snapshot: ToolCollapseViewportSnapshot): number | undefined {
+	if (snapshot.viewportAnchor === "top") return snapshot.scrollTop;
 	const nextContent = snapshot.mode.documentContainer.render(snapshot.contentWidth);
 	if (!Array.isArray(nextContent)) return undefined;
-	return snapshot.scrollTop - (snapshot.contentHeight - nextContent.length);
+	// Pi also clamps scrollTo(), but make the top-boundary fallback explicit:
+	// if removed rows exceed available scrollback, preserve as much of the
+	// transcript below the bottom anchor as the document boundary permits.
+	return Math.max(0, snapshot.scrollTop - (snapshot.contentHeight - nextContent.length));
+}
+
+function scrollToToolViewportTarget(
+	snapshot: ToolCollapseViewportSnapshot,
+	target: number,
+	wasFollowingEnd: boolean,
+): void {
+	const preserveFollowingEnd = snapshot.viewportAnchor === "bottom" && wasFollowingEnd;
+	snapshot.scrollView.scrollTo(target, { disableFollow: !preserveFollowingEnd });
+	// A top anchor can stay fixed only while the requested scrollTop exists.
+	// If collapse removes that scroll range, accept the boundary clamp and
+	// restore follow mode when the viewport was following the end before click.
+	if (
+		snapshot.viewportAnchor === "top"
+		&& wasFollowingEnd
+		&& snapshot.scrollView.scrollTop !== target
+	) snapshot.scrollView.scrollTo(target, { disableFollow: false });
 }
 
 function shiftPendingToolCollapseViewports(
@@ -1398,13 +1457,15 @@ function stabilizeToolCollapseViewport(snapshot: ToolCollapseViewportSnapshot): 
 	const beforeFollowingEnd = snapshot.scrollView.isFollowingEnd;
 	try {
 		const target = collapseViewportTarget(snapshot);
-		if (target === undefined || target === snapshot.scrollTop) return;
-		const options = { disableFollow: !snapshot.wasFollowingEnd };
-		snapshot.scrollView.scrollTo(target, options);
-		// Commit the new content height, then apply disableFollow again. ScrollView
-		// cannot suppress follow at the future maximum while it still has the old height.
-		if (renderToolCollapseViewportNow(snapshot)) snapshot.scrollView.scrollTo(target, options);
-		else snapshot.renderer.requestRender();
+		if (target === undefined) return;
+		// Bottom collapse can request a target outside the old layout. Give the
+		// ScrollView an early target, then commit the new geometry and apply it again.
+		if (snapshot.viewportAnchor === "bottom") {
+			scrollToToolViewportTarget(snapshot, target, snapshot.wasFollowingEnd);
+		}
+		if (renderToolCollapseViewportNow(snapshot)) {
+			scrollToToolViewportTarget(snapshot, target, snapshot.wasFollowingEnd);
+		} else snapshot.renderer.requestRender();
 	} catch {
 		// Keep collapse functional if Pi changes its private layout or ScrollView API.
 	} finally {
@@ -1442,7 +1503,10 @@ function rememberPendingToolCollapseViewport(
 	try {
 		const { snapshot } = pending;
 		const lines = snapshot.anchorComponent.render(snapshot.contentWidth);
-		if (!Array.isArray(lines)) return;
+		if (!Array.isArray(lines)) {
+			clearPendingToolCollapseViewport(state);
+			return;
+		}
 		pending.postCollapse = {
 			scrollTop: snapshot.scrollView.scrollTop,
 			isFollowingEnd: snapshot.scrollView.isFollowingEnd,
@@ -1481,9 +1545,10 @@ function settlePendingToolCollapseViewport(state: any, pending: PendingToolColla
 		// Commit the settled component height before scrolling to a target that can
 		// be outside the placeholder layout's old range.
 		if (!renderToolCollapseViewportNow(snapshot)) return;
-		snapshot.scrollView.scrollTo(postCollapse.scrollTop + heightDelta, {
-			disableFollow: !postCollapse.isFollowingEnd,
-		});
+		const target = snapshot.viewportAnchor === "bottom"
+			? postCollapse.scrollTop + heightDelta
+			: postCollapse.scrollTop;
+		scrollToToolViewportTarget(snapshot, target, postCollapse.isFollowingEnd);
 	} catch {
 		return;
 	} finally {
@@ -1544,22 +1609,23 @@ function toolGroupAtScreenPoint(
 		const localX = x - documentBox.rect.x;
 		const localY = y - row;
 		if (isToolGroupComponent(component)) {
-			const tool = component.toolAtPoint(localX, localY);
-			const action = component.actionAtPoint(localX, localY);
-			if (tool && action) {
+			const anchor = component.clickAnchorAtPoint(localX, localY);
+			if (anchor) {
 				return {
-					component: tool,
-					action,
+					component: anchor.tool,
+					action: anchor.action,
+					viewportAnchor: anchor.viewportAnchor,
 					activate: () => component.toggleToolAtPoint(localX, localY),
 				};
 			}
 		} else if (component instanceof ToolExecutionComponent) {
-			const action = (component as any).clickActionAtPoint?.(localX, localY) as ToolClickAction | undefined;
-			if (action) {
+			const anchor = (component as any).clickAnchorAtPoint?.(localX, localY) as ToolClickAnchor | undefined;
+			if (anchor) {
 				return {
 					component,
-					action,
-					activate: () => (component as any).activateClickAction?.(action) === true,
+					action: anchor.action,
+					viewportAnchor: anchor.viewportAnchor,
+					activate: () => (component as any).activateClickAction?.(anchor.action, anchor.viewportAnchor) === true,
 				};
 			}
 		}
@@ -1590,14 +1656,13 @@ function installToolGroupMouseAdapter(): void {
 	if (!state) {
 		state = { modes: new WeakMap() };
 		fullscreenPrototype[TOOL_GROUP_MOUSE_PATCH_FLAG] = state;
-		if (!nativeMouseDispatch) {
 		const originalHandleViewportInput = fullscreenPrototype.handleViewportInput;
 		fullscreenPrototype.handleViewportInput = function (this: ToolGroupFullscreenRenderer, data: string) {
 			const event = parseToolGroupSgrMouseEvent(data);
 			const mode = state!.modes.get(this);
 			const isLeftButton = event !== undefined && (event.button & 3) === 0;
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0) {
-				const pending = state!.pendingClick;
+				const pending = nativeMouseDispatch ? state!.nativePendingClick : state!.pendingClick;
 				const sameWord = pending
 					&& pending.renderer === this
 					&& pending.y === event.y
@@ -1605,12 +1670,16 @@ function installToolGroupMouseAdapter(): void {
 						? pending.x === event.x
 						: event.x >= pending.wordStartX && event.x < pending.wordEndX);
 				if (pending && sameWord) {
-					clearTimeout(pending.timer);
-					state!.pendingClick = undefined;
+					if (nativeMouseDispatch) clearReversibleNativeClick(pending as ReversibleNativeClick);
+					else {
+						clearTimeout(pending.timer);
+						state!.pendingClick = undefined;
+					}
 					pending.rollback();
 					// Rebuild geometry before Pi resolves the second press as a word or
-					// line selection. doRender is synchronous in the raw-SGR host.
-					(this as any).doRender?.();
+					// line selection, even if the first click removed its MouseRegion.
+					if (typeof this.renderNow === "function") this.renderNow();
+					else this.doRender?.();
 				}
 				state!.press = {
 					x: event.x,
@@ -1623,7 +1692,14 @@ function installToolGroupMouseAdapter(): void {
 				if (event.x !== state!.press.x || event.y !== state!.press.y) state!.press.moved = true;
 			}
 
-			const result = originalHandleViewportInput.call(this, data);
+			const previousNativeDispatch = activeNativeMouseDispatch;
+			if (nativeMouseDispatch) activeNativeMouseDispatch = { state: state!, renderer: this };
+			let result: unknown;
+			try {
+				result = originalHandleViewportInput.call(this, data);
+			} finally {
+				activeNativeMouseDispatch = previousNativeDispatch;
+			}
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0 && state!.press) {
 				state!.press.blocked = this.selectionGranularity !== "character" || Boolean(this.pressedUrl);
 				const anchor = this.selectionAnchor as { row?: number; col?: number } | undefined;
@@ -1645,7 +1721,8 @@ function installToolGroupMouseAdapter(): void {
 				state!.press = undefined;
 				const target = mode ? state!.targetAt?.(this, mode, event.x, event.y) : undefined;
 				if (
-					isLeftButton
+					!nativeMouseDispatch
+					&& isLeftButton
 					&& press
 					&& !press.moved
 					&& !press.blocked
@@ -1654,9 +1731,10 @@ function installToolGroupMouseAdapter(): void {
 					&& press.y === event.y
 					&& press.target?.component === target?.component
 					&& press.target?.action === target?.action
+					&& press.target?.viewportAnchor === target?.viewportAnchor
 					&& target
 				) {
-					const snapshot = captureToolClickState(target.component, target.action);
+					const snapshot = captureToolClickState(target.component, target.action, target.viewportAnchor);
 					clearToolGroupMouseSelection(this);
 					if (target.activate()) {
 						this.requestRender();
@@ -1681,7 +1759,6 @@ function installToolGroupMouseAdapter(): void {
 			}
 			return result;
 		};
-		}
 	}
 	state.targetAt = toolGroupAtScreenPoint;
 
@@ -1954,12 +2031,14 @@ let localDetailRenderTool: any;
 let clickVisualEpoch = 0;
 
 type ToolClickAction = "header" | "expand" | "detail" | "detail-extra";
+type ToolViewportAnchor = "top" | "bottom";
 
 type ToolClickAnchor = {
 	line: number;
 	start: number;
 	end: number;
 	action: ToolClickAction;
+	viewportAnchor: ToolViewportAnchor;
 };
 
 function syncExtraToolDetailMode(): void {
@@ -2115,6 +2194,7 @@ function finalCollapseHintText(): string {
 type ResolvedClickAnchor = {
 	action: "expand" | "detail" | "detail-extra";
 	text: string;
+	viewportAnchor: ToolViewportAnchor;
 	exactTextSpan?: boolean;
 };
 
@@ -2142,12 +2222,17 @@ function resolveClickHints(text: string, tool: any): { text: string; anchors: Re
 		} else if (action === "expand" || action === "collapse-final") {
 			const hint = action === "collapse-final" ? finalCollapseHintText() : clickHintText("expand", tool);
 			output += hint;
-			anchors.push({ action: "expand", text: stripAnsi(hint).trim(), exactTextSpan: action === "collapse-final" });
+			anchors.push({
+			action: "expand",
+			text: stripAnsi(hint).trim(),
+			viewportAnchor: action === "collapse-final" ? "bottom" : "top",
+			exactTextSpan: action === "collapse-final",
+		});
 		} else if ((action === "detail" || action === "detail-extra") && (!extraToolOutputExpanded || tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true)) {
 			const hint = clickHintText(action, tool);
 			if (anchors.some((anchor) => anchor.action === "expand")) output += CLICK_CONTROL_BREAK_MARK;
 			output += hint;
-			anchors.push({ action, text: stripAnsi(hint).trim() });
+			anchors.push({ action, text: stripAnsi(hint).trim(), viewportAnchor: "top" });
 		}
 		cursor = close + CLICK_HINT_CLOSE.length;
 	}
@@ -2171,9 +2256,10 @@ function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): vo
 function safeInvalidate(ctx: any, pendingViewport?: PendingToolCollapseViewport): void {
 	try {
 		if (typeof ctx?.invalidate === "function") ctx.invalidate();
-		settlePendingToolCollapseViewport(ctx?.state, pendingViewport);
 	} catch {
 		// Tool render contexts may outlive their row during reload/session switches.
+	} finally {
+		settlePendingToolCollapseViewport(ctx?.state, pendingViewport);
 	}
 }
 
@@ -3226,23 +3312,31 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 			const targetIndex = semantic.anchorText ? plain.indexOf(semantic.anchorText) : -1;
 			const start = targetIndex >= 0 ? visibleWidth(plain.slice(0, targetIndex)) : clickAnchorStart(rendered[matched]);
 			const end = targetIndex >= 0 ? start + visibleWidth(semantic.anchorText!) : visibleWidth(plain.trimEnd());
-			if (end > start) anchors.push({ line: matched, start, end, action: semantic.action });
+			if (end > start) anchors.push({
+				line: matched,
+				start,
+				end,
+				action: semantic.action,
+				viewportAnchor: semantic.viewportAnchor,
+			});
 		}
 	}
 	tool[TOOL_CLICK_ANCHORS] = anchors;
 }
 
-function activateToolClickAction(tool: any, action: ToolClickAction): boolean {
+function activateToolClickAction(
+	tool: any,
+	action: ToolClickAction,
+	viewportAnchor: ToolViewportAnchor = "top",
+): boolean {
 	if (!toolClickExpansionActive(tool)) return false;
+	if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
 	clearPendingToolCollapseViewport(tool.rendererState);
-	const collapseViewport = toolClickActionWillCollapse(tool, action)
-		? captureToolCollapseViewport(tool)
-		: undefined;
-	const pendingViewport = collapseViewport
-		? queuePendingToolCollapseViewport(tool.rendererState, collapseViewport)
+	const clickViewport = captureToolCollapseViewport(tool, viewportAnchor);
+	const pendingViewport = clickViewport
+		? queuePendingToolCollapseViewport(tool.rendererState, clickViewport)
 		: undefined;
 	if (action === "detail" || action === "detail-extra") {
-		if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
 		tool[TOOL_CLICK_LOCAL_EXPANDED] = true;
 		const nextLevel = action === "detail-extra"
 			? toolLocalDetailLevel(tool) === 2 ? 0 : 2
@@ -3262,7 +3356,7 @@ function activateToolClickAction(tool: any, action: ToolClickAction): boolean {
 		tool.setExpanded?.(next);
 	}
 	tool.ui?.requestRender?.();
-	if (collapseViewport) stabilizeToolCollapseViewport(collapseViewport);
+	if (clickViewport) stabilizeToolCollapseViewport(clickViewport);
 	rememberPendingToolCollapseViewport(tool.rendererState, pendingViewport);
 	return true;
 }
@@ -3289,15 +3383,22 @@ function patchToolExecutionRenderers(): void {
 		};
 	}
 
-	proto.clickActionAtPoint = function clickActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+	proto.clickAnchorAtPoint = function clickAnchorAtPoint(x: number, y: number): ToolClickAnchor | undefined {
 		if (!toolClickExpansionActive(this)) return undefined;
 		return (this[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined)?.find((anchor) => (
 			y === anchor.line && x >= anchor.start && x < anchor.end
-		))?.action;
+		));
 	};
 
-	proto.activateClickAction = function activateClickAction(action: ToolClickAction): boolean {
-		return activateToolClickAction(this, action);
+	proto.clickActionAtPoint = function clickActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+		return this.clickAnchorAtPoint(x, y)?.action;
+	};
+
+	proto.activateClickAction = function activateClickAction(
+		action: ToolClickAction,
+		viewportAnchor: ToolViewportAnchor = "top",
+	): boolean {
+		return activateToolClickAction(this, action, viewportAnchor);
 	};
 
 	proto.handleMouse = function handleToolMouse(event: any): any {
@@ -3308,13 +3409,13 @@ function patchToolExecutionRenderers(): void {
 			|| event?.dragged === true
 			|| Boolean(event?.url)
 		) return undefined;
-		const action = this.clickActionAtPoint(event.x, event.y);
-		if (!action) return undefined;
-		const snapshot = captureToolClickState(this, action);
+		const anchor = this.clickAnchorAtPoint(event.x, event.y) as ToolClickAnchor | undefined;
+		if (!anchor) return undefined;
+		const snapshot = captureToolClickState(this, anchor.action, anchor.viewportAnchor);
 		return scheduleNativeSingleClick(
 			this,
 			Number(event.clickCount ?? 1),
-			() => this.activateClickAction(action),
+			() => this.activateClickAction(anchor.action, anchor.viewportAnchor),
 			() => restoreToolClickState(this, snapshot),
 		);
 	};
@@ -4016,6 +4117,7 @@ type ToolTextSemanticRow = {
 	line: number;
 	text: string;
 	action: ToolClickAction;
+	viewportAnchor: ToolViewportAnchor;
 	anchorText?: string;
 };
 
@@ -4116,8 +4218,8 @@ class ToolText extends Text {
 					const line = `${horizontalPad}${padToWidth(part, contentWidth)}${horizontalPad}`;
 					const lineIndex = rendered.length;
 					rendered.push(line);
-					if (header) semanticRows.push({ line: lineIndex, text: line, action: "header" });
-					if (resultSummary) semanticRows.push({ line: lineIndex, text: line, action: "expand" });
+					if (header) semanticRows.push({ line: lineIndex, text: line, action: "header", viewportAnchor: "top" });
+					if (resultSummary) semanticRows.push({ line: lineIndex, text: line, action: "expand", viewportAnchor: "top" });
 					const partText = stripAnsi(part);
 					for (const anchor of resolved.anchors) {
 						if (resolved.anchors.length === 1) {
@@ -4125,6 +4227,7 @@ class ToolText extends Text {
 								line: lineIndex,
 								text: line,
 								action: anchor.action,
+								viewportAnchor: anchor.viewportAnchor,
 								...(anchor.exactTextSpan ? { anchorText: anchor.text } : {}),
 							});
 							continue;
@@ -4133,7 +4236,13 @@ class ToolText extends Text {
 							? anchor.action === "expand" ? "click to collapse" : "click for more detail"
 							: anchor.action === "expand" ? "collapse" : "detail";
 						if (partText.includes(target)) {
-							semanticRows.push({ line: lineIndex, text: line, action: anchor.action, anchorText: target });
+							semanticRows.push({
+								line: lineIndex,
+								text: line,
+								action: anchor.action,
+								viewportAnchor: anchor.viewportAnchor,
+								anchorText: target,
+							});
 						}
 					}
 				}
@@ -4682,7 +4791,12 @@ function liveBranchDisplay(state: Record<string, unknown> | undefined, theme: Th
 	if (!state || typeof state !== "object") return undefined;
 	const body = state._ptBody;
 	if (typeof body === "string" && body.trim() && !body.includes("(rendering")) {
-		return indentBranchBlock(withBranch(body, theme, false, true));
+		const finalCollapse = state._ptFinalCollapse === true;
+		return indentBranchBlock(withContinuedProgressiveBranch(
+			appendLocalCollapseAction(body, theme, finalCollapse),
+			theme,
+			finalCollapse,
+		));
 	}
 	const display = state._ptDisplay;
 	if (typeof display === "string" && display.trim()) {
@@ -5279,6 +5393,31 @@ function maxLineNumber(lines: DiffLine[]): number {
 	return max;
 }
 
+function splitDiffRowCount(diff: ParsedDiff): number {
+	let rows = 0;
+	let index = 0;
+	while (index < diff.lines.length) {
+		const line = diff.lines[index];
+		if (line.type === "sep" || line.type === "ctx") {
+			rows++;
+			index++;
+			continue;
+		}
+		let deleted = 0;
+		let added = 0;
+		while (index < diff.lines.length && diff.lines[index].type === "del") {
+			deleted++;
+			index++;
+		}
+		while (index < diff.lines.length && diff.lines[index].type === "add") {
+			added++;
+			index++;
+		}
+		rows += Math.max(deleted, added);
+	}
+	return rows;
+}
+
 function shouldUseSplit(diff: ParsedDiff, tw: number, maxRows = MAX_PREVIEW_LINES): boolean {
 	if (!diff.lines.length) return false;
 	if (tw < SPLIT_MIN_WIDTH) return false;
@@ -5300,6 +5439,12 @@ function shouldUseSplit(diff: ParsedDiff, tw: number, maxRows = MAX_PREVIEW_LINE
 	if (wrapCandidates >= SPLIT_MAX_WRAP_LINES) return false;
 	if (wrapRatio >= SPLIT_MAX_WRAP_RATIO) return false;
 	return true;
+}
+
+function diffFitsRenderLimit(diff: ParsedDiff, width: number, maxRows: number): boolean {
+	return shouldUseSplit(diff, width, maxRows)
+		? splitDiffRowCount(diff) <= maxRows
+		: diff.lines.length <= maxRows;
 }
 
 const EXT_LANG: Record<string, BundledLanguage> = {
@@ -5934,42 +6079,58 @@ function renderEditPreviewBody(
 	diffs: ParsedDiff[],
 	lines: number[],
 	summary: string,
+	localDetailLevel: ToolClickDetailLevel,
+	totalBudget: number,
+	localClickControls: boolean,
 	pendingViewport?: PendingToolCollapseViewport,
 ): void {
 	const dc = resolveDiffColors(theme);
 	const branchWidth = branchDiffWidth();
-	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		const line = lines[0] ?? getFirstChangedNewLine(diff);
-		const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_PREVIEW_LINES, ctx.state) : 32;
-		const finalCollapse = progressiveLocalControlsEnabled()
-			&& localDetailLevel > 0
-			&& (localDetailLevel >= 2 || diff.lines.length <= previewLines);
+		const hasHiddenCollapsedContent = !diffFitsRenderLimit(diff, branchWidth, 32);
+		const resultSummary = hasHiddenCollapsedContent
+			? markResultSummary(summarizeDiff(diff.added, diff.removed))
+			: summarizeDiff(diff.added, diff.removed);
+		const previewLines = ctx.expanded ? totalBudget : 32;
+		const finalCollapse = localClickControls
+			&& hasHiddenCollapsedContent
+			&& ctx.expanded
+			&& (localDetailLevel >= 2 || diffFitsRenderLimit(diff, branchWidth, previewLines));
+		ctx.state._ptFinalCollapse = finalCollapse;
 		renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}\n${rendered}`;
+				ctx.state._ptBody = `${resultSummary}${formatLineMeta(line, theme)}\n${rendered}`;
 				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 				safeInvalidate(ctx, pendingViewport);
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = `${summarizeDiff(diff.added, diff.removed)}${formatLineMeta(line, theme)}`;
+				ctx.state._ptBody = `${resultSummary}${formatLineMeta(line, theme)}`;
 				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 				safeInvalidate(ctx, pendingViewport);
 			});
 		return;
 	}
-	const maxShown = ctx.expanded ? operations.length : Math.min(operations.length, 3);
-	const totalBudget = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : MAX_PREVIEW_LINES;
+	const collapsedMaxShown = Math.min(operations.length, 3);
+	const collapsedPreviewLines = Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, collapsedMaxShown)));
+	const hasHiddenCollapsedContent = collapsedMaxShown < operations.length
+		|| diffs.slice(0, collapsedMaxShown).some((diff) => !diffFitsRenderLimit(diff, branchWidth, collapsedPreviewLines));
+	const resultSummary = hasHiddenCollapsedContent
+		? markResultSummary(`${operations.length} edits ${summary}`)
+		: `${operations.length} edits ${summary}`;
+	const maxShown = ctx.expanded ? operations.length : collapsedMaxShown;
 	const previewLines = ctx.expanded
 		? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
-		: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
-	const finalCollapse = progressiveLocalControlsEnabled()
-		&& localDetailLevel > 0
+		: collapsedPreviewLines;
+	const finalCollapse = localClickControls
+		&& hasHiddenCollapsedContent
+		&& ctx.expanded
 		&& (localDetailLevel >= 2
-			|| (maxShown === operations.length && diffs.every((diff) => diff.lines.length <= previewLines)));
+			|| (maxShown === operations.length && diffs.every((diff) => diffFitsRenderLimit(diff, branchWidth, previewLines))));
+	ctx.state._ptFinalCollapse = finalCollapse;
 	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
 		const line = lines[index] ?? getFirstChangedNewLine(diff);
 		return renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
@@ -5982,13 +6143,13 @@ function renderEditPreviewBody(
 			const suffix = remainder > 0
 				? `\n${theme.fg("muted", `… ${remainder} more edit blocks`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
 				: "";
-			ctx.state._ptBody = `${operations.length} edits ${summary}\n\n${sections.join("\n\n")}${suffix}`;
+			ctx.state._ptBody = `${resultSummary}\n\n${sections.join("\n\n")}${suffix}`;
 			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 			safeInvalidate(ctx, pendingViewport);
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
-			ctx.state._ptBody = `${operations.length} edits ${summary}`;
+			ctx.state._ptBody = resultSummary;
 			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
 			safeInvalidate(ctx, pendingViewport);
 		});
@@ -6785,16 +6946,26 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
 	const normalBudget = preview.changes.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
 	const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
-	const maxShown = ctx.expanded ? preview.changes.length : Math.min(preview.changes.length, 3);
-	const previewLines = preview.changes.length === 1
-		? ctx.expanded ? totalBudget : 32
-		: ctx.expanded
-			? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
-			: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
+	const collapsedMaxShown = Math.min(preview.changes.length, 3);
+	const collapsedPreviewLines = preview.changes.length === 1
+		? 32
+		: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, collapsedMaxShown)));
+	const hasHiddenCollapsedContent = collapsedMaxShown < preview.changes.length
+		|| preview.changes.slice(0, collapsedMaxShown).some(
+			(change) => !diffFitsRenderLimit(change.diff, diffWidth, collapsedPreviewLines),
+		);
+	const resultSummary = (text: string): string => hasHiddenCollapsedContent ? markResultSummary(text) : text;
+	const maxShown = ctx.expanded ? preview.changes.length : collapsedMaxShown;
+	const previewLines = ctx.expanded
+		? preview.changes.length === 1
+			? totalBudget
+			: Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
+		: collapsedPreviewLines;
 	const allReturnedFits = maxShown === preview.changes.length
-		&& preview.changes.every((change) => change.diff.lines.length <= previewLines);
+		&& preview.changes.every((change) => diffFitsRenderLimit(change.diff, diffWidth, previewLines));
 	const finalCollapse = progressiveLocalControlsEnabled()
-		&& localDetailLevel > 0
+		&& hasHiddenCollapsedContent
+		&& ctx.expanded
 		&& (localDetailLevel >= 2 || allReturnedFits);
 	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
 	if (ctx.state._applyPatchPreviewKey !== key) {
@@ -6808,13 +6979,13 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 				.then((rendered) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`;
+					ctx.state._applyPatchPreviewBody = `${resultSummary(`${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`)}\n${rendered}`;
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx, pendingViewport);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
+					ctx.state._applyPatchPreviewBody = resultSummary(`${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`);
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx, pendingViewport);
 				});
@@ -6830,14 +7001,14 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 					const suffix = remainder > 0
 						? `\n${theme.fg("muted", `… ${remainder} more file patches`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
 						: "";
-					const summary = `${preview.changes.length} files ${preview.summary}`;
+					const summary = resultSummary(`${preview.changes.length} files ${preview.summary}`);
 					ctx.state._applyPatchPreviewBody = `${summary}\n\n${sections.join("\n\n")}${suffix}`;
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx, pendingViewport);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${preview.changes.length} files ${preview.summary}`;
+					ctx.state._applyPatchPreviewBody = resultSummary(`${preview.changes.length} files ${preview.summary}`);
 					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
 					safeInvalidate(ctx, pendingViewport);
 				});
@@ -8085,13 +8256,17 @@ export default function (pi: ExtensionAPI) {
 			const d = (result as any).details;
 			if (d?._type === "diff") {
 				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-				const finalCollapse = progressiveLocalControlsEnabled()
-					&& isEffectiveFinalDetailLayer(d.diff?.lines?.length ?? 0, MAX_RENDER_LINES, ctx.state);
-				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : diffCollapsedLimit();
+				const localClickControls = progressiveLocalControlsEnabled();
+				const collapsedLimit = diffCollapsedLimit();
+				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : collapsedLimit;
 				const hunks = d.diff?.lines?.filter((l: any) => l.type === "sep").length + (d.diff?.lines?.length ? 1 : 0);
 				const diffWidth = branchDiffWidth();
+				const hasHiddenCollapsedContent = !diffFitsRenderLimit(d.diff, diffWidth, collapsedLimit);
+				const finalCollapse = localClickControls && hasHiddenCollapsedContent && ctx.expanded
+					&& (localDetailLevel >= 2 || diffFitsRenderLimit(d.diff, diffWidth, previewLines));
 				const mode = shouldUseSplit(d.diff, diffWidth, previewLines) ? "split" : "unified";
-				const richSummary = markResultSummary(diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode));
+				const summaryText = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
+				const richSummary = hasHiddenCollapsedContent ? markResultSummary(summaryText) : summaryText;
 				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._wdk !== key) {
 					ctx.state._wdk = key;
@@ -8118,11 +8293,15 @@ export default function (pi: ExtensionAPI) {
 				const lineTotal = typeof d.lines === "number" ? d.lines : lineCount(content);
 				const contentHash = hashText(content);
 				const syntheticDiff = getCachedParsedDiff(ctx, `nf-diff:${d.filePath}:${contentHash}`, "", content);
-				const richSummary = markResultSummary(diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file"));
+				const collapsedLimit = diffCollapsedLimit();
+				const hasHiddenCollapsedContent = syntheticDiff.lines.length > collapsedLimit;
+				const summaryText = diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file");
+				const richSummary = hasHiddenCollapsedContent ? markResultSummary(summaryText) : summaryText;
 				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-				const finalCollapse = progressiveLocalControlsEnabled()
-					&& isEffectiveFinalDetailLayer(syntheticDiff.lines.length, MAX_RENDER_LINES, ctx.state);
-				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : diffCollapsedLimit();
+				const localClickControls = progressiveLocalControlsEnabled();
+				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : collapsedLimit;
+				const finalCollapse = localClickControls && hasHiddenCollapsedContent && ctx.expanded
+					&& (localDetailLevel >= 2 || syntheticDiff.lines.length <= previewLines);
 				const diffWidth = branchDiffWidth();
 				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._nfk !== pk) {
@@ -8201,11 +8380,13 @@ export default function (pi: ExtensionAPI) {
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
 			const normalBudget = operations.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
 			const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
-			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
+			const localClickControls = progressiveLocalControlsEnabled();
+			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}:${localClickControls ? 1 : 0}`;
 			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
 				ctx.state._pk = key;
 				ctx.state._ptBody = theme.fg("muted", "(rendering…)");
+				ctx.state._ptFinalCollapse = false;
 				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
 				const lg = lang(fp);
 				const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
@@ -8214,11 +8395,11 @@ export default function (pi: ExtensionAPI) {
 						if (ctx.state._pk !== key) return;
 						const diffs = localizedDiffs?.map((entry) => entry.diff) ?? fallbackDiffs;
 						const lines = localizedDiffs?.map((entry) => entry.line) ?? diffs.map((diff) => getFirstChangedNewLine(diff));
-						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, editSummary, pendingViewport);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, editSummary, localDetailLevel, totalBudget, localClickControls, pendingViewport);
 					})
 					.catch(() => {
 						if (ctx.state._pk !== key) return;
-						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary, pendingViewport);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary, localDetailLevel, totalBudget, localClickControls, pendingViewport);
 					});
 			}
 				const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);

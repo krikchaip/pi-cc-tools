@@ -35,10 +35,15 @@
     "CHANGELOG.md"
   ],
   "scripts": {
-    "typecheck": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/index.ts extensions/spinner.ts scripts/test-generic-errors.ts",
-    "test": "npm run test:generic-errors",
+    "typecheck": "npm run typecheck:source && npm run typecheck:renderers",
+    "typecheck:source": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/index.ts extensions/spinner.ts scripts/test-generic-errors.ts",
+    "typecheck:renderers": "tsc --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --allowImportingTsExtensions --skipLibCheck scripts/renderer-test-harness.ts scripts/test-click-e2e.ts scripts/test-mcp-renderer.ts scripts/test-renderer-integration.ts",
+    "test": "npm run test:generic-errors && npm run test:renderers",
     "test:generic-errors": "bun scripts/test-generic-errors.ts",
     "test:mcp-renderer": "bun scripts/test-mcp-renderer.ts",
+    "test:renderer-integration": "bun scripts/test-renderer-integration.ts",
+    "test:renderers": "npm run test:mcp-renderer && npm run test:renderer-integration",
+    "test:e2e:click": "bun scripts/test-click-e2e.ts",
     "test:shell-settings": "bun scripts/test-shell-settings.ts",
     "pack:dry-run": "npm pack --dry-run",
     "publish:dry-run": "npm publish --dry-run",
