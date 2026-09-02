@@ -3337,6 +3337,7 @@ function activateToolClickAction(
 	viewportAnchor: ToolViewportAnchor = "top",
 ): boolean {
 	if (!toolClickExpansionActive(tool)) return false;
+	if (tool?.rendererState?._ptAsyncRenderPending === true) return false;
 	if ((action === "header" || action === "expand") && !toolHasEffectiveClickAction(tool)) return false;
 	if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
 	clearPendingToolCollapseViewport(tool.rendererState);
@@ -6116,12 +6117,14 @@ function renderEditPreviewBody(
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${resultSummary}${formatLineMeta(line, theme)}\n${rendered}`;
 				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+				ctx.state._ptAsyncRenderPending = false;
 				safeInvalidate(ctx, pendingViewport);
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
 				ctx.state._ptBody = `${resultSummary}${formatLineMeta(line, theme)}`;
 				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+				ctx.state._ptAsyncRenderPending = false;
 				safeInvalidate(ctx, pendingViewport);
 			});
 		return;
@@ -6157,12 +6160,14 @@ function renderEditPreviewBody(
 				: "";
 			ctx.state._ptBody = `${resultSummary}\n\n${sections.join("\n\n")}${suffix}`;
 			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+			ctx.state._ptAsyncRenderPending = false;
 			safeInvalidate(ctx, pendingViewport);
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
 			ctx.state._ptBody = resultSummary;
 			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+			ctx.state._ptAsyncRenderPending = false;
 			safeInvalidate(ctx, pendingViewport);
 		});
 }
@@ -8282,18 +8287,23 @@ export default function (pi: ExtensionAPI) {
 				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._wdk !== key) {
 					ctx.state._wdk = key;
-					ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+					ctx.state._ptAsyncRenderPending = true;
+					if (typeof ctx.state._wdt !== "string" || !ctx.state._wdt.trim()) {
+						ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+					}
 					const dc = resolveDiffColors(theme);
 					const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 					renderSplit(d.diff, d.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._wdk !== key) return;
 							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
+							ctx.state._ptAsyncRenderPending = false;
 							safeInvalidate(ctx, pendingViewport);
 						})
 						.catch(() => {
 							if (ctx.state._wdk !== key) return;
 							ctx.state._wdt = withBranch(richSummary, theme);
+							ctx.state._ptAsyncRenderPending = false;
 							safeInvalidate(ctx, pendingViewport);
 						});
 				}
@@ -8318,18 +8328,23 @@ export default function (pi: ExtensionAPI) {
 				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._nfk !== pk) {
 					ctx.state._nfk = pk;
-					ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+					ctx.state._ptAsyncRenderPending = true;
+					if (typeof ctx.state._nft !== "string" || !ctx.state._nft.trim()) {
+						ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
+					}
 					const dc = resolveDiffColors(theme);
 					const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 					renderUnified(syntheticDiff, lang(d.filePath), { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 						.then((rendered) => {
 							if (ctx.state._nfk !== pk) return;
 							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
+							ctx.state._ptAsyncRenderPending = false;
 							safeInvalidate(ctx, pendingViewport);
 						})
 						.catch(() => {
 							if (ctx.state._nfk !== pk) return;
 							ctx.state._nft = withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme);
+							ctx.state._ptAsyncRenderPending = false;
 							safeInvalidate(ctx, pendingViewport);
 						});
 				}
@@ -8397,9 +8412,12 @@ export default function (pi: ExtensionAPI) {
 			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
 				ctx.state._pk = key;
-				ctx.state._ptBody = theme.fg("muted", "(rendering…)");
-				ctx.state._ptFinalCollapse = false;
-				ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				ctx.state._ptAsyncRenderPending = true;
+				if (typeof ctx.state._ptDisplay !== "string" || !ctx.state._ptDisplay.trim()) {
+					ctx.state._ptBody = theme.fg("muted", "(rendering…)");
+					ctx.state._ptFinalCollapse = false;
+					ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+				}
 				const lg = lang(fp);
 				const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 				void computeLocalizedEditDiffs(fp, operations, cwd)

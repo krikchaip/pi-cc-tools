@@ -6,6 +6,7 @@ const expectFiles = [
   "e2e/expect/click-viewport-anchors.expect",
   "e2e/expect/collapse-scroll-position.expect",
   "e2e/expect/tool-group-click.expect",
+  "e2e/expect/async-diff-click.expect",
 ];
 
 function isExecutable(path: string): boolean {
