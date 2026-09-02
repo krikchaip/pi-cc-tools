@@ -839,6 +839,7 @@ await withRendererHarness(
     }
 
     {
+      let shortEditRenderRequests = 0;
       const shortEditExecution = new ToolExecutionComponent(
         "edit",
         "edit_short_fully_visible_fixture",
@@ -849,7 +850,7 @@ await withRendererHarness(
         },
         {},
         edit,
-        { mode: "fullscreen", requestRender() {} } as any,
+        { mode: "fullscreen", requestRender() { shortEditRenderRequests++; } } as any,
         process.cwd(),
       ) as any;
       shortEditExecution.markExecutionStarted();
@@ -875,6 +876,51 @@ await withRendererHarness(
         || shortEditRows.some((line: string) => line.includes("click to collapse"))
       ) {
         throw new Error(`fully visible short Edit exposed a no-op click control: ${JSON.stringify({ shortEditRows, shortEditSummaryActions })}`);
+      }
+      shortEditExecution.updateResult({
+        content: [{ type: "text", text: "Applied edit" }],
+        details: {
+          _type: "editInfo",
+          summary: "+1 -1",
+          editLine: 1,
+          hunks: 1,
+          added: 1,
+          removed: 1,
+        },
+        isError: false,
+      }, false);
+      await waitFor(
+        () => shortEditExecution.render(120).filter((line: string) => {
+          const text = plain(line);
+          return text.includes("+1") && text.includes("-1");
+        }).length === 2,
+        "complete fully visible short Edit execution",
+      );
+      const completeShortEditRows = shortEditExecution.render(120).map((line: string) => plain(line));
+      const shortEditAnchorPoints = completeShortEditRows.flatMap((_line: string, y: number) => {
+        const x = Array.from({ length: 120 }, (_, candidate) => candidate).find(
+          (candidate) => shortEditExecution.clickAnchorAtPoint(candidate, y) !== undefined,
+        );
+        return x === undefined ? [] : [{ x, y }];
+      });
+      if (shortEditAnchorPoints.length < 2) {
+        throw new Error(`complete short Edit did not expose its header and result anchors: ${JSON.stringify(completeShortEditRows)}`);
+      }
+      const rowsBeforeNoOpClicks = shortEditExecution.render(120);
+      const renderRequestsBeforeNoOpClicks = shortEditRenderRequests;
+      for (const point of shortEditAnchorPoints) {
+        const anchor = shortEditExecution.clickAnchorAtPoint(point.x, point.y);
+        if (!anchor) throw new Error(`short Edit anchor vanished before activation: ${JSON.stringify(point)}`);
+        if (shortEditExecution.activateClickAction(anchor.action, anchor.viewportAnchor)) {
+          throw new Error(`fully visible short Edit activated a no-op anchor: ${JSON.stringify({ point, anchor })}`);
+        }
+      }
+      if (
+        shortEditExecution.expanded === true
+        || shortEditRenderRequests !== renderRequestsBeforeNoOpClicks
+        || JSON.stringify(shortEditExecution.render(120)) !== JSON.stringify(rowsBeforeNoOpClicks)
+      ) {
+        throw new Error(`fully visible short Edit repainted after no-op clicks: ${JSON.stringify({ shortEditRenderRequests, renderRequestsBeforeNoOpClicks })}`);
       }
       shortEditExecution.setExpanded(true);
       await waitFor(
