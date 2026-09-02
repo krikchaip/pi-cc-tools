@@ -139,9 +139,9 @@ if {![wait_for 5 {click.*for more detail}]} {
   exit 1
 }
 
-# At this width, the first truncation action wraps to row 10. Click 2 advances
-# only to expandedPreviewMaxLines=6 and keeps the extra-detail gate.
-send -- "\033\[<0;12;10M\033\[<0;12;10m"
+# The first truncation action is row 9. Click 2 advances only to
+# expandedPreviewMaxLines=6 and keeps the extra-detail gate.
+send -- "\033\[<0;12;9M\033\[<0;12;9m"
 if {![wait_for 5 {standalone detail 06}]} {
   puts stderr "standalone standard-detail row did not stop at its 6-line cap"
   send "\003\003"
@@ -157,9 +157,9 @@ if {![wait_for 5 {click.*for more detail}]} {
   exit 1
 }
 
-# Three additional payload rows move the wrapped action to row 13. Click 3
-# advances to extraExpandedPreviewMaxLines=10, not beyond it.
-send -- "\033\[<0;12;13M\033\[<0;12;13m"
+# Three additional payload rows move the action to row 12. Click 3 advances
+# to extraExpandedPreviewMaxLines=10, not beyond it.
+send -- "\033\[<0;12;12M\033\[<0;12;12m"
 if {![wait_for 5 {standalone detail 10}]} {
   puts stderr "standalone extra-detail row did not reach its 10-line cap"
   send "\003\003"

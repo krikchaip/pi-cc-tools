@@ -83,6 +83,7 @@ const CLICK_HINT_CLOSE = "\uE102";
 const WRAP_MARK = "\u200B";
 const HEADER_WRAP_MARK = "\uE103";
 const CLICK_CONTROL_BREAK_MARK = "\uE104";
+const RESULT_SUMMARY_WRAP_MARK = "\uE105";
 const LEGACY_WRAP_MARK = "\uE000";
 const KITTY_IMAGE_PREFIX = "\x1b_G";
 const ITERM2_IMAGE_PREFIX = "\x1b]1337;File=";
@@ -3720,12 +3721,20 @@ function markedContinuationPrefix(prefix: string): string {
 	return " ".repeat(visibleWidth(prefix));
 }
 
+function markResultSummary(text: string): string {
+	return `${RESULT_SUMMARY_WRAP_MARK}${text}`;
+}
+
 function stripWrapMarks(text: string): string {
-	return text.replaceAll(WRAP_MARK, "").replaceAll(HEADER_WRAP_MARK, "").replaceAll(LEGACY_WRAP_MARK, "");
+	return text
+		.replaceAll(WRAP_MARK, "")
+		.replaceAll(HEADER_WRAP_MARK, "")
+		.replaceAll(RESULT_SUMMARY_WRAP_MARK, "")
+		.replaceAll(LEGACY_WRAP_MARK, "");
 }
 
 function findWrapMark(line: string): { index: number; mark: string } | undefined {
-	return [WRAP_MARK, HEADER_WRAP_MARK, LEGACY_WRAP_MARK]
+	return [WRAP_MARK, HEADER_WRAP_MARK, RESULT_SUMMARY_WRAP_MARK, LEGACY_WRAP_MARK]
 		.map((mark) => ({ index: line.indexOf(mark), mark }))
 		.filter((candidate) => candidate.index >= 0)
 		.sort((left, right) => left.index - right.index)[0];
@@ -3831,6 +3840,7 @@ class ToolText extends Text {
 		const semanticRows: ToolTextSemanticRow[] = [];
 		for (const logicalLine of logicalLines) {
 			const header = logicalLine.includes(HEADER_WRAP_MARK);
+			const resultSummary = logicalLine.includes(RESULT_SUMMARY_WRAP_MARK);
 			const resolved = resolveClickHints(logicalLine, tool);
 			const breakIndex = resolved.text.indexOf(CLICK_CONTROL_BREAK_MARK);
 			let resolvedText = resolved.text.replace(CLICK_CONTROL_BREAK_MARK, "");
@@ -3847,6 +3857,7 @@ class ToolText extends Text {
 					const lineIndex = rendered.length;
 					rendered.push(line);
 					if (header) semanticRows.push({ line: lineIndex, text: line, action: "header" });
+					if (resultSummary) semanticRows.push({ line: lineIndex, text: line, action: "expand" });
 					const partText = stripAnsi(part);
 					for (const anchor of resolved.anchors) {
 						if (resolved.anchors.length === 1) {
@@ -3964,7 +3975,22 @@ interface PreviewIndicatorState {
 	finalCollapse?: boolean;
 }
 
-function progressivePreviewIndicator(toolExpanded: boolean, state?: Record<PropertyKey, unknown>): PreviewIndicatorState {
+function isEffectiveFinalDetailLayer(
+	totalLineCount: number,
+	normalLimit: number,
+	state?: Record<PropertyKey, unknown>,
+): boolean {
+	const localDetailLevel = progressiveLocalDetailLevelForRender(state);
+	return localDetailLevel > 0
+		&& (localDetailLevel >= 2 || totalLineCount <= progressivePreviewLimit(normalLimit, state));
+}
+
+function progressivePreviewIndicator(
+	toolExpanded: boolean,
+	state: Record<PropertyKey, unknown> | undefined,
+	totalLineCount: number,
+	normalLimit: number,
+): PreviewIndicatorState {
 	const localDetailLevel = progressiveLocalDetailLevelForRender(state);
 	const localClickControls = progressiveLocalControlsEnabled();
 	return {
@@ -3972,7 +3998,7 @@ function progressivePreviewIndicator(toolExpanded: boolean, state?: Record<Prope
 		localDetailEnabled: localDetailLevel < 2,
 		progressiveLocalDetail: true,
 		localClickControls,
-		finalCollapse: localClickControls && localDetailLevel === 2,
+		finalCollapse: localClickControls && isEffectiveFinalDetailLayer(totalLineCount, normalLimit, state),
 	};
 }
 
@@ -5672,11 +5698,13 @@ function renderEditPreviewBody(
 	const dc = resolveDiffColors(theme);
 	const branchWidth = branchDiffWidth();
 	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-	const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		const line = lines[0] ?? getFirstChangedNewLine(diff);
 		const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_PREVIEW_LINES, ctx.state) : 32;
+		const finalCollapse = progressiveLocalControlsEnabled()
+			&& localDetailLevel > 0
+			&& (localDetailLevel >= 2 || diff.lines.length <= previewLines);
 		renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
@@ -5697,6 +5725,10 @@ function renderEditPreviewBody(
 	const previewLines = ctx.expanded
 		? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
 		: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
+	const finalCollapse = progressiveLocalControlsEnabled()
+		&& localDetailLevel > 0
+		&& (localDetailLevel >= 2
+			|| (maxShown === operations.length && diffs.every((diff) => diff.lines.length <= previewLines)));
 	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
 		const line = lines[index] ?? getFirstChangedNewLine(diff);
 		return renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
@@ -6108,7 +6140,9 @@ function runningPreviewBlock(
 	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx?.state);
 	const previewExpanded = tieredLocalExpansion ? localDetailLevel > 0 : expanded;
 	const normalLimit = tieredLocalExpansion ? tieredToolNormalPreviewLimit(rendererTool) : limit;
-	const indicator = tieredLocalExpansion ? progressivePreviewIndicator(expanded, ctx.state) : undefined;
+	const indicator = tieredLocalExpansion
+		? progressivePreviewIndicator(expanded, ctx.state, previewTotal, normalLimit)
+		: undefined;
 	let preview = buildPreviewText(
 		previewSource,
 		previewExpanded,
@@ -6508,9 +6542,19 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 
 	const diffWidth = branchDiffWidth();
 	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-	const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
 	const normalBudget = preview.changes.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
 	const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
+	const maxShown = ctx.expanded ? preview.changes.length : Math.min(preview.changes.length, 3);
+	const previewLines = preview.changes.length === 1
+		? ctx.expanded ? totalBudget : 32
+		: ctx.expanded
+			? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
+			: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
+	const allReturnedFits = maxShown === preview.changes.length
+		&& preview.changes.every((change) => change.diff.lines.length <= previewLines);
+	const finalCollapse = progressiveLocalControlsEnabled()
+		&& localDetailLevel > 0
+		&& (localDetailLevel >= 2 || allReturnedFits);
 	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
 	if (ctx.state._applyPatchPreviewKey !== key) {
 		ctx.state._applyPatchPreviewKey = key;
@@ -6519,7 +6563,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 		const dc = resolveDiffColors(theme);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
-			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, ctx.expanded ? totalBudget : 32, dc, diffWidth)
+			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 				.then((rendered) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					ctx.state._applyPatchPreviewBody = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`;
@@ -6533,10 +6577,6 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 					safeInvalidate(ctx);
 				});
 		} else {
-			const maxShown = ctx.expanded ? preview.changes.length : Math.min(preview.changes.length, 3);
-			const previewLines = ctx.expanded
-				? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
-				: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, maxShown)));
 			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change, index) =>
 				renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 					.then((rendered) => `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`)
@@ -6581,17 +6621,17 @@ function renderApplyPatchResult(result: any, isPartial: boolean, theme: Theme, c
 
 	const meta = getApplyPatchResultMeta(ctx.args, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
 	if (!meta || meta.changeCount === 0) {
-		return makeText(ctx.lastComponent, withBranch(theme.fg("success", "Applied"), theme));
+		return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Applied")), theme));
 	}
 
 	if (meta.changeCount === 1 && meta.firstChange) {
 		const change = meta.firstChange;
 		const summary = diffSummaryWithMeta(change.added, change.removed, change.hunks, change.kind === "add" ? "new file" : change.kind === "delete" ? "delete" : "");
-		return makeText(ctx.lastComponent, withBranch(`${theme.fg("success", "Applied")} ${theme.fg("muted", change.displayPath)} ${summary}${formatLineMeta(change.line, theme)}`, theme));
+		return makeText(ctx.lastComponent, withBranch(markResultSummary(`${theme.fg("success", "Applied")} ${theme.fg("muted", change.displayPath)} ${summary}${formatLineMeta(change.line, theme)}`), theme));
 	}
 
 	const summary = diffSummaryWithMeta(meta.totalAdded, meta.totalRemoved, meta.totalHunks, "");
-	return makeText(ctx.lastComponent, withBranch(`${theme.fg("success", "Applied")} ${meta.changeCount} files ${summary}${meta.totalLines ? ` ${theme.fg("muted", `(${meta.totalLines} diff lines)`)}` : ""}`, theme));
+	return makeText(ctx.lastComponent, withBranch(markResultSummary(`${theme.fg("success", "Applied")} ${meta.changeCount} files ${summary}${meta.totalLines ? ` ${theme.fg("muted", `(${meta.totalLines} diff lines)`)}` : ""}`), theme));
 }
 
 function summarizeMcpToolCall(args: any, theme: Theme): string {
@@ -6684,7 +6724,8 @@ function parseMcpJsonTree(raw: string, theme: Theme): McpJsonTree | null {
 }
 
 function renderMcpJsonTree(tree: McpJsonTree, expanded: boolean, theme: Theme): string {
-	return buildPreviewText(tree.lines, expanded, theme, previewLimit(), tree.totalLineCount);
+	const lines = tree.lines.map((line, index) => index === 0 ? markResultSummary(line) : line);
+	return buildPreviewText(lines, expanded, theme, previewLimit(), tree.totalLineCount);
 }
 
 function parseMcpKeyValueFields(lines: string[]): McpKeyValueField[] | null {
@@ -6724,10 +6765,12 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 	const raw = getTextContent(result).trim();
 	const lines = raw ? raw.split("\n") : [];
 	if (lines.length === 0) {
-		return makeMcpText(ctx.lastComponent, withBranch(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done"), theme));
+		return makeMcpText(ctx.lastComponent, withBranch(markResultSummary(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done")), theme));
 	}
 
-	const statusText = ctx.isError ? theme.fg("error", lines[0]) : theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`);
+	const statusText = ctx.isError
+		? theme.fg("error", lines[0])
+		: markResultSummary(theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`));
 	if (mode === "summary") return makeMcpText(ctx.lastComponent, withBranch(statusText, theme));
 	if (ctx.isError) {
 		if (!expanded) return makeMcpText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
@@ -6915,6 +6958,7 @@ function renderTaskListResult(lines: string[], expanded: boolean, theme: Theme, 
 	if (pending > 0) parts.push(`${theme.fg("muted", String(pending))} pending`);
 	if (completed > 0) parts.push(`${theme.fg("success", String(completed))} completed`);
 	if (parts.length > 0) summary += ` ${theme.fg("muted", "•")} ${parts.join(` ${theme.fg("muted", "•")} `)}`;
+	summary = markResultSummary(summary);
 
 	if (!expanded) {
 		return makeText(ctx.lastComponent, withBranch(`${summary}${toolOutputDetailHint(theme, expanded)}`, theme));
@@ -6924,7 +6968,8 @@ function renderTaskListResult(lines: string[], expanded: boolean, theme: Theme, 
 	const shown = tasks.slice(0, progressivePreviewLimit(previewLimit(), ctx.state));
 	const preview = shown.map((task) => `${theme.fg("accent", `#${task.id}`)} ${formatTaskStatus(task.status, theme)} ${theme.fg("dim", task.subject)}`);
 	const remaining = tasks.length - shown.length;
-	const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+	const finalCollapse = progressiveLocalControlsEnabled()
+		&& isEffectiveFinalDetailLayer(tasks.length, previewLimit(), ctx.state);
 	if (remaining > 0) {
 		const controls = progressiveLocalControlsEnabled()
 			? toolOutputDetailHint(theme, expanded, true, localDetailLevel < 2, true)
@@ -6957,7 +7002,7 @@ function getReadImageFallback(result: any, ctx: any): string {
 function renderReadImageResult(result: any, expanded: boolean, theme: Theme, ctx: any): Text {
 	const image = getFirstImageBlock(result);
 	const mimeType = image?.mimeType ?? "image";
-	const summary = `${theme.fg("success", "Image loaded")} ${theme.fg("muted", `[${mimeType}]`)}`;
+	const summary = markResultSummary(`${theme.fg("success", "Image loaded")} ${theme.fg("muted", `[${mimeType}]`)}`);
 	if (!expanded) {
 		return makeText(ctx.lastComponent, withBranch(`${summary}${toolOutputDetailHint(theme, expanded)}`, theme));
 	}
@@ -6988,9 +7033,9 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 	if (lines.length === 0) {
 		if (patchFiles.length > 0) {
 			const suffix = patchFiles.length === 1 ? patchFiles[0] : `${patchFiles.length} files`;
-			return makeText(ctx.lastComponent, withBranch(`${theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Applied")} ${theme.fg("muted", suffix)}`, theme));
+			return makeText(ctx.lastComponent, withBranch(markResultSummary(`${theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Applied")} ${theme.fg("muted", suffix)}`), theme));
 		}
-		return makeText(ctx.lastComponent, withBranch(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done"), theme));
+		return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done")), theme));
 	}
 
 	if (!ctx.isError && name === "TaskList") {
@@ -6999,7 +7044,7 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 
 	const statusText = ctx.isError
 		? theme.fg("error", lines[0])
-		: theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`);
+		: markResultSummary(theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`));
 	if (!expanded) {
 		return makeText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
 	}
@@ -7010,7 +7055,7 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 	}
 
 	if (lines.length === 1) {
-		return makeText(ctx.lastComponent, withBranch(formatOpenAiSuccessLine(name, lines[0], theme), theme));
+		return makeText(ctx.lastComponent, withBranch(markResultSummary(formatOpenAiSuccessLine(name, lines[0], theme)), theme));
 	}
 
 	const preview = buildPreviewText(
@@ -7504,11 +7549,11 @@ export default function (pi: ExtensionAPI) {
 			const content = result.content.find((block: any) => block?.type === "text");
 			if (content?.type !== "text") return makeText(ctx.lastComponent, withBranch(theme.fg("error", "No text content"), theme));
 			const lines = content.text.split("\n");
-			let text = theme.fg("muted", `${lines.length} lines loaded`);
+			let text = markResultSummary(theme.fg("muted", `${lines.length} lines loaded`));
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-		const indicator = progressivePreviewIndicator(expanded, ctx.state);
+		const indicator = progressivePreviewIndicator(expanded, ctx.state, lines.length, previewLimit());
 		text += `\n${buildPreviewText(lines, localDetailLevel > 0, theme, previewLimit(), lines.length, (line) => theme.fg("dim", line || " "), indicator)}`;
 			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
@@ -7562,7 +7607,7 @@ export default function (pi: ExtensionAPI) {
 			}
 			const exitMatch = output.match(/exit code: (\d+)/);
 			const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : null;
-			let text = exitCode === null || exitCode === 0 ? theme.fg("success", "Done") : theme.fg("error", `Exit ${exitCode}`);
+			let text = markResultSummary(exitCode === null || exitCode === 0 ? theme.fg("success", "Done") : theme.fg("error", `Exit ${exitCode}`));
 			text += theme.fg("muted", ` (${nonEmpty.total} lines)`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " [truncated]");
 			const persistentPreview = !progressiveLocalControlsEnabled() && shouldPreserveBashPreview(ctx)
@@ -7574,7 +7619,7 @@ export default function (pi: ExtensionAPI) {
 			const collapsed = bashCollapsedLimit();
 			if (rewrite) text += `\n${formatRtkRewriteDetails(rewrite, theme)}`;
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-		const indicator = progressivePreviewIndicator(expanded, ctx.state);
+		const indicator = progressivePreviewIndicator(expanded, ctx.state, nonEmpty.total, collapsed);
 		text += `\n${buildPreviewText(nonEmpty.lines, localDetailLevel > 0, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line), indicator)}`;
 			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
@@ -7611,12 +7656,12 @@ export default function (pi: ExtensionAPI) {
 			const matches = (result.content[0]?.type === "text" ? result.content[0].text : "")
 				.split("\n")
 				.filter((line) => line.trim().length > 0);
-			if (matches.length === 0) return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "no matches"), theme));
-			let text = theme.fg("muted", `${matches.length} matches`);
+			if (matches.length === 0) return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("muted", "no matches")), theme));
+			let text = markResultSummary(theme.fg("muted", `${matches.length} matches`));
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-		const indicator = progressivePreviewIndicator(expanded, ctx.state);
+		const indicator = progressivePreviewIndicator(expanded, ctx.state, matches.length, previewLimit());
 		text += `\n${buildPreviewText(matches, localDetailLevel > 0, theme, previewLimit(), matches.length, (line) => theme.fg("dim", line), indicator)}`;
 			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
@@ -7652,8 +7697,8 @@ export default function (pi: ExtensionAPI) {
 			const items = (result.content[0]?.type === "text" ? result.content[0].text : "")
 				.split("\n")
 				.filter((line) => line.trim().length > 0);
-			if (items.length === 0) return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "no files found"), theme));
-			let text = theme.fg("muted", `${items.length} files`);
+			if (items.length === 0) return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("muted", "no files found")), theme));
+			let text = markResultSummary(theme.fg("muted", `${items.length} files`));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			// Expanded: grouped find results with icons
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
@@ -7666,7 +7711,8 @@ export default function (pi: ExtensionAPI) {
 				findLines.push(`  ${icon}${theme.fg("dim", item)}`);
 			}
 			const remaining = items.length - shown.length;
-			const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+			const finalCollapse = progressiveLocalControlsEnabled()
+				&& isEffectiveFinalDetailLayer(items.length, previewLimit(), ctx.state);
 			if (remaining > 0) {
 				const controls = progressiveLocalControlsEnabled()
 					? toolOutputDetailHint(theme, expanded, true, localDetailLevel < 2, true)
@@ -7705,8 +7751,8 @@ export default function (pi: ExtensionAPI) {
 			const items = (result.content[0]?.type === "text" ? result.content[0].text : "")
 				.split("\n")
 				.filter((line) => line.trim().length > 0);
-			if (items.length === 0) return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "empty directory"), theme));
-			let text = theme.fg("muted", `${items.length} entries`);
+			if (items.length === 0) return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("muted", "empty directory")), theme));
+			let text = markResultSummary(theme.fg("muted", `${items.length} entries`));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			// Expanded: tree-view with icons
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
@@ -7723,7 +7769,8 @@ export default function (pi: ExtensionAPI) {
 				treeLines.push(`${prefix}${icon}${name}`);
 			}
 			const remaining = items.length - shown.length;
-			const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+			const finalCollapse = progressiveLocalControlsEnabled()
+				&& isEffectiveFinalDetailLayer(items.length, previewLimit(), ctx.state);
 			if (remaining > 0) {
 				const controls = progressiveLocalControlsEnabled()
 					? toolOutputDetailHint(theme, expanded, true, localDetailLevel < 2, true)
@@ -7796,12 +7843,13 @@ export default function (pi: ExtensionAPI) {
 			const d = (result as any).details;
 			if (d?._type === "diff") {
 				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-				const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+				const finalCollapse = progressiveLocalControlsEnabled()
+					&& isEffectiveFinalDetailLayer(d.diff?.lines?.length ?? 0, MAX_RENDER_LINES, ctx.state);
 				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : diffCollapsedLimit();
 				const hunks = d.diff?.lines?.filter((l: any) => l.type === "sep").length + (d.diff?.lines?.length ? 1 : 0);
 				const diffWidth = branchDiffWidth();
 				const mode = shouldUseSplit(d.diff, diffWidth, previewLines) ? "split" : "unified";
-				const richSummary = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
+				const richSummary = markResultSummary(diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode));
 				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
 				if (ctx.state._wdk !== key) {
 					ctx.state._wdk = key;
@@ -7821,15 +7869,16 @@ export default function (pi: ExtensionAPI) {
 				}
 				return makeText(ctx.lastComponent, ctx.state._wdt ?? withBranch(richSummary, theme));
 			}
-			if (d?._type === "noChange") return makeText(ctx.lastComponent, withBranch(theme.fg("muted", "✓ no changes"), theme));
+			if (d?._type === "noChange") return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("muted", "✓ no changes")), theme));
 			if (d?._type === "new") {
 				const content = typeof ctx.args?.content === "string" ? ctx.args.content : "";
 				const lineTotal = typeof d.lines === "number" ? d.lines : lineCount(content);
 				const contentHash = hashText(content);
 				const syntheticDiff = getCachedParsedDiff(ctx, `nf-diff:${d.filePath}:${contentHash}`, "", content);
-				const richSummary = diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file");
+				const richSummary = markResultSummary(diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file"));
 				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-				const finalCollapse = progressiveLocalControlsEnabled() && localDetailLevel === 2;
+				const finalCollapse = progressiveLocalControlsEnabled()
+					&& isEffectiveFinalDetailLayer(syntheticDiff.lines.length, MAX_RENDER_LINES, ctx.state);
 				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : diffCollapsedLimit();
 				const diffWidth = branchDiffWidth();
 				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
@@ -7851,7 +7900,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return makeText(ctx.lastComponent, ctx.state._nft ?? withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme));
 			}
-			return makeText(ctx.lastComponent, withBranch(theme.fg("success", "Written"), theme));
+			return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Written")), theme));
 		},
 	});
 
@@ -7948,14 +7997,14 @@ export default function (pi: ExtensionAPI) {
 				const { editLine, hunks, added, removed } = (result as any).details;
 				const loc = formatLineMeta(editLine ?? 0, theme);
 				const summary = diffSummaryWithMeta(added ?? 0, removed ?? 0, hunks ?? 0, "");
-				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(`${summary}${loc}`, theme)));
+				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(markResultSummary(`${summary}${loc}`), theme)));
 			}
 			if ((result as any).details?._type === "multiEditInfo") {
 				const { editCount, diffLineCount, hunks, totalAdded, totalRemoved } = (result as any).details;
 				const summary = diffSummaryWithMeta(totalAdded ?? 0, totalRemoved ?? 0, hunks ?? 0, "");
-				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(`${editCount} edits ${summary}${typeof diffLineCount === "number" ? ` ${theme.fg("muted", `(${diffLineCount} diff lines)`)}` : ""}`, theme)));
+				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(markResultSummary(`${editCount} edits ${summary}${typeof diffLineCount === "number" ? ` ${theme.fg("muted", `(${diffLineCount} diff lines)`)}` : ""}`), theme)));
 			}
-			return makeText(ctx.lastComponent, indentBranchBlock(withBranch(theme.fg("success", "Applied"), theme)));
+			return makeText(ctx.lastComponent, indentBranchBlock(withBranch(markResultSummary(theme.fg("success", "Applied")), theme)));
 		},
 	});
 

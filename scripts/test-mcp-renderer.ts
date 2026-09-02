@@ -40,6 +40,15 @@ try {
     parameters: {},
     async execute() { return { content: [] }; },
   });
+  for (const name of ["apply_patch", "web_search", "TaskList"]) {
+    fakePi.registerTool({
+      name,
+      label: name,
+      description: name,
+      parameters: {},
+      async execute() { return { content: [] }; },
+    });
+  }
 
   const extension = await import("../extensions/index.ts");
   extension.default(fakePi as any);
@@ -65,6 +74,88 @@ try {
   const render = (text: string, expanded = false, width = 120): string => (
     renderRaw(text, expanded, width).replace(/\x1b\[[0-9;]*m/g, "")
   );
+  const plain = (text: string): string => text.replace(/\x1b\[[0-9;]*m/g, "");
+  const assertResultSummaryAnchor = (
+    name: string,
+    result: any,
+    expanded: boolean,
+    expectedSummary: string,
+    ctxOverrides: Record<string, unknown> = {},
+  ): void => {
+    const definition = fakePi.tools.get(name);
+    if (typeof definition?.renderResult !== "function") {
+      throw new Error(`${name} renderer was not registered`);
+    }
+    const state = {};
+    const component = definition.renderResult(
+      result,
+      { expanded, isPartial: false },
+      theme,
+      {
+        state,
+        args: {},
+        argsComplete: true,
+        cwd: process.cwd(),
+        expanded,
+        isError: false,
+        lastComponent: undefined,
+        ...ctxOverrides,
+      },
+    );
+    const rows = component.render(120).map((line: string) => plain(line));
+    const semanticRows = component.getSemanticRows?.().map((row: any) => ({ ...row, text: plain(row.text) })) ?? [];
+    const summaryIndex = rows.findIndex((line: string) => line.includes(expectedSummary));
+    if (summaryIndex < 0) {
+      throw new Error(`${name} did not render result summary ${JSON.stringify(expectedSummary)}: ${JSON.stringify(rows)}`);
+    }
+    if (!semanticRows.some((row: any) => row.line === summaryIndex && row.action === "expand")) {
+      throw new Error(`${name} result summary was not a stable expansion anchor: ${JSON.stringify({ rows, semanticRows })}`);
+    }
+  };
+
+  const summaryCases: Array<[string, any, string, Record<string, unknown>?]> = [
+    ["read", { content: [{ type: "text", text: "read one\nread two" }] }, "2 lines loaded"],
+    ["read", { content: [{ type: "image", data: "", mimeType: "image/png" }] }, "Image loaded"],
+    ["bash", { content: [{ type: "text", text: "bash one\nbash two" }] }, "Done (2 lines)", { args: { command: "printf test" } }],
+    ["grep", { content: [{ type: "text", text: "a.ts:1:one\na.ts:2:two" }] }, "2 matches"],
+    ["find", { content: [{ type: "text", text: "a.ts\nb.ts" }] }, "2 files"],
+    ["ls", { content: [{ type: "text", text: "a.ts\nb.ts" }] }, "2 entries"],
+    ["write", { content: [{ type: "text", text: "Wrote fixture.ts" }] }, "Written"],
+    ["edit", { content: [{ type: "text", text: "Edited fixture.ts" }] }, "Applied"],
+    ["apply_patch", { content: [{ type: "text", text: "Done!" }] }, "Applied"],
+    ["mcp", { content: [{ type: "text", text: JSON.stringify({ ok: true, count: 2 }) }] }, "Response"],
+    ["web_search", { content: [{ type: "text", text: "search one\nsearch two" }] }, "2 lines returned"],
+    ["TaskList", { content: [{ type: "text", text: "#1 [pending] First\n#2 [completed] Second" }] }, "2 tasks"],
+  ];
+  for (const [name, result, expectedSummary, ctxOverrides] of summaryCases) {
+    assertResultSummaryAnchor(name, result, false, expectedSummary, ctxOverrides);
+    assertResultSummaryAnchor(name, result, true, expectedSummary, ctxOverrides);
+  }
+
+  const assertPayloadRowInert = (
+    name: string,
+    result: any,
+    expectedPayload: string,
+    ctxOverrides: Record<string, unknown> = {},
+  ): void => {
+    const definition = fakePi.tools.get(name);
+    const component = definition.renderResult(
+      result,
+      { expanded: true, isPartial: false },
+      theme,
+      { state: {}, args: {}, cwd: process.cwd(), expanded: true, isError: false, lastComponent: undefined, ...ctxOverrides },
+    );
+    const rows = component.render(120).map((line: string) => plain(line));
+    const payloadRow = rows.findIndex((line: string) => line.includes(expectedPayload));
+    const semanticRows = component.getSemanticRows?.() ?? [];
+    if (payloadRow < 0 || semanticRows.some((row: any) => row.line === payloadRow)) {
+      throw new Error(`${name} raw payload row was clickable: ${JSON.stringify({ rows, semanticRows })}`);
+    }
+  };
+  assertPayloadRowInert("bash", { content: [{ type: "text", text: "" }] }, "(no output)", { args: { command: "true" } });
+  assertPayloadRowInert("mcp", { content: [{ type: "text", text: "Repository: example\nBranch: main" }] }, "Repository");
+  assertPayloadRowInert("write", { content: [{ type: "text", text: "write failed raw payload" }] }, "write failed raw payload", { isError: true });
+  assertPayloadRowInert("web_search", { content: [{ type: "text", text: "search failed raw payload\nsecond error line" }] }, "search failed raw payload", { isError: true });
 
   const fields = [
     "Repository: example-org/example-repo",
@@ -479,6 +570,22 @@ try {
   const standaloneActionX = (row: number, action: string): number => (
     Array.from({ length: 120 }, (_, x) => x).find((x) => readExecution.clickActionAtPoint(x, row) === action) ?? -1
   );
+  const readSummaryRow = readRows.findIndex((line: string) => line.includes("20 lines loaded"));
+  const readSummaryStart = readSummaryRow < 0 ? -1 : readRows[readSummaryRow].indexOf("20 lines loaded");
+  const readSummaryEnd = readSummaryRow < 0 ? -1 : readRows[readSummaryRow].trimEnd().length;
+  const readPayloadRow = readRows.findIndex((line: string) => line.includes("result line 1"));
+  if (
+    readSummaryStart < 0
+    || !Array.from({ length: readSummaryEnd - readSummaryStart }, (_, offset) => readSummaryStart + offset)
+      .every((x) => readExecution.clickActionAtPoint(x, readSummaryRow) === "expand")
+    || readExecution.clickActionAtPoint(Math.max(0, readSummaryStart - 1), readSummaryRow) !== undefined
+    || readExecution.clickActionAtPoint(readSummaryEnd, readSummaryRow) !== undefined
+    || readPayloadRow < 0
+    || Array.from({ length: readRows[readPayloadRow].trimEnd().length }, (_, x) => readExecution.clickActionAtPoint(x, readPayloadRow))
+      .some((action) => action !== undefined)
+  ) {
+    throw new Error(`standalone result summary did not bind only its full semantic row: ${JSON.stringify({ readRows, readSummaryRow, readSummaryStart, readSummaryEnd, readPayloadRow })}`);
+  }
   const detailRow = readRows.findIndex((line: string, index: number) => (
     line.includes("more lines")
     && !line.includes("click to collapse")
@@ -537,6 +644,46 @@ try {
   if (!readExecution.activateClickAction("expand") || readExecution.expanded) {
     throw new Error("standalone final collapse action did not collapse the execution");
   }
+
+  const readOffsetNotice = "[23 more lines in file. Use offset=11 to continue.]";
+  const tenLineOutput = [...Array.from({ length: 9 }, (_, index) => `level-one line ${index + 1}`), readOffsetNotice].join("\n");
+  const effectiveFinalRead = new ToolExecutionComponent(
+    "read",
+    "read_effective_final_fixture",
+    { path: "level-one.ts" },
+    {},
+    readDefinition,
+    { mode: "fullscreen", requestRender() {} } as any,
+    process.cwd(),
+  ) as any;
+  effectiveFinalRead.markExecutionStarted();
+  effectiveFinalRead.setArgsComplete();
+  effectiveFinalRead.updateResult({ content: [{ type: "text", text: tenLineOutput }], isError: false }, false);
+  effectiveFinalRead.setExpanded(true);
+  const normalEffectiveFinalRows = effectiveFinalRead.render(120).map((line: string) => plain(line));
+  if (normalEffectiveFinalRows.some((line: string) => line.includes("click to collapse"))) {
+    throw new Error(`content-exhausted normal preview added a dedicated collapse row: ${JSON.stringify(normalEffectiveFinalRows)}`);
+  }
+  if (!effectiveFinalRead.activateClickAction("detail")) {
+    throw new Error("effective-final Read did not enter its first detail layer");
+  }
+  const levelOneEffectiveFinalRows = effectiveFinalRead.render(120).map((line: string) => plain(line));
+  const levelOneCollapseRow = levelOneEffectiveFinalRows.findIndex((line: string) => line.includes("click to collapse"));
+  const levelOneCollapseX = levelOneCollapseRow < 0
+    ? -1
+    : Array.from({ length: 120 }, (_, x) => x).find((x) => effectiveFinalRead.clickActionAtPoint(x, levelOneCollapseRow) === "expand") ?? -1;
+  const readOffsetNoticeRow = levelOneEffectiveFinalRows.findIndex((line: string) => line.includes(readOffsetNotice));
+  if (
+    readOffsetNoticeRow < 0
+    || Array.from({ length: levelOneEffectiveFinalRows[readOffsetNoticeRow].trimEnd().length }, (_, x) => effectiveFinalRead.clickActionAtPoint(x, readOffsetNoticeRow))
+      .some((action) => action !== undefined)
+    || levelOneCollapseRow < 0
+    || levelOneCollapseX < 0
+    || levelOneEffectiveFinalRows.some((line: string) => line.includes("click for more detail"))
+  ) {
+    throw new Error(`first detail layer that revealed all returned content was not final: ${JSON.stringify(levelOneEffectiveFinalRows)}`);
+  }
+
   const readPeer = new ToolExecutionComponent(
     "read",
     "read_click_fixture_2",
@@ -647,6 +794,50 @@ try {
   const writeExtraDetailRow = standardWriteRows.findIndex((line: string, index: number) => (
     line.includes("more diff lines") && writeDetailActionX(index) >= 0
   ));
+
+  const effectiveFinalWrite = new ToolExecutionComponent(
+    "write",
+    "write_effective_final_fixture",
+    { path: "effective-final.ts", content: "new" },
+    {},
+    write,
+    { mode: "fullscreen", requestRender() {} } as any,
+    process.cwd(),
+  ) as any;
+  effectiveFinalWrite.markExecutionStarted();
+  effectiveFinalWrite.setArgsComplete();
+  effectiveFinalWrite.updateResult({
+    content: [{ type: "text", text: "Wrote effective-final.ts" }],
+    details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 3000, lines: expandedDiffLines.slice(0, 180) } },
+    isError: false,
+  }, false);
+  effectiveFinalWrite.setExpanded(true);
+  await waitFor(
+    () => typeof effectiveFinalWrite.rendererState._wdt === "string"
+      && effectiveFinalWrite.rendererState._wdt.includes("more diff lines")
+      && effectiveFinalWrite.rendererState._wdk.endsWith(":150"),
+    "effective-final Write normal detail layer",
+  );
+  effectiveFinalWrite.render(120);
+  if (!effectiveFinalWrite.activateClickAction("detail")) {
+    throw new Error("effective-final Write did not enter level 1");
+  }
+  await waitFor(
+    () => typeof effectiveFinalWrite.rendererState._wdk === "string"
+      && effectiveFinalWrite.rendererState._wdk.endsWith(":200")
+      && typeof effectiveFinalWrite.rendererState._wdt === "string"
+      && !effectiveFinalWrite.rendererState._wdt.includes("rendering diff"),
+    "effective-final Write level-1 collapse row",
+  );
+  const effectiveFinalWriteRows = effectiveFinalWrite.render(120).map((line: string) => plain(line));
+  if (
+    effectiveFinalWriteRows.some((line: string) => line.includes("more diff lines"))
+    || effectiveFinalWriteRows.some((line: string) => line.includes("click for more detail"))
+    || !effectiveFinalWriteRows.some((line: string) => line.includes("click to collapse"))
+  ) {
+    throw new Error(`Write level 1 that revealed all returned diff content was not final: ${JSON.stringify(effectiveFinalWriteRows)}`);
+  }
+
   if (writeExtraDetailRow < 0 || !writeExecution.activateClickAction("detail")) {
     throw new Error(`standard-detail Write diff did not preserve its extra-detail row: ${JSON.stringify(standardWriteRows)}`);
   }

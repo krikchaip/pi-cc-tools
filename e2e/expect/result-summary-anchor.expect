@@ -1,0 +1,372 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for stable result-summary anchors.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set fixture_dir [file join $repo_dir "e2e" "fixtures"]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-result-summary-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"bashCollapsedLines":3,"expandedPreviewMaxLines":50,"extraExpandedPreviewMaxLines":100,"groupToolCalls":true}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc stop_pi {} {
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+set fixture_path [file join $fixture_dir "collapse-row-review-group-session.jsonl"]
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-collapse-row-review" $cwd] $content]
+close $session
+cd $cwd
+log_file -noappend [file join $scratch "group.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {click.*any for details}]} {
+  puts stderr "group fixture did not become ready"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Expand only the first grouped child from its execution summary row.
+send -- "\033\[<0;6;3M\033\[<0;6;3m"
+if {![wait_for 5 {group first 03}]} {
+  puts stderr "first grouped Read did not expand"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {group second 03}]} {
+  puts stderr "first grouped Read expansion changed its peer"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Its result summary is row 4. It must collapse the first child, which moves
+# the second compact execution from row 9 to row 4.
+send -- "\033\[<0;10;4M\033\[<0;10;4m"
+after 300
+# Prove the geometry changed by expanding the second child from its new row.
+send -- "\033\[<0;6;4M\033\[<0;6;4m"
+if {![wait_for 5 {group second 03}]} {
+  puts stderr "expanded grouped result summary did not collapse only its child"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+stop_pi
+
+proc materialize_session {fixture_path session_path target_cwd} {
+  set source [open $fixture_path "r"]
+  set content [read $source]
+  close $source
+  set session [open $session_path "w"]
+  puts -nonewline $session [string map [list "/tmp/pi-cc-tools-result-summary-acceptance" $target_cwd] $content]
+  close $session
+}
+
+proc read_capture {path} {
+  set capture [open $path "r"]
+  fconfigure $capture -encoding utf-8
+  set content [read $capture]
+  close $capture
+  return $content
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  # A one-column PTY resize invalidates every fullscreen row without changing
+  # transcript expansion state. Each wait drains queued output into the active
+  # isolated log before the next resize or log rotation.
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not widen Pi PTY for deterministic repaint: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not restore Pi PTY after deterministic repaint: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  return 1
+}
+
+proc require_connector_before {content token connector label} {
+  set token_index [string last $token $content]
+  if {$token_index < 0} {
+    puts stderr "$label token missing: $token"
+    return 0
+  }
+  set prefix [string range $content 0 $token_index]
+  set connector_bytes "\033\[38;2;72;72;72m${connector}"
+  set connector_index [string last $connector_bytes $prefix]
+  if {$connector_index < 0 || $token_index - $connector_index > 500} {
+    puts stderr "$label did not use connector $connector"
+    return 0
+  }
+  return 1
+}
+
+# Image 4: one more-detail click reaches the effective final layer at level 1.
+set level_one_fixture [file join $fixture_dir "effective-final-level-one-session.jsonl"]
+set level_one_session [file join $scratch "level-one-session.jsonl"]
+materialize_session $level_one_fixture $level_one_session $cwd
+set level_one_log [file join $scratch "level-one.ansi"]
+cd $cwd
+log_file -noappend [file join $scratch "level-one-collapsed.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $level_one_session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+if {![wait_for 10 {click.*to expand}]} {
+  puts stderr "effective-final Read fixture did not become ready"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# At 100 columns: border row 2, header row 3, result summary row 4.
+send -- "\033\[<0;12;4M\033\[<0;12;4m"
+if {![wait_for 5 {image4 payload 03}]} {
+  puts stderr "effective-final Read did not open its normal preview"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {click.*for more detail}]} {
+  puts stderr "effective-final Read normal preview had no detail gate"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Summary row 4 + three payload rows place the normal-preview gate on row 8.
+log_file
+log_file -noappend $level_one_log
+send -- "\033\[<0;20;8M\033\[<0;20;8m"
+if {![wait_for 5 {image4 payload 05}]} {
+  puts stderr "level-1 detail did not reveal the final ordinary payload row"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {\[23 more lines in file\. Use offset=230 to continue\.\]}]} {
+  puts stderr "level-1 detail did not reveal the final offset notice"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {click.*to collapse}]} {
+  puts stderr "effective final layer 1 did not append a bottom collapse row"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {click.*for more detail}]} {
+  puts stderr "effective final layer 1 retained a stale more-detail gate"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+after 200
+log_file
+set level_one_capture [read_capture $level_one_log]
+if {[string first "click for more detail" $level_one_capture] >= 0} {
+  puts stderr "effective final layer 1 capture retained a stale more-detail gate"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![require_connector_before $level_one_capture "6 lines loaded" "├" "level-1 summary"]
+    || ![require_connector_before $level_one_capture "\[23 more lines in file. Use offset=230 to continue.\]" "│" "level-1 notice"]
+    || ![require_connector_before $level_one_capture "to collapse" "└" "level-1 collapse row"]} {
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+foreach payload_number {01 02 03 04 05} {
+  if {![require_connector_before $level_one_capture "image4 payload $payload_number" "│" "level-1 payload $payload_number"]} {
+    stop_pi
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+}
+
+# Six payload rows put the dedicated bottom action on row 11. Click its text.
+set level_one_collapse_log [file join $scratch "level-one-collapse.ansi"]
+log_file -noappend $level_one_collapse_log
+send -- "\033\[<0;20;11M\033\[<0;20;11m"
+after 300
+stty columns 101 rows $rows
+stty columns $columns rows $rows
+if {![wait_for 5 {click.*to expand}]} {
+  puts stderr "bottom level-1 collapse row did not collapse the Read execution"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+after 200
+log_file
+set level_one_collapse_capture [read_capture $level_one_collapse_log]
+if {[string first "image4 payload" $level_one_collapse_capture] >= 0
+    || [string first "click to collapse" $level_one_collapse_capture] >= 0
+    || [string first "click for more detail" $level_one_collapse_capture] >= 0} {
+  puts stderr "collapsed level-1 Read still rendered expanded detail"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+stop_pi
+
+# Image 5: short Bash payload is inert; its result summary collapses only Bash.
+set bash_fixture [file join $fixture_dir "short-bash-group-session.jsonl"]
+set bash_session [file join $scratch "short-bash-session.jsonl"]
+materialize_session $bash_fixture $bash_session $cwd
+set bash_expanded_log [file join $scratch "short-bash-expanded.ansi"]
+cd $cwd
+log_file -noappend [file join $scratch "short-bash-collapsed.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $bash_session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+if {![wait_for 10 {click.*any for details}]} {
+  puts stderr "short Bash group fixture did not become ready"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+log_file -noappend $bash_expanded_log
+# The first compact grouped execution is row 3.
+send -- "\033\[<0;8;3M\033\[<0;8;3m"
+if {![wait_for 5 {Done.*\(1 lines\)}]} {
+  puts stderr "short Bash did not render its one-line result summary"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {![wait_for 5 {\(no output\)}]} {
+  puts stderr "short Bash did not render the expected payload placeholder"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {click.*to collapse}]} {
+  puts stderr "short Bash level 0 added an unwanted bottom collapse row"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[wait_for 1 {peer detail}]} {
+  puts stderr "expanding short Bash changed its grouped peer"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Summary is row 4 and payload is row 5. Isolate the payload click, then force
+# Pi to write a fresh full repaint into this phase's log.
+set bash_payload_log [file join $scratch "short-bash-payload-click.ansi"]
+log_file
+log_file -noappend $bash_payload_log
+send -- "\033\[<0;8;5M\033\[<0;8;5m"
+if {![force_fullscreen_repaint $columns $rows]} {
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+set bash_payload_capture [read_capture $bash_payload_log]
+if {![regexp {Done.*\(1 lines\)} $bash_payload_capture]
+    || [string first "(no output)" $bash_payload_capture] < 0} {
+  puts stderr "short Bash payload click did not preserve its expanded state on repaint"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[string first "peer detail" $bash_payload_capture] >= 0
+    || [regexp {click.*to collapse} $bash_payload_capture]} {
+  puts stderr "short Bash payload click changed its peer or added a bottom collapse row"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+# Outer indent + branches place the final ')' of Done (1 lines) at column 19.
+set bash_collapse_log [file join $scratch "short-bash-collapse.ansi"]
+log_file -noappend $bash_collapse_log
+send -- "\033\[<0;19;4M\033\[<0;19;4m"
+if {![force_fullscreen_repaint $columns $rows]} {
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+set bash_collapse_capture [read_capture $bash_collapse_log]
+if {[string first "peer.txt" $bash_collapse_capture] < 0
+    || ![regexp {click.*any for details} $bash_collapse_capture]} {
+  puts stderr "short Bash summary click did not produce a fresh compact-state repaint"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[regexp {Done.*\(1 lines\)} $bash_collapse_capture]
+    || [string first "(no output)" $bash_collapse_capture] >= 0
+    || [string first "peer detail" $bash_collapse_capture] >= 0
+    || [regexp {click.*to collapse} $bash_collapse_capture]} {
+  puts stderr "short Bash compact repaint retained child or peer detail"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+stop_pi
+
+puts "RESULT_SUMMARY_ANCHOR_PASS"
+puts "ARTIFACTS $scratch"
+exit 0
