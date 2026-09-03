@@ -399,6 +399,164 @@ await withRendererHarness(
       throw new Error(`grouped final detail layer did not expose a clickable collapse row: ${JSON.stringify({ rows: extraDetailedReadGroupRows, groupedCollapseRow, rowActions, semantics: readExecution.resultRendererComponent?.getSemanticRows?.().map((row: any) => ({ ...row, text: row.text.replace(/\x1b\[[0-9;]*m/g, "") })) })}`);
     }
 
+    const progressiveAnchorCases = [
+      { name: "bash", args: { command: "printf fixture" }, lines: Array.from({ length: 20 }, (_, i) => `bash line ${i + 1}`) },
+      { name: "grep", args: { pattern: "fixture", path: "." }, lines: Array.from({ length: 20 }, (_, i) => `file.ts:${i + 1}:fixture`) },
+      { name: "find", args: { pattern: "*.ts", path: "." }, lines: Array.from({ length: 20 }, (_, i) => `file-${i + 1}.ts`) },
+      { name: "ls", args: { path: "." }, lines: Array.from({ length: 20 }, (_, i) => `entry-${i + 1}.ts`) },
+      { name: "TaskList", args: {}, lines: Array.from({ length: 20 }, (_, i) => `#${i + 1} [pending] Task ${i + 1}`) },
+    ];
+    for (const fixture of progressiveAnchorCases) {
+      const definition = fakePi.tools.get(fixture.name);
+      if (!definition) throw new Error(`${fixture.name} renderer was not registered`);
+      const execution = new ToolExecutionComponent(
+        fixture.name,
+        `${fixture.name}_anchor_matrix`,
+        fixture.args,
+        {},
+        definition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      execution.markExecutionStarted();
+      execution.setArgsComplete();
+      execution.updateResult({ content: [{ type: "text", text: fixture.lines.join("\n") }], isError: false }, false);
+
+      const findAnchor = (action: string, viewportAnchor?: string): any => {
+        const rows = execution.render(120);
+        for (let y = 0; y < rows.length; y++) {
+          for (let x = 0; x < 120; x++) {
+            const anchor = execution.clickAnchorAtPoint(x, y);
+            if (anchor?.action === action && (!viewportAnchor || anchor.viewportAnchor === viewportAnchor)) return anchor;
+          }
+        }
+        return undefined;
+      };
+      if (!findAnchor("expand", "top") || !execution.activateClickAction("expand", "top")) {
+        throw new Error(`${fixture.name} summary anchor did not expand`);
+      }
+      for (const level of [1, 2]) {
+        if (!findAnchor("detail", "top") || !execution.activateClickAction("detail", "top")) {
+          throw new Error(`${fixture.name} detail anchor did not activate level ${level}`);
+        }
+        if (execution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== level) {
+          throw new Error(`${fixture.name} detail anchor did not persist level ${level}`);
+        }
+      }
+      if (!findAnchor("expand", "bottom") || !execution.activateClickAction("expand", "bottom") || execution.expanded) {
+        throw new Error(`${fixture.name} final bottom anchor did not collapse`);
+      }
+      if (!findAnchor("header", "top") || !execution.activateClickAction("header", "top") || !execution.expanded) {
+        throw new Error(`${fixture.name} header anchor did not re-expand`);
+      }
+      if (!execution.activateClickAction("header", "top") || execution.expanded) {
+        throw new Error(`${fixture.name} header anchor did not collapse`);
+      }
+    }
+
+    const openAiDefinition = fakePi.tools.get("web_search");
+    if (!openAiDefinition) throw new Error("web_search renderer was not registered");
+    const openAiExecution = new ToolExecutionComponent(
+      "web_search",
+      "web_search_anchor_matrix",
+      { query: "fixture" },
+      {},
+      openAiDefinition,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    openAiExecution.markExecutionStarted();
+    openAiExecution.setArgsComplete();
+    openAiExecution.updateResult({
+      content: [{ type: "text", text: Array.from({ length: 20 }, (_, i) => `search result ${i + 1}`).join("\n") }],
+      isError: false,
+    }, false);
+    const findOpenAiAnchor = (action: string, viewportAnchor = "top"): any => {
+      const rows = openAiExecution.render(120);
+      for (let y = 0; y < rows.length; y++) {
+        for (let x = 0; x < 120; x++) {
+          const anchor = openAiExecution.clickAnchorAtPoint(x, y);
+          if (anchor?.action === action && anchor.viewportAnchor === viewportAnchor) return anchor;
+        }
+      }
+      return undefined;
+    };
+    if (!findOpenAiAnchor("expand") || !openAiExecution.activateClickAction("expand", "top")) {
+      throw new Error("OpenAI-style summary anchor did not expand");
+    }
+    if (!findOpenAiAnchor("expand") || !findOpenAiAnchor("detail-extra")) {
+      throw new Error("OpenAI-style capped output lacked inline collapse or extra-detail anchors");
+    }
+    if (findOpenAiAnchor("expand", "bottom")) {
+      throw new Error("OpenAI-style non-progressive output exposed an invalid bottom anchor");
+    }
+    if (!openAiExecution.activateClickAction("detail-extra", "top")
+      || openAiExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== 2) {
+      throw new Error("OpenAI-style extra-detail anchor did not activate maximum detail");
+    }
+    if (!findOpenAiAnchor("detail-extra") || !openAiExecution.activateClickAction("detail-extra", "top")
+      || openAiExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== undefined) {
+      throw new Error("OpenAI-style less-detail anchor did not return to normal detail");
+    }
+    if (!openAiExecution.activateClickAction("expand", "top") || openAiExecution.expanded) {
+      throw new Error("OpenAI-style inline collapse anchor did not collapse");
+    }
+    if (!findOpenAiAnchor("header") || !openAiExecution.activateClickAction("header", "top") || !openAiExecution.expanded) {
+      throw new Error("OpenAI-style header anchor did not expand");
+    }
+
+    for (const terminal of [
+      {
+        name: "read",
+        id: "read_image_anchor_matrix",
+        args: { path: "fixture.png" },
+        result: { content: [{ type: "image", data: "", mimeType: "image/png" }], isError: false },
+      },
+      {
+        name: "web_search",
+        id: "web_search_error_anchor_matrix",
+        args: { query: "fixture" },
+        result: { content: [{ type: "text", text: "search failed\nrequest rejected" }], isError: true },
+      },
+    ]) {
+      const definition = fakePi.tools.get(terminal.name);
+      const execution = new ToolExecutionComponent(
+        terminal.name,
+        terminal.id,
+        terminal.args,
+        {},
+        definition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      execution.markExecutionStarted();
+      execution.setArgsComplete();
+      execution.updateResult(terminal.result, false);
+      const anchors = (): any[] => {
+        const found = new Map<string, any>();
+        const rows = execution.render(120);
+        for (let y = 0; y < rows.length; y++) {
+          for (let x = 0; x < 120; x++) {
+            const anchor = execution.clickAnchorAtPoint(x, y);
+            if (anchor) found.set(`${anchor.action}:${anchor.viewportAnchor}`, anchor);
+          }
+        }
+        return [...found.values()];
+      };
+      if (!anchors().some((anchor) => anchor.action === "expand" && anchor.viewportAnchor === "top")
+        || !execution.activateClickAction("expand", "top")) {
+        throw new Error(`${terminal.id} collapsed expansion anchor did not activate`);
+      }
+      const expandedAnchors = anchors();
+      if (expandedAnchors.some((anchor) => anchor.action === "detail" || anchor.action === "detail-extra" || anchor.viewportAnchor === "bottom")) {
+        throw new Error(`${terminal.id} terminal expansion exposed an invalid detail or bottom anchor`);
+      }
+      if (!expandedAnchors.some((anchor) => anchor.action === "header")
+        || !execution.activateClickAction("header", "top") || execution.expanded) {
+        throw new Error(`${terminal.id} header anchor did not collapse the terminal expansion`);
+      }
+    }
+
     writePiSettings({
       clickExpansion: true,
       expandedPreviewMaxLines: 200,

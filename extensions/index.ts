@@ -76,6 +76,10 @@ const TOOL_CLICK_GLOBAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-
 const TOOL_CLICK_LOCAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-local-expanded");
 const TOOL_CLICK_DETAIL_LEVEL = Symbol.for("pi-claude-style-tools:tool-click-detail-level");
 const TOOL_COLLAPSE_PENDING_VIEWPORT = Symbol.for("pi-claude-style-tools:tool-collapse-pending-viewport");
+const TOOL_RENDER_BRIDGE_KEY = Symbol.for("pi-claude-style-tools:tool-render-bridge");
+const SETTINGS_CACHE_KEY = Symbol.for("pi-claude-style-tools:settings-cache");
+const CLICK_RUNTIME_KEY = Symbol.for("pi-claude-style-tools:click-runtime");
+const ACTIVE_TOOL_GROUPS_KEY = Symbol.for("pi-claude-style-tools:active-tool-groups");
 const CLICK_HINT_OPEN = "\uE100";
 const CLICK_HINT_SEPARATOR = "\uE101";
 const CLICK_HINT_CLOSE = "\uE102";
@@ -146,7 +150,10 @@ interface SettingsFile {
 	toolBranchColorMode?: "theme" | "fixed";
 }
 
-let _settingsCache: { value: SettingsFile; timestamp: number } | null = null;
+type SettingsCacheEntry = { value: SettingsFile; timestamp: number };
+type SettingsCacheState = { entry: SettingsCacheEntry | null };
+// Retained host patches must see command writes from a new /reload generation.
+const settingsCacheState = ((globalThis as any)[SETTINGS_CACHE_KEY] ??= { entry: null }) as SettingsCacheState;
 const SETTINGS_CACHE_TTL_MS = 5_000;
 let _piOutputPadCache: { value: 0 | 1; timestamp: number } | null = null;
 const PI_OUTPUT_PAD_CACHE_TTL_MS = 250;
@@ -178,8 +185,8 @@ function syncToolOutputPad(component: any, outputPad: 0 | 1): void {
 
 function readSettings(): SettingsFile {
 	const now = Date.now();
-	if (_settingsCache && now - _settingsCache.timestamp < SETTINGS_CACHE_TTL_MS) {
-		return _settingsCache.value;
+	if (settingsCacheState.entry && now - settingsCacheState.entry.timestamp < SETTINGS_CACHE_TTL_MS) {
+		return settingsCacheState.entry.value;
 	}
 	const cwdPath = `${process.cwd()}/.pi/settings.json`;
 	const homePath = `${process.env.HOME ?? ""}/.pi/settings.json`;
@@ -193,7 +200,7 @@ function readSettings(): SettingsFile {
 			// ignore invalid settings files
 		}
 	}
-	_settingsCache = { value: merged, timestamp: now };
+	settingsCacheState.entry = { value: merged, timestamp: now };
 	return merged;
 }
 
@@ -208,7 +215,7 @@ function bustSpinnerSettingsCache(): void {
 }
 
 function writeSettingsKey(key: string, value: unknown): void {
-	_settingsCache = null; // invalidate cache on write
+	settingsCacheState.entry = null; // invalidate every extension generation on write
 	const home = process.env.HOME ?? "";
 	if (!home) return;
 	const dir = `${home}/.pi`;
@@ -839,7 +846,8 @@ function formatBranchedToolLines(
 }
 
 const NON_GROUPABLE_TOOL_NAMES = new Set(["edit", "write", "apply_patch"]);
-const ACTIVE_TOOL_GROUPS = new Set<any>();
+// /reload keeps old group instances alive while commands run from the new module.
+const ACTIVE_TOOL_GROUPS = ((globalThis as any)[ACTIVE_TOOL_GROUPS_KEY] ??= new Set<any>()) as Set<any>;
 
 function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecutionComponent> {
 	return value instanceof ToolExecutionComponent && !NON_GROUPABLE_TOOL_NAMES.has(getToolName(value));
@@ -1091,7 +1099,7 @@ class ToolGroupComponent extends Container {
 	render(width: number): string[] {
 		if (this.tools.length === 0) return [];
 		const safeWidth = Number.isFinite(width) ? Math.max(1, Math.floor(width)) : 1;
-		const clickState = `${clickVisualEpoch}:${this.clickAnchorsEnabled() ? 1 : 0}`;
+		const clickState = `${clickRuntime.visualEpoch}:${this.clickAnchorsEnabled() ? 1 : 0}`;
 		// Fast path: settled groups with a valid memo skip ALL child walks.
 		// Child mutations mark dirty via clearToolRenderCache → invalidate().
 		if (
@@ -1152,7 +1160,7 @@ class ToolGroupComponent extends Container {
 				{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
 			);
 			if (clicksEnabled && branched.length > 0) {
-				const callRows = tool.callRendererComponent instanceof ToolText
+				const callRows = isToolTextComponent(tool.callRendererComponent)
 					? tool.callRendererComponent.getSemanticRows().filter((row: ToolTextSemanticRow) => row.action === "header").length
 					: 0;
 				const headerRows = childExpanded ? Math.max(1, callRows) : branched.length;
@@ -1168,7 +1176,7 @@ class ToolGroupComponent extends Container {
 					viewportAnchor: "top",
 				});
 				}
-				if (childExpanded && tool.resultRendererComponent instanceof ToolText) {
+				if (childExpanded && isToolTextComponent(tool.resultRendererComponent)) {
 					for (const semantic of tool.resultRendererComponent.getSemanticRows()) {
 						if (semantic.action === "header") continue;
 						const needle = semantic.anchorText ?? stripAnsi(semantic.text).trim();
@@ -1278,7 +1286,12 @@ type ToolGroupInteractiveMode = {
 	switchTuiMode(mode: "regular" | "fullscreen", restoreProgress?: boolean, startRenderer?: boolean): boolean;
 };
 
-let activeClickInteractiveMode: ToolGroupInteractiveMode | undefined;
+type ClickRuntimeState = {
+	activeInteractiveMode?: ToolGroupInteractiveMode;
+	visualEpoch: number;
+};
+// Host patches survive /reload. Commands and retained patches need one runtime.
+const clickRuntime = ((globalThis as any)[CLICK_RUNTIME_KEY] ??= { visualEpoch: 0 }) as ClickRuntimeState;
 
 type ToolGroupMousePatchState = {
 	modes: WeakMap<object, ToolGroupInteractiveMode>;
@@ -1373,7 +1386,7 @@ function captureToolCollapseViewport(
 	tool: any,
 	viewportAnchor: ToolViewportAnchor,
 ): ToolCollapseViewportSnapshot | undefined {
-	const mode = activeClickInteractiveMode;
+	const mode = clickRuntime.activeInteractiveMode;
 	const renderer = mode?.renderer;
 	const frame = renderer?.currentLayout;
 	const scrollView = frame?.primaryScrollView;
@@ -1773,7 +1786,7 @@ function installToolGroupMouseAdapter(): void {
 	const originalRenderInitialMessages = interactivePrototype.renderInitialMessages;
 	interactivePrototype.renderInitialMessages = function (this: ToolGroupInteractiveMode) {
 		this.ui[TOOL_CLICK_GLOBAL_EXPANDED] = this.toolOutputExpanded === true;
-		activeClickInteractiveMode = this;
+		clickRuntime.activeInteractiveMode = this;
 		state!.modes.set(this.renderer, this);
 		return originalRenderInitialMessages.apply(this, arguments as any);
 	};
@@ -1783,14 +1796,14 @@ function installToolGroupMouseAdapter(): void {
 		this.ui[TOOL_CLICK_GLOBAL_EXPANDED] = expanded;
 		const result = originalSetToolsExpanded.apply(this, arguments as any);
 		if (changed) resetLocalClickStates(this, false);
-		else clickVisualEpoch++;
+		else clickRuntime.visualEpoch++;
 		return result;
 	};
 	const originalSwitchTuiMode = interactivePrototype.switchTuiMode;
 	interactivePrototype.switchTuiMode = function (this: ToolGroupInteractiveMode) {
 		const switched = originalSwitchTuiMode.apply(this, arguments as any);
 		if (switched) {
-			activeClickInteractiveMode = this;
+			clickRuntime.activeInteractiveMode = this;
 			this.ui[TOOL_CLICK_GLOBAL_EXPANDED] = this.toolOutputExpanded === true;
 			state!.modes.set(this.renderer, this);
 		}
@@ -1799,7 +1812,14 @@ function installToolGroupMouseAdapter(): void {
 }
 
 function isToolGroupComponent(value: unknown): value is ToolGroupComponent {
-	return value instanceof ToolGroupComponent;
+	// /reload replaces extension-local class identities while old host wrappers
+	// can still own transcript components. Accept the stable group interface too.
+	const candidate = value as Partial<ToolGroupComponent> | undefined;
+	return value instanceof ToolGroupComponent || Boolean(candidate)
+		&& typeof candidate?.clickAnchorAtPoint === "function"
+		&& typeof candidate?.toggleToolAtPoint === "function"
+		&& typeof candidate?.forEachTool === "function"
+		&& typeof candidate?.releaseTools === "function";
 }
 
 function forEachModeTool(mode: ToolGroupInteractiveMode | undefined, visitor: (tool: any) => void): void {
@@ -1824,7 +1844,7 @@ function resetLocalClickStates(mode: ToolGroupInteractiveMode | undefined, colla
 		if (isToolGroupComponent(parent)) groups.add(parent);
 	});
 	for (const group of groups) group.invalidate();
-	clickVisualEpoch++;
+	clickRuntime.visualEpoch++;
 }
 
 function isIgnorableToolSeparator(value: unknown): boolean {
@@ -2032,8 +2052,10 @@ function hashText(text: string): string {
 }
 
 let extraToolOutputExpanded = false;
-let localDetailRenderTool: any;
-let clickVisualEpoch = 0;
+type ToolRenderBridge = { localDetailTool?: any };
+// Pi keeps host method patches across /reload, while renderer functions come
+// from the new extension instance. Both generations must share this context.
+const toolRenderBridge = ((globalThis as any)[TOOL_RENDER_BRIDGE_KEY] ??= {}) as ToolRenderBridge;
 
 type ToolClickAction = "header" | "expand" | "detail" | "detail-extra";
 type ToolViewportAnchor = "top" | "bottom";
@@ -2053,7 +2075,7 @@ function syncExtraToolDetailMode(): void {
 function setExtraToolDetailMode(enabled: boolean): void {
 	extraToolOutputExpanded = enabled;
 	writeSettingsKey("extraToolOutputExpanded", enabled);
-	clickVisualEpoch++;
+	clickRuntime.visualEpoch++;
 }
 
 function clickExpansionEnabled(): boolean {
@@ -2110,7 +2132,7 @@ function nextToolLocalDetailLevel(tool: any): ToolClickDetailLevel {
 }
 
 function toolClickStateKey(tool: any): string {
-	return `${clickVisualEpoch}:${toolClickExpansionActive(tool) ? 1 : 0}:${toolLocalDetailLevel(tool)}`;
+	return `${clickRuntime.visualEpoch}:${toolClickExpansionActive(tool) ? 1 : 0}:${toolLocalDetailLevel(tool)}`;
 }
 
 function configuredKeyHint(binding: Parameters<typeof keyText>[0], fallbackKey: string, description: string): string {
@@ -3234,12 +3256,13 @@ function patchToolRenderCacheInvalidation(): void {
 			if (method === "updateDisplay" || method === "updateResult" || method === "invalidate") {
 				syncLiveToolRenderState(this);
 			}
-			const previousDetailTool = localDetailRenderTool;
-			if (method === "updateDisplay") localDetailRenderTool = this;
+			const previousDetailTool = toolRenderBridge.localDetailTool;
+			if (method === "updateDisplay") toolRenderBridge.localDetailTool = this;
 			try {
 				return original.apply(this, args);
 			} finally {
-				localDetailRenderTool = previousDetailTool;
+				if (previousDetailTool === undefined) delete toolRenderBridge.localDetailTool;
+				else toolRenderBridge.localDetailTool = previousDetailTool;
 				clearToolRenderCache(this);
 			}
 		};
@@ -3302,7 +3325,7 @@ function clickAnchorStart(line: string): number {
 function toolHasEffectiveClickAction(tool: any): boolean {
 	if (tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true) return true;
 	return [tool.callRendererComponent, tool.resultRendererComponent]
-		.filter((component): component is ToolText => component instanceof ToolText)
+		.filter(isToolTextComponent)
 		.some((component) => component.hasClickAction(tool));
 }
 
@@ -3312,7 +3335,7 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 		return;
 	}
 	const components = [tool.callRendererComponent, tool.resultRendererComponent]
-		.filter((component): component is ToolText => component instanceof ToolText);
+		.filter(isToolTextComponent);
 	const anchors: ToolClickAnchor[] = [];
 	for (const component of components) {
 		for (const semantic of component.getSemanticRows()) {
@@ -3389,7 +3412,7 @@ function patchToolExecutionRenderers(): void {
 		proto.render = function patchedToolExecutionRender(width: number): string[] {
 			syncToolOutputPad(this, readPiOutputPad());
 			for (const component of [this.callRendererComponent, this.resultRendererComponent]) {
-				if (component instanceof ToolText) (component as any)[TOOL_CLICK_OWNER] = this;
+				if (isToolTextComponent(component)) (component as any)[TOOL_CLICK_OWNER] = this;
 			}
 			const rendered = originalRender.call(this, width);
 			updateToolClickAnchors(this, rendered);
@@ -4278,8 +4301,19 @@ class ToolText extends Text {
 	}
 }
 
+function isToolTextComponent(value: unknown): value is ToolText {
+	// ToolExecution's host-level render patch survives /reload, but ToolText does
+	// not keep the same class identity. Match its narrow renderer interface.
+	const candidate = value as Partial<ToolText> | undefined;
+	return value instanceof ToolText || Boolean(candidate)
+		&& typeof candidate?.setText === "function"
+		&& typeof candidate?.setFollowPiOutputPad === "function"
+		&& typeof candidate?.getSemanticRows === "function"
+		&& typeof candidate?.hasClickAction === "function";
+}
+
 function makeText(last: unknown, text: string, followPiOutputPad = false): Text {
-	const component = last instanceof ToolText ? last : new ToolText();
+	const component = isToolTextComponent(last) ? last : new ToolText();
 	component.setFollowPiOutputPad(followPiOutputPad);
 	component.setText(text);
 	return component;
@@ -4296,19 +4330,21 @@ function previewLimit(): number {
 
 function renderedToolLocalDetailLevel(state?: Record<PropertyKey, unknown>): ToolClickDetailLevel {
 	const explicit = normalizeToolClickDetailLevel(state?.[TOOL_CLICK_DETAIL_LEVEL]);
-	return explicit > 0 ? explicit : toolLocalDetailLevel(localDetailRenderTool);
+	return explicit > 0 ? explicit : toolLocalDetailLevel(toolRenderBridge.localDetailTool);
 }
 
 function progressiveLocalDetailLevelForRender(state?: Record<PropertyKey, unknown>): ToolClickDetailLevel {
-	return toolSupportsProgressiveLocalDetail(localDetailRenderTool)
-		&& localDetailRenderTool?.[TOOL_CLICK_LOCAL_EXPANDED] === true
+	const rendererTool = toolRenderBridge.localDetailTool;
+	return toolSupportsProgressiveLocalDetail(rendererTool)
+		&& rendererTool?.[TOOL_CLICK_LOCAL_EXPANDED] === true
 		? renderedToolLocalDetailLevel(state)
 		: 0;
 }
 
 function progressiveLocalControlsEnabled(): boolean {
-	return toolSupportsProgressiveLocalDetail(localDetailRenderTool)
-		&& toolClickExpansionActive(localDetailRenderTool);
+	const rendererTool = toolRenderBridge.localDetailTool;
+	return toolSupportsProgressiveLocalDetail(rendererTool)
+		&& toolClickExpansionActive(rendererTool);
 }
 
 function configuredExpandedPreviewLimit(extraDetail: boolean): number {
@@ -4824,7 +4860,7 @@ function liveBranchDisplay(state: Record<string, unknown> | undefined, theme: Th
 }
 
 function refreshAllToolBranchVisuals(ctx: any): void {
-	_settingsCache = null;
+	settingsCacheState.entry = null;
 	syncToolBackgroundMode();
 	invalidateThemePaletteCache();
 	applyToolBackgroundMode(ctx?.ui?.theme);
@@ -4843,7 +4879,7 @@ function refreshAllToolBranchVisuals(ctx: any): void {
 /** Re-derive borders, branches, diffs, and spinner keys from the active pi theme (no cross-extension deps). */
 function rebindUiChromeToTheme(ctx: any): void {
 	if (!ctx?.hasUI) return;
-	_settingsCache = null;
+	settingsCacheState.entry = null;
 	syncToolBackgroundMode();
 	const theme = ctx.ui?.theme;
 	invalidateThemePaletteCache();
@@ -6558,7 +6594,7 @@ function runningPreviewBlock(
 	// For tail previews the "earlier lines" prefix owns the remaining count — pass
 	// previewSource.length so buildPreviewText doesn't also append "more lines".
 	const previewTotal = options.tail && !expanded ? previewSource.length : totalLineCount;
-	const rendererTool = localDetailRenderTool;
+	const rendererTool = toolRenderBridge.localDetailTool;
 	const tieredLocalExpansion = toolUsesTieredTextPreview(rendererTool)
 		&& rendererTool?.[TOOL_CLICK_LOCAL_EXPANDED] === true;
 	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx?.state);
@@ -7643,8 +7679,8 @@ export default function (pi: ExtensionAPI) {
 					return;
 				}
 				writeSettingsKey("clickExpansion", next);
-				if (!next) resetLocalClickStates(activeClickInteractiveMode, true);
-				else clickVisualEpoch++;
+				if (!next) resetLocalClickStates(clickRuntime.activeInteractiveMode, true);
+				else clickRuntime.visualEpoch++;
 				if (ctx.hasUI) {
 					(ctx.ui as any).invalidate?.();
 					(ctx.ui as any).requestRender?.();

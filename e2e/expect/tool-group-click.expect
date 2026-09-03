@@ -50,6 +50,24 @@ proc wait_for {seconds pattern} {
   return 0
 }
 
+proc wait_for_both {seconds first second} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  set found_first 0
+  set found_second 0
+  while {[clock milliseconds] < $deadline && (!$found_first || !$found_second)} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c" }
+      "\033\[?u" { send "\033\[?0u" }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $first { set found_first 1 }
+      -re $second { set found_second 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return [expr {$found_first && $found_second}]
+}
+
 proc drain_output {} {
   set saved_timeout $::timeout
   set ::timeout 0
@@ -75,6 +93,15 @@ stty columns 100 rows 40
 
 if {![wait_for 10 {click.*any for details}]} {
   puts stderr "collapsed tool group did not show click guidance"
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+send -- "/reload\r"
+if {![wait_for 10 {Reloaded keybindings, extensions, skills, prompts, themes, and context files}]} {
+  puts stderr "/reload did not complete before grouped anchor checks"
   send "\003\003"
   catch {close}
   puts "ARTIFACTS $scratch"
@@ -156,6 +183,24 @@ log_file -noappend [file join $scratch "global-collapsed.ansi"]
 send -- "\033j"
 if {![wait_for 5 {click.*any for details}]} {
   puts stderr "global collapse did not restore click guidance"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+
+log_file
+log_file -noappend [file join $scratch "post-reload-group-off.ansi"]
+send -- "/cc-tools group off\r"
+if {![wait_for_both 5 {Tool grouping: off} {click.*to expand}]} {
+  puts stderr "post-reload group-off command did not split the live group"
+  send "\003\003"
+  catch {close}
+  exit 1
+}
+
+send -- "/cc-tools group on\r"
+if {![wait_for 5 {Tool grouping: on}]} {
+  puts stderr "post-reload group-on cleanup did not complete"
   send "\003\003"
   catch {close}
   exit 1

@@ -244,7 +244,13 @@ def main_assert(scratch: Path) -> None:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "locate":
         locate(Path(sys.argv[2]), sys.argv[3])
+    elif len(sys.argv) == 4 and sys.argv[1] == "final-contains":
+        frame = frames(Path(sys.argv[2]))[-1]
+        raise SystemExit(0 if any(sys.argv[3] in row for row in frame) else 1)
     elif len(sys.argv) == 2:
         main_assert(Path(sys.argv[1]))
     else:
-        raise SystemExit("usage: async-diff-click-assert.py <scratch> | locate <capture> <pattern>")
+        raise SystemExit(
+            "usage: async-diff-click-assert.py <scratch> | "
+            "locate|final-contains <capture> <pattern>"
+        )

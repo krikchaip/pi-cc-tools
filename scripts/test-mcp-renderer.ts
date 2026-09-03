@@ -236,6 +236,52 @@ await withRendererHarness(
       throw new Error(`MCP renderer ignored outputPad 0: ${JSON.stringify(repositoryRow)}`);
     }
 
+    const mcpAnchorExecution = new ToolExecutionComponent(
+      "mcp",
+      "call_anchor_matrix",
+      { server: "github", tool: "get_repository" },
+      {},
+      legacyDefinition,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    mcpAnchorExecution.markExecutionStarted();
+    mcpAnchorExecution.setArgsComplete();
+    mcpAnchorExecution.updateResult({
+      content: [{ type: "text", text: Array.from({ length: 20 }, (_, i) => `MCP payload ${i + 1}`).join("\n") }],
+      isError: false,
+    }, false);
+    const findMcpAnchor = (action: string, viewportAnchor = "top"): any => {
+      const rows = mcpAnchorExecution.render(120);
+      for (let y = 0; y < rows.length; y++) {
+        for (let x = 0; x < 120; x++) {
+          const anchor = mcpAnchorExecution.clickAnchorAtPoint(x, y);
+          if (anchor?.action === action && anchor.viewportAnchor === viewportAnchor) return anchor;
+        }
+      }
+      return undefined;
+    };
+    if (!findMcpAnchor("expand") || !mcpAnchorExecution.activateClickAction("expand", "top")) {
+      throw new Error("MCP collapsed expansion anchor did not activate");
+    }
+    if (!findMcpAnchor("expand") || !findMcpAnchor("detail-extra")) {
+      throw new Error("expanded capped MCP output lacked inline collapse or extra-detail anchors");
+    }
+    if (!mcpAnchorExecution.activateClickAction("detail-extra", "top")
+      || mcpAnchorExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== 2) {
+      throw new Error("MCP extra-detail anchor did not activate maximum detail");
+    }
+    if (!findMcpAnchor("detail-extra") || !mcpAnchorExecution.activateClickAction("detail-extra", "top")
+      || mcpAnchorExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== undefined) {
+      throw new Error("MCP less-detail anchor did not return to normal detail");
+    }
+    if (!mcpAnchorExecution.activateClickAction("expand", "top") || mcpAnchorExecution.expanded) {
+      throw new Error("MCP inline collapse anchor did not collapse");
+    }
+    if (!findMcpAnchor("header") || !mcpAnchorExecution.activateClickAction("header", "top") || !mcpAnchorExecution.expanded) {
+      throw new Error("MCP header anchor did not expand");
+    }
+
     writeAgentSettings({ outputPad: 1 });
     await new Promise((resolve) => setTimeout(resolve, 300));
     const directPadded = render(fields);
