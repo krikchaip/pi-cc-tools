@@ -15,8 +15,8 @@ WIDTH = 100
 HEIGHT = 40
 
 
-def snapshots(raw: str) -> list[list[str]]:
-    screen = [[" "] * WIDTH for _ in range(HEIGHT)]
+def snapshots(raw: str, initial: list[str] | None = None) -> list[list[str]]:
+    screen = [list(line.ljust(WIDTH)[:WIDTH]) for line in initial] if initial else [[" "] * WIDTH for _ in range(HEIGHT)]
     row = column = 0
     saved = (0, 0)
     frames: list[list[str]] = []
@@ -139,6 +139,36 @@ def assert_frozen(label: str, before: list[str], after: list[str], pattern: str,
     moved = [f"{token}: {before_rows[token]} -> {after_rows[token]}" for token in common if before_rows[token] != after_rows[token]]
     if moved:
         failures.append(f"{label}: frozen transcript rows moved: " + ", ".join(moved))
+
+
+if len(sys.argv) > 2 and sys.argv[2] == "transient-tail":
+    token = "transcript-tail.txt"
+    before_frames = snapshots((scratch / "tail-before.ansi").read_text(errors="replace"))
+    before_matches = [candidate for candidate in before_frames if token in "\n".join(candidate)]
+    if not before_matches:
+        raise SystemExit(f"TRANSCRIPT_TAIL_CLICK_FLICKER_FAIL: compact frame has no {token!r}")
+    before = before_matches[-1]
+    transition_frames = snapshots(
+        (scratch / "tail-transition.ansi").read_text(errors="replace"),
+        initial=before,
+    )
+    expected_rows = token_rows(before, re.escape(token))
+    expected = expected_rows.get(token)
+    observed = [token_rows(candidate, re.escape(token)).get(token) for candidate in transition_frames]
+    observed = [row for row in observed if row is not None]
+    expanded = any("click for more detail" in "\n".join(candidate) for candidate in transition_frames)
+    if not observed or not expanded:
+        raise SystemExit(
+            "TRANSCRIPT_TAIL_CLICK_FLICKER_FAIL: expansion transition was not captured; "
+            f"observed={observed}, expanded={expanded}"
+        )
+    if any(row != expected for row in observed):
+        raise SystemExit(
+            f"TRANSCRIPT_TAIL_CLICK_FLICKER_FAIL: expected header row {expected} "
+            f"in every frame, observed {observed}"
+        )
+    print(f"TRANSCRIPT_TAIL_CLICK_FLICKER_PASS: header stayed on row {expected} across {len(observed)} frames")
+    raise SystemExit(0)
 
 
 top_before = frame("top-before-expand.ansi", "collapse-scroll-position.txt")

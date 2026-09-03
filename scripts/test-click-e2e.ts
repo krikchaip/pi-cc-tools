@@ -8,6 +8,7 @@ const expectFiles = [
   "e2e/expect/collapse-row-review.expect",
   "e2e/expect/result-summary-anchor.expect",
   "e2e/expect/click-viewport-anchors.expect",
+  "e2e/expect/transcript-tail-click-flicker.expect",
   "e2e/expect/collapse-scroll-position.expect",
   "e2e/expect/tool-group-click.expect",
   "e2e/expect/async-diff-click.expect",
