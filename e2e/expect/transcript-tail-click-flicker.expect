@@ -1,0 +1,123 @@
+#!/usr/bin/expect -f
+# Real-Pi regression: expanding the newest tool must not paint a transient shifted viewport.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "transcript-tail-click-session.jsonl"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set assert_path [file join $expect_dir "click-viewport-anchors-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-transcript-tail-click-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":100,"extraExpandedPreviewMaxLines":200,"groupToolCalls":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-transcript-tail-click" $cwd] $content]
+close $session
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_repaint {} {
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+}
+
+proc force_fullscreen_repaint {path columns rows} {
+  global spawn_id
+  log_file
+  log_file -noappend $path
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  log_file
+  return 1
+}
+
+proc stop_pi {} {
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {click.*to expand}]} {
+  puts stderr "transcript-tail fixture did not become ready"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+set before_path [file join $scratch "tail-before.ansi"]
+if {![force_fullscreen_repaint $before_path $columns $rows]} {
+  puts stderr "could not capture transcript-tail compact frame"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+if {[catch {exec python3 $locator_path locate $before_path "70 lines loaded"} summary_point]
+    || [llength $summary_point] != 2} {
+  puts stderr "could not locate transcript-tail result summary"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+set x [lindex $summary_point 0]
+set y [lindex $summary_point 1]
+set transition_path [file join $scratch "tail-transition.ansi"]
+log_file -noappend $transition_path
+send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+if {![wait_for 3 {click.*for more detail}]} {
+  puts stderr "transcript-tail result summary did not expand"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+drain_repaint
+log_file
+stop_pi
+
+set assertion_status [catch {exec python3 $assert_path $scratch transient-tail} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status

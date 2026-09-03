@@ -1471,11 +1471,10 @@ function stabilizeToolCollapseViewport(snapshot: ToolCollapseViewportSnapshot): 
 	try {
 		const target = collapseViewportTarget(snapshot);
 		if (target === undefined) return;
-		// Bottom collapse can request a target outside the old layout. Give the
-		// ScrollView an early target, then commit the new geometry and apply it again.
-		if (snapshot.viewportAnchor === "bottom") {
-			scrollToToolViewportTarget(snapshot, target, snapshot.wasFollowingEnd);
-		}
+		// Freeze the viewport before committing the new geometry. For top anchors,
+		// this disables follow-end before the first paint can shift the transcript.
+		// Bottom collapse also needs the early target when the old layout permits it.
+		scrollToToolViewportTarget(snapshot, target, snapshot.wasFollowingEnd);
 		if (renderToolCollapseViewportNow(snapshot)) {
 			scrollToToolViewportTarget(snapshot, target, snapshot.wasFollowingEnd);
 		} else snapshot.renderer.requestRender();
