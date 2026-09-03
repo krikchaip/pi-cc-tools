@@ -221,6 +221,17 @@ def main_assert(scratch: Path) -> None:
             )
             if stable_repaints > 1:
                 failures.append(f"{name}: repainted stable top-anchor rows {stable_repaints} times")
+        elif name == "bottom-collapse-transition.ansi":
+            repainted = next(
+                (
+                    token
+                    for token in ("Output ends here", "BETWEEN_TOOLS_01", "async-edit.ts")
+                    if token in plain
+                ),
+                None,
+            )
+            if repainted:
+                failures.append(f"{name}: repainted stable off-screen-collapse content: {repainted!r}")
 
     if failures:
         print("ASYNC_DIFF_CLICK_FAIL")

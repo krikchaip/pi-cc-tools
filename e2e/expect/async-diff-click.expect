@@ -38,7 +38,7 @@ proc wait_for {seconds pattern} {
     expect {
       "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
       "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
-      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      "install missing project packages" { puts stderr "unexpected project trust prompt"; return 0 }
       -re $pattern { return 1 }
       timeout {}
       eof { return 0 }
