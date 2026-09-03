@@ -3,10 +3,15 @@ import { delimiter, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const expectFiles = [
+  "e2e/expect/fullscreen-click-expansion.expect",
+  "e2e/expect/click-layering-regression.expect",
+  "e2e/expect/collapse-row-review.expect",
+  "e2e/expect/result-summary-anchor.expect",
   "e2e/expect/click-viewport-anchors.expect",
   "e2e/expect/collapse-scroll-position.expect",
   "e2e/expect/tool-group-click.expect",
   "e2e/expect/async-diff-click.expect",
+  "e2e/expect/reload-click-anchors.expect",
 ];
 
 function isExecutable(path: string): boolean {
