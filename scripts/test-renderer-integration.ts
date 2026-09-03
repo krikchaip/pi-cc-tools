@@ -200,6 +200,37 @@ await withRendererHarness(
     await emitLifecycle("agent_start");
 
     const readDefinition = fakePi.tools.get("read");
+    const skillReadExecution = new ToolExecutionComponent(
+      "read",
+      "standalone_skill_read_click_fixture",
+      { path: "/tmp/pi-cc-tools-skill-anchor/skills/grilling/SKILL.md" },
+      {},
+      readDefinition,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    skillReadExecution.markExecutionStarted();
+    skillReadExecution.setArgsComplete();
+    skillReadExecution.updateResult({
+      content: [{
+        type: "text",
+        text: Array.from({ length: 6 }, (_, index) => `skill anchor payload ${index + 1}`).join("\n"),
+      }],
+      isError: false,
+    }, false);
+    const skillReadRows = skillReadExecution.render(120).map((line: string) => plain(line));
+    const skillHeaderRow = skillReadRows.findIndex((line: string) => line.includes("[skill] grilling"));
+    const skillHeaderX = skillHeaderRow < 0 ? -1 : skillReadRows[skillHeaderRow].indexOf("[skill]") + 1;
+    if (
+      skillHeaderRow < 0
+      || skillHeaderX < 1
+      || skillReadExecution.clickActionAtPoint(skillHeaderX, skillHeaderRow) !== "header"
+      || !skillReadExecution.activateClickAction("header", "top")
+      || !skillReadExecution.render(120).some((line: string) => plain(line).includes("skill anchor payload 3"))
+    ) {
+      throw new Error(`standalone skill header did not expand its Read result: ${JSON.stringify({ skillReadRows, skillHeaderRow, skillHeaderX })}`);
+    }
+
     const readExecution = new ToolExecutionComponent(
       "read",
       "read_click_fixture",

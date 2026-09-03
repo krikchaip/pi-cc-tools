@@ -7991,6 +7991,7 @@ export default function (pi: ExtensionAPI) {
 				const skillName = basename(dirname(absPath)) || "SKILL.md";
 				const line =
 					theme.fg("customMessageLabel", `\x1b[1m[skill]\x1b[22m `) +
+					HEADER_WRAP_MARK +
 					theme.fg("customMessageText", skillName);
 				return makeText(ctx.lastComponent, `${toolStatusDot(ctx, theme)}${line}${liveLineCountTrailing(ctx, theme)}`);
 			}

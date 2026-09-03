@@ -1,0 +1,113 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression: a standalone [skill] Read header expands its result.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "standalone-skill-anchor-session.jsonl"]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-standalone-skill-anchor-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set session_path [file join $scratch "session.jsonl"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":50,"extraExpandedPreviewMaxLines":100,"groupToolCalls":true}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-standalone-skill-anchor" $cwd] $content]
+close $session
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc stop_pi {} {
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  return 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {click.*to expand}]} {
+  puts stderr "standalone skill fixture did not become ready"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+log_file
+set frame_path [file join $scratch "collapsed-frame.ansi"]
+log_file -noappend $frame_path
+if {![force_fullscreen_repaint $columns $rows]} {
+  puts stderr "could not capture standalone skill frame"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+if {[catch {exec python3 $locator_path locate $frame_path "\[skill\] grilling"} point]} {
+  puts stderr "could not locate standalone skill header: $point"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+lassign $point x y
+log_file -noappend [file join $scratch "click.ansi"]
+send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+if {![wait_for 5 {skill anchor payload 03}]} {
+  puts stderr "standalone skill header click did not expand its result"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+stop_pi
+file delete -force $scratch
+puts "PASS standalone skill header anchor"
