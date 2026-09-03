@@ -12,6 +12,7 @@ const expectFiles = [
   "e2e/expect/tool-group-click.expect",
   "e2e/expect/async-diff-click.expect",
   "e2e/expect/reload-click-anchors.expect",
+  "e2e/expect/standalone-skill-anchor.expect",
 ];
 
 function isExecutable(path: string): boolean {
