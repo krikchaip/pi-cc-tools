@@ -1542,12 +1542,17 @@ function settlePendingToolCollapseViewport(state: any, pending: PendingToolColla
 		if (!Array.isArray(lines)) return;
 		const heightDelta = lines.length - postCollapse.componentHeight;
 		if (heightDelta === 0) return;
-		// Commit the settled component height before scrolling to a target that can
-		// be outside the placeholder layout's old range.
-		if (!renderToolCollapseViewportNow(snapshot)) return;
 		const target = snapshot.viewportAnchor === "bottom"
 			? postCollapse.scrollTop + heightDelta
 			: postCollapse.scrollTop;
+		// A shrinking bottom-anchored component has a valid target in the old layout.
+		// Move there before the first settled paint so rows below the anchor stay fixed.
+		// A growing bottom-anchored component must first commit its larger scroll range.
+		if (
+			snapshot.viewportAnchor === "bottom"
+			&& heightDelta > 0
+			&& !renderToolCollapseViewportNow(snapshot)
+		) return;
 		scrollToToolViewportTarget(snapshot, target, postCollapse.isFollowingEnd);
 	} catch {
 		return;
