@@ -267,6 +267,20 @@ if len(sys.argv) > 2 and sys.argv[2] == "grouped":
             failures.append(f"grouped payload indentation changed across L0/L1/L2: {token!r}, columns={columns!r}")
     if len(set(baseline_columns.values())) < 4:
         failures.append(f"grouped fixture did not exercise varied payload indentation: {baseline_columns!r}")
+    grouped_root = baseline_columns.get("GROUP_INDENT_ROOT", -1)
+    grouped_expected_offsets = {
+        "GROUP_INDENT_TWO_SPACES": 2,
+        "GROUP_INDENT_FOUR_SPACES": 4,
+        "GROUP_INDENT_SEVEN_SPACES": 7,
+        "GROUP_INDENT_TAB": 4,
+        "GROUP_INDENT_MIXED": 6,
+    }
+    for token, offset in grouped_expected_offsets.items():
+        if grouped_root >= 0 and baseline_columns.get(token) != grouped_root + offset:
+            failures.append(
+                f"grouped output changed four-column tab-stop geometry: {token!r}, "
+                f"expected={grouped_root + offset}, actual={baseline_columns.get(token)!r}"
+            )
     if failures:
         print("GROUPED_OUTPUT_INDENTATION_FAIL")
         for index, failure in enumerate(failures, 1):
@@ -305,6 +319,20 @@ for token in standalone_tokens:
         failures.append(f"standalone payload indentation changed across L0/L1/L2: {token!r}, columns={columns!r}")
 if len(set(baseline_columns.values())) < 4:
     failures.append(f"standalone fixture did not exercise varied payload indentation: {baseline_columns!r}")
+standalone_root = baseline_columns.get("STANDALONE_INDENT_ROOT", -1)
+standalone_expected_offsets = {
+    "STANDALONE_INDENT_TWO_SPACES": 2,
+    "STANDALONE_INDENT_FOUR_SPACES": 4,
+    "STANDALONE_INDENT_SEVEN_SPACES": 7,
+    "STANDALONE_INDENT_TAB": 4,
+    "STANDALONE_INDENT_MIXED": 6,
+}
+for token, offset in standalone_expected_offsets.items():
+    if standalone_root >= 0 and baseline_columns.get(token) != standalone_root + offset:
+        failures.append(
+            f"standalone output changed four-column tab-stop geometry: {token!r}, "
+            f"expected={standalone_root + offset}, actual={baseline_columns.get(token)!r}"
+        )
 
 def token_position(frame: list[str], token: str, label: str) -> tuple[int, int]:
     for row_index, row in enumerate(frame):

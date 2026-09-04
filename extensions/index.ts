@@ -4481,6 +4481,30 @@ function findWrapMark(line: string): { index: number; mark: string } | undefined
 		.sort((left, right) => left.index - right.index)[0];
 }
 
+const TOOL_OUTPUT_TAB_WIDTH = 4;
+
+function expandTabStops(text: string, tabWidth = TOOL_OUTPUT_TAB_WIDTH): string {
+	return text.split("\n").map((line) => {
+		const segments = line.split("\t");
+		if (segments.length === 1) return line;
+		let expanded = segments[0];
+		for (const segment of segments.slice(1)) {
+			const column = visibleWidth(expanded);
+			const spaces = tabWidth - (column % tabWidth);
+			expanded += `${" ".repeat(spaces)}${segment}`;
+		}
+		return expanded;
+	}).join("\n");
+}
+
+function expandToolLineTabs(line: string): string {
+	const marker = findWrapMark(line);
+	if (!marker) return expandTabStops(line);
+	const prefix = line.slice(0, marker.index);
+	const body = line.slice(marker.index + marker.mark.length);
+	return `${expandTabStops(prefix)}${marker.mark}${expandTabStops(body)}`;
+}
+
 function wrapMarkedLine(line: string, width: number): string[] {
 	const clipIndex = line.indexOf(CLIP_MARK);
 	if (clipIndex !== -1) {
@@ -4631,7 +4655,7 @@ class ToolText extends Text {
 		}
 		const contentWidth = Math.max(1, width - paddingX * 2);
 		const horizontalPad = " ".repeat(paddingX);
-		const logicalLines = this.value.replace(/\t/g, "   ").split("\n");
+		const logicalLines = this.value.split("\n").map(expandToolLineTabs);
 		const rendered: string[] = [];
 		const semanticRows: ToolTextSemanticRow[] = [];
 		for (const logicalLine of logicalLines) {
@@ -5651,7 +5675,7 @@ function diffStrip(value: string): string {
 }
 
 function tabs(text: string): string {
-	return text.replace(/\t/g, "  ");
+	return expandTabStops(text);
 }
 
 function termW(): number {
