@@ -1,0 +1,144 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for output-owned empty lines in Read and [skill].
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set standalone_fixture [file join $repo_dir "e2e" "fixtures" "read-skill-output-shape-standalone-session.jsonl"]
+set grouped_fixture [file join $repo_dir "e2e" "fixtures" "read-skill-output-shape-grouped-session.jsonl"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set assert_path [file join $expect_dir "expanded-output-indentation-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-read-skill-output-shape-[pid]"
+set columns 100
+set rows 40
+file mkdir $scratch
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_repaint {} {
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  return 1
+}
+
+proc stop_pi {} {
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  log_file
+}
+
+proc fail {message} {
+  global scratch
+  puts stderr $message
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+proc locate_and_click {frame marker label} {
+  global locator_path
+  if {[catch {exec python3 $locator_path locate $frame $marker} point]} {
+    fail "$label: could not locate $marker: $point"
+  }
+  lassign $point x y
+  send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+}
+
+proc run_case {label fixture target marker} {
+  global scratch extension_path pi_bin columns rows spawn_id
+  set case_dir [file join $scratch $label]
+  set cwd [file join $case_dir "cwd"]
+  set home [file join $case_dir "home"]
+  set agent [file join $case_dir "agent"]
+  file mkdir $cwd
+  file mkdir [file join $home ".pi"]
+  file mkdir $agent
+
+  set source [open $fixture "r"]
+  set content [read $source]
+  close $source
+  set resolved_target [string map [list "__CASE_CWD__" $cwd] $target]
+  set session_path [file join $case_dir "session.jsonl"]
+  set session [open $session_path "w"]
+  puts -nonewline $session [string map [list "__FIXTURE_CWD__" $cwd "__TARGET_PATH__" $resolved_target] $content]
+  close $session
+
+  set settings_json {{"quietStartup":true,"theme":"dark","outputPad":1,"clickExpansion":true,"previewLines":8,"expandedPreviewMaxLines":10,"extraExpandedPreviewMaxLines":15,"groupToolCalls":true}}
+  foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+    set settings [open $path "w"]
+    puts $settings $settings_json
+    close $settings
+  }
+
+  cd $cwd
+  log_file -noappend [file join $case_dir "startup.ansi"]
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+    $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+    -e $extension_path --tui-mode fullscreen
+  stty columns $columns rows $rows
+  if {![wait_for 10 {click.*(to expand|any for details)}]} { fail "$label did not become ready" }
+
+  log_file
+  set collapsed [file join $case_dir "collapsed.ansi"]
+  log_file -noappend $collapsed
+  if {![force_fullscreen_repaint $columns $rows]} { fail "$label collapsed capture failed" }
+  log_file
+  log_file -noappend [file join $case_dir "opening.ansi"]
+  locate_and_click $collapsed $marker "$label header"
+  if {![wait_for 5 {READ_SHAPE_FILLER_2}]} { fail "$label L0 did not open" }
+
+  log_file
+  set level0 [file join $case_dir "level0.ansi"]
+  log_file -noappend $level0
+  if {![force_fullscreen_repaint $columns $rows]} { fail "$label L0 capture failed" }
+  log_file
+  log_file -noappend [file join $case_dir "level1.ansi"]
+  locate_and_click $level0 "click for more detail" "$label L0 detail"
+  drain_repaint
+  if {![force_fullscreen_repaint $columns $rows]} { fail "$label L1 capture failed" }
+
+  log_file
+  set level1_capture [file join $case_dir "level1.ansi"]
+  locate_and_click $level1_capture "click for more detail" "$label L1 detail"
+  log_file -noappend [file join $case_dir "level2.ansi"]
+  drain_repaint
+  if {![force_fullscreen_repaint $columns $rows]} { fail "$label L2 capture failed" }
+  stop_pi
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+run_case "standalone-read" $standalone_fixture "target.txt" "target.txt"
+run_case "standalone-skill" $standalone_fixture "__CASE_CWD__/skills/shape/SKILL.md" "\[skill\] shape"
+run_case "grouped-read" $grouped_fixture "target.txt" "target.txt"
+run_case "grouped-skill" $grouped_fixture "__CASE_CWD__/skills/shape/SKILL.md" "\[skill\] shape"
+
+set assertion_status [catch {exec python3 $assert_path $scratch read-skill-shapes} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status

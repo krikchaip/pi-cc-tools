@@ -1,14 +1,14 @@
 #!/usr/bin/expect -f
-# Real-Pi fullscreen regression for payload indentation across local detail layers.
+# Real-Pi fullscreen regression for grouped payload indentation across L0/L1/L2.
 
 set timeout 1
 set expect_dir [file dirname [file normalize [info script]]]
 set repo_dir [file dirname [file dirname $expect_dir]]
 set extension_path [file join $repo_dir "extensions" "index.ts"]
-set fixture_path [file join $repo_dir "e2e" "fixtures" "expanded-output-indentation-session.jsonl"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "grouped-output-indentation-session.jsonl"]
 set assert_path [file join $expect_dir "expanded-output-indentation-assert.py"]
 set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
-set scratch "/tmp/pi-cc-tools-expanded-output-indentation-[pid]"
+set scratch "/tmp/pi-cc-tools-grouped-output-indentation-[pid]"
 set cwd [file join $scratch "cwd"]
 set home [file join $scratch "home"]
 set agent [file join $scratch "agent"]
@@ -23,10 +23,10 @@ set content [read $fixture]
 close $fixture
 set session_path [file join $scratch "session.jsonl"]
 set session [open $session_path "w"]
-puts -nonewline $session [string map [list "/tmp/pi-cc-tools-expanded-output-indentation" $cwd] $content]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-grouped-output-indentation" $cwd] $content]
 close $session
 
-set settings_json {{"quietStartup":true,"theme":"dark","outputPad":1,"clickExpansion":true,"previewLines":6,"expandedPreviewMaxLines":9,"extraExpandedPreviewMaxLines":12}}
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"previewLines":6,"expandedPreviewMaxLines":8,"extraExpandedPreviewMaxLines":12}}
 foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
   set settings [open $path "w"]
   puts $settings $settings_json
@@ -87,36 +87,35 @@ spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LI
   -e $extension_path --tui-mode fullscreen
 stty columns $columns rows $rows
 
-if {![wait_for 10 {click.*to expand}]} { fail "indentation fixture did not become ready" $scratch }
+if {![wait_for 10 {click.*any for details}]} { fail "grouped indentation fixture did not become ready" $scratch }
 
-# Result summary is row 4. This opens local detail level 0 (six payload lines).
-send -- "\033\[<0;12;4M\033\[<0;12;4m"
-if {![wait_for 5 {STANDALONE_INDENT_MIXED}]} { fail "level 0 did not open" $scratch }
+# First grouped execution header is row 3.
+send -- "\033\[<0;6;3M\033\[<0;6;3m"
+if {![wait_for 5 {GROUP_INDENT_MIXED}]} { fail "grouped L0 did not open" $scratch }
 log_file
 log_file -noappend [file join $scratch "level0.ansi"]
-if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture level 0 repaint" $scratch }
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture grouped L0" $scratch }
 
-# Level-0 hidden-content action is row 11. It opens nine logical payload lines.
+# Six payload rows place the L0 detail action on row 11.
 log_file
 log_file -noappend [file join $scratch "level1.ansi"]
 send -- "\033\[<0;35;11M\033\[<0;35;11m"
-if {![wait_for 5 {INDENT_WRAP_L1}]} { fail "level 1 did not open" $scratch }
-if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture level 1 repaint" $scratch }
+if {![wait_for 5 {GROUP_INDENT_L1_END}]} { fail "grouped L1 did not open" $scratch }
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture grouped L1" $scratch }
 
-# Preserving four payload-indent columns wraps the ninth logical line onto
-# three physical rows. Its next-detail action is therefore row 16.
+# Eight payload rows place the L1 detail action on row 13.
 log_file
 log_file -noappend [file join $scratch "level2.ansi"]
-send -- "\033\[<0;35;16M\033\[<0;35;16m"
-if {![wait_for 5 {INDENT_FINAL_L2}]} { fail "level 2 did not open" $scratch }
-if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture level 2 repaint" $scratch }
+send -- "\033\[<0;35;13M\033\[<0;35;13m"
+if {![wait_for 5 {GROUP_INDENT_L2_END}]} { fail "grouped L2 did not open" $scratch }
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not capture grouped L2" $scratch }
 
 send "\003\003"
 catch {close}
 catch {wait}
 log_file
 
-set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+set assertion_status [catch {exec python3 $assert_path $scratch grouped} assertion_output]
 puts $assertion_output
 puts "ARTIFACTS $scratch"
 exit $assertion_status

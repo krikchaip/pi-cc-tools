@@ -126,7 +126,11 @@ await withRendererHarness(
     ).render(120).join("\n");
     assertCollapsedIndicator(bashRaw, "earlier lines", true);
 
-    const cappedOutput = Array.from({ length: 20 }, (_, index) => `result line ${index + 1}`).join("\n");
+    const groupedIndentPrefixes = ["", "  ", "    ", "       ", "\t", " \t  "];
+    const cappedOutput = Array.from({ length: 20 }, (_, index) => {
+      const indent = groupedIndentPrefixes[index] ?? "";
+      return `${indent}result line ${index + 1}`;
+    }).join("\n");
     for (const { name, args } of [
       { name: "read", args: { path: "fixture.ts" } },
       { name: "grep", args: { pattern: "result", path: "." } },
@@ -304,6 +308,14 @@ await withRendererHarness(
     }
     const extraDetailedReadRows = readExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
     const extraDetailedRead = extraDetailedReadRows.join("\n");
+    for (const token of ["result line 1", "result line 2", "result line 3", "result line 4", "result line 5", "result line 6"]) {
+      const columns = [readRows, standardReadRows, extraDetailedReadRows].map(
+        (rows) => rows.find((line: string) => line.includes(token))?.indexOf(token) ?? -1,
+      );
+      if (columns.some((column) => column < 0) || !columns.every((column) => column === columns[0])) {
+        throw new Error(`standalone Read payload indentation changed across L0/L1/L2: ${JSON.stringify({ token, columns })}`);
+      }
+    }
     if (!extraDetailedRead.includes("result line 15") || extraDetailedRead.includes("result line 16")) {
       throw new Error(`standalone second detail action did not stop at extraExpandedPreviewMaxLines=15: ${JSON.stringify(extraDetailedRead)}`);
     }
@@ -328,6 +340,124 @@ await withRendererHarness(
     }
     if (!readExecution.activateClickAction("expand") || readExecution.expanded) {
       throw new Error("standalone final collapse action did not collapse the execution");
+    }
+
+    const newlineOwnedBashOutput = [
+      "",
+      "BASH_NEWLINE_ROOT",
+      "  BASH_NEWLINE_CHILD",
+      "",
+      "\t",
+      " \t  BASH_NEWLINE_MIXED",
+      ...Array.from({ length: 6 }, (_, index) => `BASH_NEWLINE_FILLER_${index + 1}`),
+      "BASH_NEWLINE_END",
+      "",
+      "",
+    ].join("\n");
+    const newlineOwnedBash = new ToolExecutionComponent(
+      "bash",
+      "bash_newline_fixture",
+      { command: "printf fixture" },
+      {},
+      bash,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    newlineOwnedBash.markExecutionStarted();
+    newlineOwnedBash.setArgsComplete();
+    newlineOwnedBash.updateResult({ content: [{ type: "text", text: newlineOwnedBashOutput }], isError: false }, false);
+    newlineOwnedBash.setExpanded(true);
+    const assertBashOwnedPrefix = (rows: string[], layer: string): void => {
+      const summary = rows.findIndex((line) => line.includes("Done (15 lines)"));
+      const root = rows.findIndex((line) => line.includes("BASH_NEWLINE_ROOT"));
+      const child = rows.findIndex((line) => line.includes("BASH_NEWLINE_CHILD"));
+      const mixed = rows.findIndex((line) => line.includes("BASH_NEWLINE_MIXED"));
+      if (summary < 0 || root !== summary + 2 || child !== root + 1 || mixed !== child + 3) {
+        throw new Error(`standalone Bash did not preserve output-owned prefix newlines at ${layer}: ${JSON.stringify(rows)}`);
+      }
+    };
+    const bashLevel0Rows = newlineOwnedBash.render(120).map((line: string) => plain(line));
+    assertBashOwnedPrefix(bashLevel0Rows, "L0");
+    if (!newlineOwnedBash.activateClickAction("detail")) throw new Error("standalone Bash did not enter L1");
+    const bashLevel1Rows = newlineOwnedBash.render(120).map((line: string) => plain(line));
+    assertBashOwnedPrefix(bashLevel1Rows, "L1");
+    if (!newlineOwnedBash.activateClickAction("detail")) throw new Error("standalone Bash did not enter L2");
+    const bashLevel2Rows = newlineOwnedBash.render(120).map((line: string) => plain(line));
+    assertBashOwnedPrefix(bashLevel2Rows, "L2");
+    const bashEnd = bashLevel2Rows.findIndex((line: string) => line.includes("BASH_NEWLINE_END"));
+    const bashCollapse = bashLevel2Rows.findIndex((line: string) => line.includes("click to collapse"));
+    if (bashEnd < 0 || bashCollapse !== bashEnd + 3) {
+      throw new Error(`standalone Bash did not preserve trailing output-owned newlines at L2: ${JSON.stringify(bashLevel2Rows)}`);
+    }
+
+    const newlineOwnedReadOutput = newlineOwnedBashOutput
+      .replaceAll("BASH_NEWLINE", "READ_NEWLINE");
+    const createNewlineOwnedRead = (id: string, path: string): any => {
+      const execution = new ToolExecutionComponent(
+        "read",
+        id,
+        { path },
+        {},
+        readDefinition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      execution.markExecutionStarted();
+      execution.setArgsComplete();
+      execution.updateResult({ content: [{ type: "text", text: newlineOwnedReadOutput }], isError: false }, false);
+      return execution;
+    };
+    const assertReadOutputShape = (
+      execution: any,
+      renderRows: () => string[],
+      label: string,
+    ): void => {
+      execution.setExpanded(true);
+      const layers = [renderRows()];
+      if (!execution.activateClickAction("detail")) throw new Error(`${label} did not enter L1`);
+      layers.push(renderRows());
+      if (!execution.activateClickAction("detail")) throw new Error(`${label} did not enter L2`);
+      layers.push(renderRows());
+      layers.forEach((rows, index) => {
+        const summary = rows.findIndex((line) => line.includes("15 lines loaded"));
+        const root = rows.findIndex((line) => line.includes("READ_NEWLINE_ROOT"));
+        const child = rows.findIndex((line) => line.includes("READ_NEWLINE_CHILD"));
+        const mixed = rows.findIndex((line) => line.includes("READ_NEWLINE_MIXED"));
+        if (summary < 0 || root !== summary + 2 || child !== root + 1 || mixed !== child + 3) {
+          throw new Error(`${label} did not preserve output-owned prefix empty lines at L${index}: ${JSON.stringify(rows)}`);
+        }
+      });
+      for (const token of ["READ_NEWLINE_ROOT", "READ_NEWLINE_CHILD", "READ_NEWLINE_MIXED"]) {
+        const columns = layers.map((rows) => rows.find((line) => line.includes(token))?.indexOf(token) ?? -1);
+        if (columns.some((column) => column < 0) || !columns.every((column) => column === columns[0])) {
+          throw new Error(`${label} did not preserve output indentation across L0/L1/L2: ${JSON.stringify({ token, columns })}`);
+        }
+      }
+      const finalRows = layers[2];
+      const end = finalRows.findIndex((line) => line.includes("READ_NEWLINE_END"));
+      const collapse = finalRows.findIndex((line) => line.includes("click to collapse"));
+      if (end < 0 || collapse !== end + 3) {
+        throw new Error(`${label} did not preserve trailing output-owned empty lines at L2: ${JSON.stringify(finalRows)}`);
+      }
+    };
+    for (const fixture of [
+      { label: "standalone Read", path: "read-output-shape.txt" },
+      { label: "standalone [skill]", path: "/tmp/read-output-shape/skills/shape/SKILL.md" },
+    ]) {
+      const execution = createNewlineOwnedRead(`newline_${fixture.label}`, fixture.path);
+      assertReadOutputShape(execution, () => execution.render(120).map((line: string) => plain(line)), fixture.label);
+    }
+    for (const fixture of [
+      { label: "grouped Read", path: "grouped-read-output-shape.txt" },
+      { label: "grouped [skill]", path: "/tmp/grouped-output-shape/skills/shape/SKILL.md" },
+    ]) {
+      const execution = createNewlineOwnedRead(`newline_${fixture.label}`, fixture.path);
+      const peer = createNewlineOwnedRead(`newline_${fixture.label}_peer`, "grouped-output-shape-peer.txt");
+      peer.updateResult({ content: [{ type: "text", text: "GROUPED_OUTPUT_SHAPE_PEER" }], isError: false }, false);
+      const parent = new Container();
+      parent.addChild(execution);
+      parent.addChild(peer);
+      assertReadOutputShape(execution, () => parent.render(120).map((line: string) => plain(line)), fixture.label);
     }
 
     const readOffsetNotice = "[23 more lines in file. Use offset=11 to continue.]";
@@ -397,6 +527,14 @@ await withRendererHarness(
       }) ?? -1
     );
     const expandedReadGroupRows = readGroupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const expandedReadChildEnd = expandedReadGroupRows.findIndex((line: string) => line.includes("peer.ts"));
+    const expandedReadChildRows = expandedReadGroupRows.slice(0, expandedReadChildEnd < 0 ? undefined : expandedReadChildEnd);
+    if (
+      expandedReadChildRows.some((line: string) => line.includes("Read fixture.ts"))
+      || expandedReadChildRows.some((line: string) => line.includes("────────"))
+    ) {
+      throw new Error(`grouped Read embedded standalone component chrome: ${JSON.stringify(expandedReadGroupRows)}`);
+    }
     const groupedDetailRow = expandedReadGroupRows.findIndex((line: string, index: number) => (
       line.includes("more lines") && groupedActionX(index, "detail") >= 0
     ));
@@ -418,6 +556,14 @@ await withRendererHarness(
     }
     const extraDetailedReadGroupRows = readGroupParent.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
     const extraDetailedReadGroup = extraDetailedReadGroupRows.join("\n");
+    for (const token of ["result line 1", "result line 2", "result line 3", "result line 4", "result line 5", "result line 6"]) {
+      const columns = [expandedReadGroupRows, standardReadGroupRows, extraDetailedReadGroupRows].map(
+        (rows) => rows.find((line: string) => line.includes(token))?.indexOf(token) ?? -1,
+      );
+      if (columns.some((column) => column < 0) || !columns.every((column) => column === columns[0])) {
+        throw new Error(`grouped Read payload indentation changed across L0/L1/L2: ${JSON.stringify({ token, columns })}`);
+      }
+    }
     if (!extraDetailedReadGroup.includes("result line 15") || extraDetailedReadGroup.includes("result line 16")) {
       throw new Error(`grouped second detail action did not stop at extraExpandedPreviewMaxLines=15: ${JSON.stringify(extraDetailedReadGroup)}`);
     }
