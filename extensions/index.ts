@@ -661,13 +661,19 @@ function stripGroupedToolLabel(line: string, label: string | undefined): string 
 	return line.replace(pattern, "$1$2");
 }
 
-function isChromeOnlyLine(line: string): boolean {
+function isOuterToolRule(line: string): boolean {
 	const plain = stripAnsi(line).trim();
-	return plain.length === 0 || /^[─━╭╮╰╯┌┐└┘│├┤┬┴┼\s]+$/.test(plain);
+	return plain.length >= 8 && /^[─━]+$/.test(plain);
 }
 
 function stripToolChrome(lines: string[]): string[] {
-	return trimRenderedBlankLines(lines).filter((line) => !isChromeOnlyLine(line));
+	// ToolExecutionComponent wraps its card in horizontal rules. Remove only the
+	// two outer rules. A blank or box-drawing-only row between them can be tool
+	// output and must stay intact.
+	let content = trimRenderedBlankLines(lines);
+	if (content.length > 0 && isOuterToolRule(content[0])) content = content.slice(1);
+	if (content.length > 0 && isOuterToolRule(content[content.length - 1])) content = content.slice(0, -1);
+	return content;
 }
 
 function stripLeadingToolStatus(line: string): string {
@@ -715,11 +721,18 @@ function closedBranchContinuationTrims(lines: string[]): Map<number, number> {
 		}
 		if (closedBranch) {
 			const leading = plain.match(/^[ \t]*/)?.[0] ?? "";
+			const leadingWidth = visibleWidth(leading);
 			const firstContent = plain.slice(leading.length, leading.length + 1);
+			if (!firstContent && leadingWidth >= closedBranch.contentColumn) {
+				// An output-owned empty or whitespace-only row is still part of the closed
+				// branch continuation. Keep the branch active for the payload rows after it.
+				trims.set(lineIndex, closedBranch.outerIndent);
+				continue;
+			}
 			if (
 				firstContent
 				&& !"│├└".includes(firstContent)
-				&& visibleWidth(leading) >= closedBranch.contentColumn
+				&& leadingWidth >= closedBranch.contentColumn
 			) {
 				trims.set(lineIndex, closedBranch.outerIndent);
 				continue;
@@ -782,7 +795,8 @@ function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: stri
 		if (jsonTreeRootIndex >= 0 && lineIndex >= jsonTreeRootIndex) return line;
 		const closedContinuationTrim = closedContinuationTrims.get(lineIndex);
 		if (closedContinuationTrim !== undefined) return trimAnsiLeftColumns(line, closedContinuationTrim);
-		return tintGroupedToolLine(removeGroupedToolPrefix(line, groupedLabel), groupedLabel);
+		if (lineIndex === 0) return tintGroupedToolLine(removeGroupedToolPrefix(line, groupedLabel), groupedLabel);
+		return tintGroupedToolLine(line, groupedLabel);
 	});
 	return lines.length > 0 ? lines : [`${FG_DIM}${String(tool?.toolName ?? "tool")}${TRANSPARENT_RESET}`];
 }
@@ -809,8 +823,7 @@ function formatBranchedToolLines(
 	options?: { agentBreathe?: boolean },
 ): string[] {
 	const output: string[] = [];
-	const content = lines.filter((line) => isTerminalImageLine(line) || stripAnsi(line).trim().length > 0);
-	const safeContent = content.length > 0 ? content : [""];
+	const safeContent = lines.length > 0 ? lines : [""];
 	const jsonTreeRootIndex = safeContent.findIndex((line, lineIndex) => (
 		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+·/.test(stripAnsi(line).trimStart())
 	));
@@ -3225,7 +3238,7 @@ function syncLiveToolRenderState(component: any): void {
 	if (component?.isPartial === true && component?.result) {
 		const raw = getTextContent(component.result).replace(/\r\n/g, "\n").trimEnd();
 		// tailLimit=0 → count-only (no line materialization) so huge bash tails stay cheap.
-		state._liveLineCount = collectNonEmptyLines(raw, 0).total;
+		state._liveLineCount = collectOutputLines(raw, 0).total;
 	} else if (component?.isPartial !== true) {
 		delete state._liveLineCount;
 	}
@@ -6519,17 +6532,23 @@ function getTextContent(result: any): string {
 		.join("\n");
 }
 
-function collectNonEmptyLines(text: string, tailLimit?: number): { lines: string[]; total: number } {
+function collectOutputLines(
+	text: string,
+	tailLimit?: number,
+	preserveBlankLines = false,
+): { lines: string[]; total: number } {
+	const normalized = text.replace(/\r\n/g, "\n");
+	if (normalized.length === 0) return { lines: [], total: 0 };
 	const keepTail = typeof tailLimit === "number" && Number.isFinite(tailLimit);
 	const limit = keepTail ? Math.max(0, Math.floor(tailLimit)) : 0;
 	const lines: string[] = [];
 	let total = 0;
 	let start = 0;
-	while (start <= text.length) {
-		const newline = text.indexOf("\n", start);
-		const end = newline === -1 ? text.length : newline;
-		const line = text.slice(start, end);
-		if (line.trim().length > 0) {
+	while (start <= normalized.length) {
+		const newline = normalized.indexOf("\n", start);
+		const end = newline === -1 ? normalized.length : newline;
+		const line = normalized.slice(start, end);
+		if (preserveBlankLines || line.trim().length > 0) {
 			total++;
 			if (!keepTail) {
 				lines.push(line);
@@ -6570,9 +6589,11 @@ function runningPreviewBlock(
 		lines = options.lines;
 		totalLineCount = options.totalLineCount ?? lines.length;
 	} else {
-		// Single-pass collect; when collapsed only keep the preview window.
-		const raw = getTextContent(result).replace(/\r\n/g, "\n").trimEnd();
-		const collected = collectNonEmptyLines(raw, expanded ? undefined : limit);
+		// Single-pass collect; collapsed previews stay compact, while expanded raw
+		// output keeps every output-owned line, including leading and trailing blanks.
+		const normalized = getTextContent(result).replace(/\r\n/g, "\n");
+		const raw = expanded ? normalized : normalized.trimEnd();
+		const collected = collectOutputLines(raw, expanded ? undefined : limit, expanded);
 		lines = collected.lines;
 		totalLineCount = collected.total;
 	}
@@ -8055,7 +8076,7 @@ export default function (pi: ExtensionAPI) {
 			const rewrite = ensureRtkRewriteForContext(ctx, ctx.args);
 			const output = result.content[0]?.type === "text" ? result.content[0].text : "";
 			if (isPartial) {
-				const preview = collectNonEmptyLines(output, expanded ? undefined : liveToolPreviewLimit());
+				const preview = collectOutputLines(output, expanded ? undefined : liveToolPreviewLimit(), expanded);
 				const running = runningPreviewBlock(result, "", expanded, theme, ctx, {
 					lines: preview.lines,
 					totalLineCount: preview.total,
@@ -8067,31 +8088,32 @@ export default function (pi: ExtensionAPI) {
 					: running;
 				return makeText(ctx.lastComponent, withRewrite);
 			}
-			// Collapsed: only keep the live-preview tail (or nothing). Expanded: full list.
+			// Collapsed previews stay compact. Expanded raw output preserves every
+			// output-owned line and its indentation.
 			const keepTail = !expanded && liveToolPreviewEnabled() ? liveToolPreviewLimit() : undefined;
-			const nonEmpty = collectNonEmptyLines(output, expanded ? undefined : (keepTail ?? 0));
+			const collected = collectOutputLines(output, expanded ? undefined : (keepTail ?? 0), expanded);
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
-			if (nonEmpty.total > 0 && ctx.state?._bashPreviewReleased !== true) {
+			if (collected.total > 0 && ctx.state?._bashPreviewReleased !== true) {
 				preserveBashPreview(ctx);
 				if (ctx.state) ctx.state._bashPreviewReleased = true;
 			}
 			const exitMatch = output.match(/exit code: (\d+)/);
 			const exitCode = exitMatch ? Number.parseInt(exitMatch[1], 10) : null;
 			let text = markResultSummary(exitCode === null || exitCode === 0 ? theme.fg("success", "Done") : theme.fg("error", `Exit ${exitCode}`));
-			text += theme.fg("muted", ` (${nonEmpty.total} lines)`);
+			text += theme.fg("muted", ` (${collected.total} lines)`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " [truncated]");
 			const persistentPreview = !progressiveLocalControlsEnabled() && shouldPreserveBashPreview(ctx)
-				? buildPersistentBashPreview(nonEmpty.lines, theme)
+				? buildPersistentBashPreview(collected.lines, theme)
 				: "";
 			if (!expanded && persistentPreview) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}\n${persistentPreview}`, theme));
-			if (!expanded && nonEmpty.total > 0) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
+			if (!expanded && collected.total > 0) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(text, theme));
 			const collapsed = bashCollapsedLimit();
 			if (rewrite) text += `\n${formatRtkRewriteDetails(rewrite, theme)}`;
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-		const indicator = progressivePreviewIndicator(expanded, ctx.state, nonEmpty.total, collapsed);
-		text += `\n${buildPreviewText(nonEmpty.lines, localDetailLevel > 0, theme, collapsed, nonEmpty.total, (line) => theme.fg("dim", line), indicator)}`;
+		const indicator = progressivePreviewIndicator(expanded, ctx.state, collected.total, collapsed);
+		text += `\n${buildPreviewText(collected.lines, localDetailLevel > 0, theme, collapsed, collected.total, (line) => theme.fg("dim", line), indicator)}`;
 			return makeText(ctx.lastComponent, withProgressivePreviewBranch(text, theme, indicator.finalCollapse === true));
 		},
 	});
