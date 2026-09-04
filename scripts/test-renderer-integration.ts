@@ -253,6 +253,20 @@ await withRendererHarness(
     if (!readExpanded.includes("result line 8") || readExpanded.includes("result line 9")) {
       throw new Error(`standalone first expansion did not stop at the normal 8-line preview: ${JSON.stringify(readExpanded)}`);
     }
+    const standalonePayloadColumns = Object.fromEntries(
+      [1, 3, 5, 6].map((lineNumber) => {
+        const token = `result line ${lineNumber}`;
+        return [lineNumber, readRows.find((line: string) => line.includes(token))?.indexOf(token) ?? -1];
+      }),
+    );
+    if (
+      standalonePayloadColumns[1] < 0
+      || standalonePayloadColumns[3] !== standalonePayloadColumns[1] + 4
+      || standalonePayloadColumns[5] !== standalonePayloadColumns[1] + 4
+      || standalonePayloadColumns[6] !== standalonePayloadColumns[1] + 6
+    ) {
+      throw new Error(`standalone Read did not preserve four-column tab stops: ${JSON.stringify(standalonePayloadColumns)}`);
+    }
     const standaloneActionX = (row: number, action: string): number => (
       Array.from({ length: 120 }, (_, x) => x).find((x) => readExecution.clickActionAtPoint(x, row) === action) ?? -1
     );
@@ -1024,6 +1038,35 @@ await withRendererHarness(
       const expandedShortWriteRows = shortWriteExecution.render(120).map((line: string) => plain(line));
       if (expandedShortWriteRows.some((line: string) => line.includes("click to collapse"))) {
         throw new Error(`fully visible short Write added a no-op collapse anchor: ${JSON.stringify(expandedShortWriteRows)}`);
+      }
+    }
+
+    {
+      const tabbedWriteExecution = new ToolExecutionComponent(
+        "write",
+        "write_tab_indentation_fixture",
+        { path: "tabbed-write.ts", content: "    WRITE_SPACE_INDENT\n\tWRITE_TAB_INDENT" },
+        {},
+        write,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      tabbedWriteExecution.markExecutionStarted();
+      tabbedWriteExecution.setArgsComplete();
+      tabbedWriteExecution.updateResult({
+        content: [{ type: "text", text: "Wrote tabbed-write.ts" }],
+        details: { _type: "new", filePath: "tabbed-write.ts", lines: 2 },
+        isError: false,
+      }, false);
+      await waitFor(
+        () => tabbedWriteExecution.render(120).some((line: string) => plain(line).includes("WRITE_TAB_INDENT")),
+        "tab-indented new-file Write preview",
+      );
+      const tabbedWriteRows = tabbedWriteExecution.render(120).map((line: string) => plain(line));
+      const spaceIndentColumn = tabbedWriteRows.find((line: string) => line.includes("WRITE_SPACE_INDENT"))?.indexOf("WRITE_SPACE_INDENT") ?? -1;
+      const tabIndentColumn = tabbedWriteRows.find((line: string) => line.includes("WRITE_TAB_INDENT"))?.indexOf("WRITE_TAB_INDENT") ?? -1;
+      if (spaceIndentColumn < 0 || tabIndentColumn !== spaceIndentColumn) {
+        throw new Error(`new-file Write did not preserve tab indentation: ${JSON.stringify({ spaceIndentColumn, tabIndentColumn, tabbedWriteRows })}`);
       }
     }
 
