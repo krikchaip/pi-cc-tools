@@ -4,6 +4,8 @@ import { spawnSync } from "node:child_process";
 
 const expectFiles = [
   "e2e/expect/fullscreen-click-expansion.expect",
+  "e2e/expect/builtin-transcript-click.expect",
+  "e2e/expect/builtin-collapse-viewport.expect",
   "e2e/expect/click-layering-regression.expect",
   "e2e/expect/collapse-row-review.expect",
   "e2e/expect/result-summary-anchor.expect",

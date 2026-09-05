@@ -1,0 +1,208 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for adaptive collapse positioning on transcript built-ins.
+
+set timeout 1
+match_max -d 1000000
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [expr {[info exists env(EXTENSION_PATH)] ? $env(EXTENSION_PATH) : [file join $repo_dir "extensions" "index.ts"]}]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set assert_path [file join $expect_dir "builtin-collapse-viewport-assert.py"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set scratch "/tmp/pi-cc-tools-builtin-collapse-viewport-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_repaint {} {
+  for {set read 0} {$read < 8} {incr read} {
+    after 50
+    expect -timeout 0 {
+      -re {.+} {}
+      timeout {}
+      eof { return }
+    }
+  }
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not widen Pi PTY: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id} error]} {
+    puts stderr "could not restore Pi PTY: $error"
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  return 1
+}
+
+proc capture {path columns rows} {
+  log_file
+  log_file -noappend $path
+  if {![force_fullscreen_repaint $columns $rows]} { return 0 }
+  log_file
+  return 1
+}
+
+proc locate {locator_path path pattern} {
+  if {[catch {exec python3 $locator_path locate $path $pattern} result]} { return {} }
+  return $result
+}
+
+proc find_visible_up {path pattern max_pages columns rows locator_path} {
+  for {set attempt 0} {$attempt <= $max_pages} {incr attempt} {
+    if {![capture $path $columns $rows]} { return {} }
+    set point [locate $locator_path $path $pattern]
+    if {[llength $point] == 2} { return $point }
+    send -- "\033\[5~"
+    drain_repaint
+  }
+  return {}
+}
+
+proc find_visible_after_down {path pattern max_wheels columns rows locator_path} {
+  for {set attempt 0} {$attempt <= $max_wheels} {incr attempt} {
+    if {![capture $path $columns $rows]} { return {} }
+    set point [locate $locator_path $path $pattern]
+    if {[llength $point] == 2} { return $point }
+    send -- "\033\[<65;50;20M"
+    drain_repaint
+  }
+  return {}
+}
+
+proc click {x y} {
+  send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+proc spawn_case {name fixture extension_path pi_bin cwd home agent columns rows scratch} {
+  global spawn_id
+  set session_path [file join $scratch "$name-session.jsonl"]
+  set input [open $fixture "r"]
+  set content [read $input]
+  close $input
+  set output [open $session_path "w"]
+  puts -nonewline $output [string map [list "/tmp/pi-cc-tools-builtin-viewport" $cwd] $content]
+  close $output
+
+  cd $cwd
+  log_file -noappend [file join $scratch "$name-startup.ansi"]
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+    $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+    -e $extension_path --tui-mode fullscreen
+  stty columns $columns rows $rows
+}
+
+proc stop_case {} {
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+}
+
+proc run_case {name fixture collapsed_marker detail_prefix extension_path pi_bin cwd home agent columns rows scratch locator_path} {
+  spawn_case $name $fixture $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+  if {![wait_for 10 {BUILTIN_VIEWPORT_AFTER_45}]} { fail "$name fixture did not become ready" $scratch }
+
+  set collapsed_path [file join $scratch "$name-collapsed.ansi"]
+  set collapsed_point [find_visible_up $collapsed_path $collapsed_marker 6 $columns $rows $locator_path]
+  if {[llength $collapsed_point] != 2} { fail "$name collapsed component was not found" $scratch }
+  lassign $collapsed_point _collapsed_x collapsed_y
+  click 50 $collapsed_y
+  if {![wait_for 3 "${detail_prefix}_01"]} { fail "$name did not expand" $scratch }
+
+  # Case 2: move inside a component that fills the complete transcript viewport.
+  send -- "\033\[6~"
+  drain_repaint
+  set whole_before [file join $scratch "$name-whole-before.ansi"]
+  if {![capture $whole_before $columns $rows]} { fail "$name whole-viewport capture failed" $scratch }
+  click 50 20
+  drain_repaint
+  if {![capture [file join $scratch "$name-whole-after.ansi"] $columns $rows]} {
+    fail "$name whole-viewport collapse capture failed" $scratch
+  }
+
+  # Reopen, then place the expanded bottom edge and following transcript together.
+  set recollapsed [file join $scratch "$name-recollapsed.ansi"]
+  set recollapsed_point [find_visible_up $recollapsed $collapsed_marker 6 $columns $rows $locator_path]
+  if {[llength $recollapsed_point] != 2} { fail "$name collapsed component could not be reopened" $scratch }
+  lassign $recollapsed_point _recollapsed_x recollapsed_y
+  click 50 $recollapsed_y
+  if {![wait_for 3 "${detail_prefix}_01"]} { fail "$name did not reopen" $scratch }
+  send -- "\033\[6~"
+  drain_repaint
+  send -- "\033\[6~"
+  drain_repaint
+
+  set bottom_before [file join $scratch "$name-bottom-before.ansi"]
+  set after_point [find_visible_after_down $bottom_before "BUILTIN_VIEWPORT_AFTER_03" 30 $columns $rows $locator_path]
+  if {[llength $after_point] != 2} { fail "$name bottom edge was not positioned" $scratch }
+  lassign $after_point _after_x after_y
+  click 50 [expr {$after_y - 5}]
+  drain_repaint
+  if {![capture [file join $scratch "$name-bottom-after.ansi"] $columns $rows]} {
+    fail "$name bottom-edge collapse capture failed" $scratch
+  }
+  stop_case
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+set fixture_dir [file join $repo_dir "e2e" "fixtures"]
+run_case "compaction" [file join $fixture_dir "builtin-compaction-viewport-session.jsonl"] \
+  "Compacted from 1,234 tokens" "COMPACTION_VIEWPORT_DETAIL" \
+  $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch $locator_path
+run_case "branch" [file join $fixture_dir "builtin-branch-viewport-session.jsonl"] \
+  "Branch summary" "BRANCH_VIEWPORT_DETAIL" \
+  $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch $locator_path
+run_case "shell" [file join $fixture_dir "builtin-shell-viewport-session.jsonl"] \
+  "printf builtin-shell-viewport" "SHELL_VIEWPORT_DETAIL" \
+  $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch $locator_path
+
+set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status
