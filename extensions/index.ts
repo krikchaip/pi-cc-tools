@@ -5777,7 +5777,7 @@ async function renderUnified(
 	const nw = Math.max(2, String(maxLineNumber(vis)).length);
 	const gw = nw + 5;
 	const cw = Math.max(20, tw - gw);
-	const canHL = diff.chars <= MAX_HL_CHARS && vis.length <= MAX_RENDER_LINES;
+	const canHL = diff.chars <= MAX_HL_CHARS;
 
 	const oldSrc: string[] = [];
 	const newSrc: string[] = [];
@@ -5858,7 +5858,7 @@ async function renderUnified(
 	}
 
 	out.push(diffRule(tw));
-	if (diff.lines.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(diff.lines.length - vis.length, 0, state)}${D_RST}`);
+	if (diff.lines.length > vis.length) out.push(`${BG_BASE}${FG_DIM}${collapsedDiffHint(diff.lines.length - vis.length, 0, state)}${D_RST}`);
 	return out.join("\n");
 }
 
@@ -5897,7 +5897,7 @@ async function renderSplit(
 	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
 	const gw = nw + 5;
 	const cw = Math.max(12, half - gw);
-	const canHL = diff.chars <= MAX_HL_CHARS && vis.length * 2 <= MAX_RENDER_LINES * 2;
+	const canHL = diff.chars <= MAX_HL_CHARS;
 
 	const leftSrc: string[] = [];
 	const rightSrc: string[] = [];
@@ -5996,7 +5996,7 @@ async function renderSplit(
 	}
 
 	out.push(`${diffRule(half)}${FG_RULE}┊${D_RST}${diffRule(half)}`);
-	if (rows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}  ${collapsedDiffHint(rows.length - vis.length, 0, state)}${D_RST}`);
+	if (rows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}${collapsedDiffHint(rows.length - vis.length, 0, state)}${D_RST}`);
 	return out.join("\n");
 }
 

@@ -196,6 +196,12 @@ def main_assert(scratch: Path) -> None:
     frozen("bottom collapse", bottom_before, bottom_after, r"BETWEEN_TOOLS_[0-9]+|async-edit\.ts", minimum=2)
     if any("click to collapse" in row for row in bottom_after):
         failures.append("bottom collapse settled with the expansion footer still visible")
+    bottom_anchor_rows = [row for row in bottom_after if "more diff lines" in row]
+    if not any(re.match(r"└ …", row) for row in bottom_anchor_rows):
+        failures.append(
+            "bottom diff anchor did not use exactly one space after its branch indicator: "
+            f"{bottom_anchor_rows}"
+        )
 
     top_transitions = (
         "header-expand-transition.ansi",
