@@ -767,7 +767,12 @@ await withRendererHarness(
     writeExecution.setArgsComplete();
     writeExecution.updateResult({
       content: [{ type: "text", text: "Wrote fixture.ts" }],
-      details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 4000, lines: expandedDiffLines } },
+      details: {
+        _type: "diff",
+        summary: "+1 -1",
+        diff: { added: 1, removed: 1, chars: 4000, lines: expandedDiffLines },
+        language: "typescript",
+      },
       isError: false,
     }, false);
     writeExecution.setExpanded(true);
@@ -793,13 +798,21 @@ await withRendererHarness(
     }
     await waitFor(
       () => typeof writeExecution.rendererState._wdk === "string"
-        && writeExecution.rendererState._wdk.endsWith(":200"),
+        && writeExecution.rendererState._wdk.endsWith(":200")
+        && writeExecution.rendererState._ptAsyncRenderPending === false,
       `standard-detail Write diff at its configured 200-line render cap (key: ${writeExecution.rendererState._wdk})`,
     );
+    if (!/\x1b\[38;2;\d+;\d+;\d+mconst/.test(writeExecution.rendererState._wdt)) {
+      throw new Error("standard-detail Write diff lost syntax highlighting above 150 rendered lines");
+    }
     const standardWriteRows = writeExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
     const writeExtraDetailRow = standardWriteRows.findIndex((line: string, index: number) => (
       line.includes("more diff lines") && writeDetailActionX(index) >= 0
     ));
+    const writeExtraDetailText = standardWriteRows[writeExtraDetailRow] ?? "";
+    if (!/^\s*└ …/.test(writeExtraDetailText)) {
+      throw new Error(`standard-detail Write diff did not use one space after its branch indicator: ${JSON.stringify(writeExtraDetailText)}`);
+    }
 
     const effectiveFinalWrite = new ToolExecutionComponent(
       "write",
@@ -831,6 +844,7 @@ await withRendererHarness(
     await waitFor(
       () => typeof effectiveFinalWrite.rendererState._wdk === "string"
         && effectiveFinalWrite.rendererState._wdk.endsWith(":200")
+        && effectiveFinalWrite.rendererState._ptAsyncRenderPending === false
         && typeof effectiveFinalWrite.rendererState._wdt === "string"
         && !effectiveFinalWrite.rendererState._wdt.includes("rendering diff"),
       "effective-final Write level-1 collapse row",
