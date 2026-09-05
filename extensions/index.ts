@@ -11,6 +11,9 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 import {
 	AssistantMessageComponent,
+	BashExecutionComponent,
+	BranchSummaryMessageComponent,
+	CompactionSummaryMessageComponent,
 	CustomMessageComponent,
 	InteractiveMode,
 	ToolExecutionComponent,
@@ -70,6 +73,8 @@ const USER_MESSAGE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-user-m
 const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifications-v2");
 const TOOL_GROUP_MOUSE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-mouse-patch");
 const TOOL_GROUP_MODE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-mode-patch");
+const BUILTIN_EXPANSION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:builtin-expansion-patch");
+const BUILTIN_EXPANSION_STATE = Symbol.for("pi-claude-style-tools:builtin-expansion-state");
 const TOOL_CLICK_ANCHORS = Symbol.for("pi-claude-style-tools:tool-click-anchors");
 const TOOL_CLICK_OWNER = Symbol.for("pi-claude-style-tools:tool-click-owner");
 const TOOL_CLICK_GLOBAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-global-expanded");
@@ -1251,11 +1256,13 @@ type ToolGroupMouseTarget = {
 	action: ToolClickAction;
 	viewportAnchor: ToolViewportAnchor;
 	activate(): boolean;
+	captureRollback(): () => void;
 };
 
 type ToolGroupScrollView = {
 	readonly scrollTop: number;
 	readonly isFollowingEnd: boolean;
+	readonly viewportHeight?: number;
 	scrollTo(scrollTop: number, options?: { disableFollow?: boolean }): void;
 };
 
@@ -1363,12 +1370,16 @@ function findToolGroupLayoutBox(
 	return undefined;
 }
 
+type ToolCollapseViewportAnchor = ToolViewportAnchor | "component-top";
+type RequestedToolCollapseViewportAnchor = ToolCollapseViewportAnchor | "adaptive";
+
 type ToolCollapseViewportSnapshot = {
 	renderer: ToolGroupFullscreenRenderer;
 	mode: ToolGroupInteractiveMode;
 	scrollView: ToolGroupScrollView;
 	anchorComponent: { render(width: number): string[] };
-	viewportAnchor: ToolViewportAnchor;
+	viewportAnchor: ToolCollapseViewportAnchor;
+	componentTop?: number;
 	scrollTop: number;
 	contentHeight: number;
 	contentWidth: number;
@@ -1395,9 +1406,47 @@ function isToolGroupScrollView(value: unknown): value is ToolGroupScrollView {
 		&& typeof candidate?.scrollTo === "function";
 }
 
+function chatComponentTop(
+	mode: ToolGroupInteractiveMode,
+	component: unknown,
+	width: number,
+): number | undefined {
+	let top = mode.headerContainer.render(width).length
+		+ mode.loadedResourcesContainer.render(width).length;
+	for (const child of mode.chatContainer.children) {
+		if (child === component) return top;
+		const rows = child?.render?.(width);
+		if (!Array.isArray(rows)) return undefined;
+		top += rows.length;
+	}
+	return undefined;
+}
+
+function resolveToolCollapseViewportAnchor(
+	requested: RequestedToolCollapseViewportAnchor,
+	componentTop: number | undefined,
+	componentHeight: number,
+	scrollView: ToolGroupScrollView,
+): ToolCollapseViewportAnchor {
+	if (requested !== "adaptive") return requested;
+	const viewportHeight = scrollView.viewportHeight;
+	if (
+		componentTop === undefined
+		|| !Number.isFinite(viewportHeight)
+		|| viewportHeight! <= 0
+	) return "top";
+
+	const viewportTop = scrollView.scrollTop;
+	const viewportBottom = viewportTop + viewportHeight!;
+	const componentBottom = componentTop + componentHeight;
+	if (componentTop > viewportTop) return "top";
+	if (componentBottom <= viewportBottom) return "bottom";
+	return "component-top";
+}
+
 function captureToolCollapseViewport(
 	tool: any,
-	viewportAnchor: ToolViewportAnchor,
+	requestedViewportAnchor: RequestedToolCollapseViewportAnchor,
 ): ToolCollapseViewportSnapshot | undefined {
 	const mode = clickRuntime.activeInteractiveMode;
 	const renderer = mode?.renderer;
@@ -1416,13 +1465,22 @@ function captureToolCollapseViewport(
 			|| typeof anchorComponent?.render !== "function"
 		) return undefined;
 		const content = mode.documentContainer.render(contentWidth!);
-		if (!Array.isArray(content)) return undefined;
+		const componentRows = anchorComponent.render(contentWidth!);
+		if (!Array.isArray(content) || !Array.isArray(componentRows)) return undefined;
+		const componentTop = chatComponentTop(mode, anchorComponent, contentWidth!);
+		const viewportAnchor = resolveToolCollapseViewportAnchor(
+			requestedViewportAnchor,
+			componentTop,
+			componentRows.length,
+			scrollView,
+		);
 		return {
 			renderer,
 			mode,
 			scrollView,
 			anchorComponent,
 			viewportAnchor,
+			componentTop,
 			scrollTop: scrollView.scrollTop,
 			contentHeight: content.length,
 			contentWidth: contentWidth!,
@@ -1437,6 +1495,7 @@ function captureToolCollapseViewport(
 
 function collapseViewportTarget(snapshot: ToolCollapseViewportSnapshot): number | undefined {
 	if (snapshot.viewportAnchor === "top") return snapshot.scrollTop;
+	if (snapshot.viewportAnchor === "component-top") return snapshot.componentTop;
 	const nextContent = snapshot.mode.documentContainer.render(snapshot.contentWidth);
 	if (!Array.isArray(nextContent)) return undefined;
 	// Pi also clamps scrollTo(), but make the top-boundary fallback explicit:
@@ -1619,6 +1678,167 @@ function restoreToolCollapseViewport(snapshot: ToolCollapseViewportSnapshot): vo
 	}
 }
 
+type BuiltinExpansionState = {
+	width?: number;
+	height?: number;
+	rows?: string[];
+	version: number;
+	probeWidth?: number;
+	probeVersion?: number;
+	probeResult?: boolean;
+};
+
+type BuiltinExpandableComponent = {
+	expanded: boolean;
+	setExpanded(expanded: boolean): void;
+	render(width: number): string[];
+	[BUILTIN_EXPANSION_STATE]?: BuiltinExpansionState;
+};
+
+function builtinExpansionState(component: BuiltinExpandableComponent): BuiltinExpansionState {
+	return (component[BUILTIN_EXPANSION_STATE] ??= { version: 0 });
+}
+
+function isBuiltinExpandableComponent(value: unknown): value is BuiltinExpandableComponent {
+	return value instanceof BashExecutionComponent
+		|| value instanceof CompactionSummaryMessageComponent
+		|| value instanceof BranchSummaryMessageComponent;
+}
+
+function builtinClickExpansionActive(): boolean {
+	return clickExpansionEnabled() && clickRuntime.activeInteractiveMode?.toolOutputExpanded !== true;
+}
+
+function builtinExpansionChangesOutput(component: BuiltinExpandableComponent, width: number): boolean {
+	const state = builtinExpansionState(component);
+	if (
+		state.probeWidth === width
+		&& state.probeVersion === state.version
+		&& state.probeResult !== undefined
+	) return state.probeResult;
+
+	const expanded = component.expanded === true;
+	const currentRows = state.width === width && state.rows ? state.rows : component.render(width);
+	let oppositeRows: string[] = [];
+	try {
+		component.setExpanded(!expanded);
+		oppositeRows = component.render(width);
+	} finally {
+		component.setExpanded(expanded);
+		state.width = width;
+		state.height = currentRows.length;
+		state.rows = currentRows;
+	}
+	const changed = currentRows.length !== oppositeRows.length
+		|| currentRows.some((line, index) => line !== oppositeRows[index]);
+	state.probeWidth = width;
+	state.probeVersion = state.version;
+	state.probeResult = changed;
+	return changed;
+}
+
+function builtinClickActionAtPoint(
+	component: BuiltinExpandableComponent,
+	x: number,
+	y: number,
+): ToolClickAction | undefined {
+	if (!builtinClickExpansionActive()) return undefined;
+	const state = builtinExpansionState(component);
+	if (
+		state.width === undefined
+		|| state.height === undefined
+		|| x < 0
+		|| x >= state.width
+		|| y < 0
+		|| y >= state.height
+	) return undefined;
+	return builtinExpansionChangesOutput(component, state.width) ? "expand" : undefined;
+}
+
+function builtinCollapseViewportAnchor(
+	component: BuiltinExpandableComponent,
+): RequestedToolCollapseViewportAnchor {
+	return component.expanded === true ? "adaptive" : "top";
+}
+
+function activateBuiltinClickAction(component: BuiltinExpandableComponent): boolean {
+	if (!builtinClickExpansionActive()) return false;
+	const state = builtinExpansionState(component);
+	if (state.width === undefined || !builtinExpansionChangesOutput(component, state.width)) return false;
+	const viewport = captureToolCollapseViewport(component, builtinCollapseViewportAnchor(component));
+	component.setExpanded(component.expanded !== true);
+	if (viewport) stabilizeToolCollapseViewport(viewport);
+	return true;
+}
+
+function captureBuiltinClickRollback(component: BuiltinExpandableComponent): () => void {
+	const expanded = component.expanded === true;
+	const viewport = captureToolCollapseViewport(component, builtinCollapseViewportAnchor(component));
+	return () => {
+		component.setExpanded(expanded);
+		clickRuntime.activeInteractiveMode?.renderer.requestRender();
+		if (viewport) restoreToolCollapseViewport(viewport);
+	};
+}
+
+function patchBuiltinTranscriptExpansion(): void {
+	for (const ComponentClass of [
+		BashExecutionComponent,
+		CompactionSummaryMessageComponent,
+		BranchSummaryMessageComponent,
+	]) {
+		const proto = ComponentClass.prototype as any;
+		if (proto[BUILTIN_EXPANSION_PATCH_FLAG]) continue;
+		const originalRender = proto.render;
+		proto.render = function patchedBuiltinExpandableRender(width: number): string[] {
+			const rows = originalRender.call(this, width);
+			const state = builtinExpansionState(this);
+			state.width = width;
+			state.height = rows.length;
+			state.rows = rows;
+			return rows;
+		};
+		proto.clickActionAtPoint = function clickBuiltinActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+			return builtinClickActionAtPoint(this, x, y);
+		};
+		proto.activateClickAction = function activateBuiltinAction(action: ToolClickAction): boolean {
+			return action === "expand" && activateBuiltinClickAction(this);
+		};
+		proto.handleMouse = function handleBuiltinExpandableMouse(event: any): any {
+			if (
+				!hasNativeMouseDispatch()
+				|| event?.type !== "click"
+				|| event?.button !== "left"
+				|| event?.dragged === true
+				|| Boolean(event?.url)
+				|| this.clickActionAtPoint(event.x, event.y) !== "expand"
+			) return undefined;
+			const rollback = captureBuiltinClickRollback(this);
+			return scheduleNativeSingleClick(
+				this,
+				Number(event.clickCount ?? 1),
+				() => this.activateClickAction("expand"),
+				rollback,
+			);
+		};
+		proto[BUILTIN_EXPANSION_PATCH_FLAG] = true;
+	}
+
+	const bashProto = BashExecutionComponent.prototype as any;
+	for (const method of ["appendOutput", "setComplete"]) {
+		const original = bashProto[method];
+		const patchFlag = Symbol.for(`pi-claude-style-tools:builtin-expansion-${method}-patch`);
+		if (typeof original !== "function" || bashProto[patchFlag]) continue;
+		bashProto[method] = function patchedBuiltinExpansionMutation(...args: any[]) {
+			const state = builtinExpansionState(this);
+			state.version++;
+			delete state.probeResult;
+			return original.apply(this, args);
+		};
+		bashProto[patchFlag] = true;
+	}
+}
+
 function toolGroupAtScreenPoint(
 	renderer: ToolGroupFullscreenRenderer,
 	mode: ToolGroupInteractiveMode,
@@ -1646,6 +1866,10 @@ function toolGroupAtScreenPoint(
 					action: anchor.action,
 					viewportAnchor: anchor.viewportAnchor,
 					activate: () => component.toggleToolAtPoint(localX, localY),
+					captureRollback: () => {
+						const snapshot = captureToolClickState(anchor.tool, anchor.action, anchor.viewportAnchor);
+						return () => restoreToolClickState(anchor.tool, snapshot);
+					},
 				};
 			}
 		} else if (component instanceof ToolExecutionComponent) {
@@ -1656,8 +1880,23 @@ function toolGroupAtScreenPoint(
 					action: anchor.action,
 					viewportAnchor: anchor.viewportAnchor,
 					activate: () => (component as any).activateClickAction?.(anchor.action, anchor.viewportAnchor) === true,
+					captureRollback: () => {
+						const snapshot = captureToolClickState(component, anchor.action, anchor.viewportAnchor);
+						return () => restoreToolClickState(component, snapshot);
+					},
 				};
 			}
+		} else if (
+			isBuiltinExpandableComponent(component)
+			&& builtinClickActionAtPoint(component, localX, localY) === "expand"
+		) {
+			return {
+				component,
+				action: "expand",
+				viewportAnchor: "top",
+				activate: () => activateBuiltinClickAction(component),
+				captureRollback: () => captureBuiltinClickRollback(component),
+			};
 		}
 		row += height;
 	}
@@ -1764,7 +2003,7 @@ function installToolGroupMouseAdapter(): void {
 					&& press.target?.viewportAnchor === target?.viewportAnchor
 					&& target
 				) {
-					const snapshot = captureToolClickState(target.component, target.action, target.viewportAnchor);
+					const rollback = target.captureRollback();
 					clearToolGroupMouseSelection(this);
 					if (target.activate()) {
 						this.requestRender();
@@ -1776,7 +2015,7 @@ function installToolGroupMouseAdapter(): void {
 							y: event.y,
 							wordStartX: press.wordStartX,
 							wordEndX: press.wordEndX,
-							rollback: () => restoreToolClickState(target.component, snapshot),
+							rollback,
 						};
 						pending.timer = setTimeout(() => {
 							if (state!.pendingClick !== pending) return;
@@ -1855,6 +2094,13 @@ function resetLocalClickStates(mode: ToolGroupInteractiveMode | undefined, colla
 		const parent = tool[COMPONENT_PARENT];
 		if (isToolGroupComponent(parent)) groups.add(parent);
 	});
+	if (collapseLocal && mode?.toolOutputExpanded !== true) {
+		for (const component of mode?.chatContainer.children ?? []) {
+			if (isBuiltinExpandableComponent(component) && component.expanded === true) {
+				component.setExpanded(false);
+			}
+		}
+	}
 	for (const group of groups) group.invalidate();
 	clickRuntime.visualEpoch++;
 }
@@ -7600,6 +7846,7 @@ export default function (pi: ExtensionAPI) {
 	patchContainerParentTracking();
 	installToolGroupMouseAdapter();
 	patchGlobalToolBorders();
+	patchBuiltinTranscriptExpansion();
 	patchCustomMessageRender();
 	patchUserMessageRender();
 	patchAssistantMessages();

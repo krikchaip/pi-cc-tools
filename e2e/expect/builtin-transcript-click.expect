@@ -1,0 +1,127 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for whole-component click expansion on Pi built-ins.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [expr {[info exists env(EXTENSION_PATH)] ? $env(EXTENSION_PATH) : [file join $repo_dir "extensions" "index.ts"]}]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-builtin-click-e2e-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 72
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc spawn_case {name fixture extension_path pi_bin cwd home agent columns rows scratch} {
+  global spawn_id
+  set session_path [file join $scratch "$name-session.jsonl"]
+  set input [open $fixture "r"]
+  set content [read $input]
+  close $input
+  set output [open $session_path "w"]
+  puts -nonewline $output [string map [list "/tmp/pi-cc-tools-builtin-click-e2e" $cwd] $content]
+  close $output
+
+  cd $cwd
+  log_file -noappend [file join $scratch "$name-collapsed.ansi"]
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+    $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+    -e $extension_path --tui-mode fullscreen
+  stty columns $columns rows $rows
+}
+
+proc stop_case {} {
+  send "\003\003"
+  catch {close}
+  wait
+  log_file
+}
+
+proc run_summary_case {name fixture collapsed_marker expanded_marker collapsed_y expanded_y extension_path pi_bin cwd home agent columns rows scratch} {
+  spawn_case $name $fixture $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+  if {![wait_for 10 $collapsed_marker]} {
+    puts stderr "$name did not render its collapsed state"
+    stop_case
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+
+  # Use the far-right padded cell to prove the full component width is anchored.
+  send -- "\033\[<0;71;${collapsed_y}M\033\[<0;71;${collapsed_y}m"
+  if {![wait_for 5 $expanded_marker]} {
+    puts stderr "$name did not expand from its whole-component target"
+    stop_case
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+
+  log_file
+  log_file -noappend [file join $scratch "$name-recollapsed.ansi"]
+  send -- "\033\[<0;71;${expanded_y}M\033\[<0;71;${expanded_y}m"
+  if {![wait_for 5 $collapsed_marker]} {
+    puts stderr "$name did not collapse from its expanded whole-component target"
+    stop_case
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+  if {[wait_for 1 $expanded_marker]} {
+    puts stderr "$name expanded detail remained after collapse"
+    stop_case
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+  stop_case
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+set fixture_dir [file join $repo_dir "e2e" "fixtures"]
+run_summary_case \
+  "compaction" \
+  [file join $fixture_dir "builtin-compaction-click-session.jsonl"] \
+  {Compacted from 1,234 tokens} \
+  {COMPACTION_EXPANDED_DETAIL} \
+  6 7 \
+  $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+run_summary_case \
+  "branch" \
+  [file join $fixture_dir "builtin-branch-click-session.jsonl"] \
+  {Branch summary} \
+  {BRANCH_EXPANDED_DETAIL} \
+  6 7 \
+  $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+run_summary_case \
+  "shell" \
+  [file join $fixture_dir "builtin-shell-click-session.jsonl"] \
+  {\.\.\. 4 more lines} \
+  {SHELL_EXPANDED_DETAIL_01} \
+  2 30 \
+  $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+
+puts "PASS builtin transcript whole-component clicks"
+puts "ARTIFACTS $scratch"

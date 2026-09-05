@@ -107,7 +107,7 @@ set y [lindex $summary_point 1]
 set transition_path [file join $scratch "tail-transition.ansi"]
 log_file -noappend $transition_path
 send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
-if {![wait_for 3 {click.*for more detail}]} {
+if {![wait_for 3 {TAIL_PAYLOAD_03}]} {
   puts stderr "transcript-tail result summary did not expand"
   stop_pi
   puts "ARTIFACTS $scratch"

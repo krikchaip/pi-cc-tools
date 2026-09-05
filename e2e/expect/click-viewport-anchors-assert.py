@@ -156,7 +156,7 @@ if len(sys.argv) > 2 and sys.argv[2] == "transient-tail":
     expected = expected_rows.get(token)
     observed = [token_rows(candidate, re.escape(token)).get(token) for candidate in transition_frames]
     observed = [row for row in observed if row is not None]
-    expanded = any("click for more detail" in "\n".join(candidate) for candidate in transition_frames)
+    expanded = any("TAIL_PAYLOAD_03" in "\n".join(candidate) for candidate in transition_frames)
     if not observed or not expanded:
         raise SystemExit(
             "TRANSCRIPT_TAIL_CLICK_FLICKER_FAIL: expansion transition was not captured; "

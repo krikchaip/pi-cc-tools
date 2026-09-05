@@ -14,6 +14,80 @@ await withRendererHarness(
     stubTools: ["apply_patch", "web_search", "TaskList"],
   },
   async ({ fakePi, theme, ToolExecutionComponent, Container, emitLifecycle, writePiSettings }) => {
+    const {
+      BashExecutionComponent,
+      BranchSummaryMessageComponent,
+      CompactionSummaryMessageComponent,
+    } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/index.js");
+    const builtinWidth = 72;
+    const assertWholeComponentToggle = (component: any, expandedNeedle: string, label: string): void => {
+      const collapsedRows = component.render(builtinWidth).map((line: string) => plain(line));
+      for (const y of collapsedRows.keys()) {
+        if (
+          component.clickActionAtPoint?.(0, y) !== "expand"
+          || component.clickActionAtPoint?.(builtinWidth - 1, y) !== "expand"
+        ) {
+          throw new Error(`${label} collapsed component was not clickable across its full bounds at row ${y}`);
+        }
+      }
+      if (!component.activateClickAction?.("expand") || component.expanded !== true) {
+        throw new Error(`${label} did not expand from its whole-component action`);
+      }
+      const expandedRows = component.render(builtinWidth).map((line: string) => plain(line));
+      if (!expandedRows.some((line: string) => line.includes(expandedNeedle))) {
+        throw new Error(`${label} expanded content did not render: ${JSON.stringify(expandedRows)}`);
+      }
+      for (const y of expandedRows.keys()) {
+        if (
+          component.clickActionAtPoint?.(0, y) !== "expand"
+          || component.clickActionAtPoint?.(builtinWidth - 1, y) !== "expand"
+        ) {
+          throw new Error(`${label} expanded component was not clickable across its full bounds at row ${y}`);
+        }
+      }
+      if (!component.activateClickAction?.("expand") || component.expanded !== false) {
+        throw new Error(`${label} did not collapse from its whole-component action`);
+      }
+    };
+
+    assertWholeComponentToggle(
+      new CompactionSummaryMessageComponent({
+        role: "compactionSummary",
+        summary: "COMPACTION_EXPANDED_DETAIL",
+        tokensBefore: 1234,
+        timestamp: Date.now(),
+      }),
+      "COMPACTION_EXPANDED_DETAIL",
+      "compaction summary",
+    );
+    assertWholeComponentToggle(
+      new BranchSummaryMessageComponent({
+        role: "branchSummary",
+        summary: "BRANCH_EXPANDED_DETAIL",
+        fromId: "branch-source",
+        timestamp: Date.now(),
+      }),
+      "BRANCH_EXPANDED_DETAIL",
+      "branch summary",
+    );
+
+    const builtinUi = { requestRender() {} } as any;
+    const longShell = new BashExecutionComponent("printf long", builtinUi);
+    longShell.appendOutput(Array.from({ length: 24 }, (_, index) => `SHELL_DETAIL_${index + 1}`).join("\n"));
+    longShell.setComplete(0, false);
+    assertWholeComponentToggle(longShell, "SHELL_DETAIL_1", "! shell execution");
+
+    const shortShell = new BashExecutionComponent("printf short", builtinUi) as any;
+    shortShell.appendOutput("SHORT_SHELL_1\nSHORT_SHELL_2");
+    shortShell.setComplete(0, false);
+    const shortRows = shortShell.render(builtinWidth);
+    if (shortRows.some((_: string, y: number) => shortShell.clickActionAtPoint?.(1, y) !== undefined)) {
+      throw new Error("fully visible ! shell output exposed a no-op click target");
+    }
+    if (shortShell.activateClickAction?.("expand") === true || shortShell.expanded !== false) {
+      throw new Error("fully visible ! shell output accepted a no-op expansion action");
+    }
+
     const summaryCases: Array<[string, any, string, Record<string, unknown>?]> = [
       ["read", { content: [{ type: "text", text: "read one\nread two" }] }, "2 lines loaded"],
       ["read", { content: [{ type: "image", data: "", mimeType: "image/png" }] }, "Image loaded"],
