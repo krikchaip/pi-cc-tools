@@ -152,10 +152,10 @@ foreach {label column key} {
   require_ready {click.*to expand} "$label fixture"
   send -- "\033\[<0;12;4M\033\[<0;12;4m"
   require_ready {REVIEW_READ_03} "$label normal expansion"
-  send -- "\033\[<0;43;8M\033\[<0;43;8m"
+  send -- "\033\[<0;20;8M\033\[<0;20;8m"
   require_ready {REVIEW_READ_05} "$label standard detail"
   # Five payload lines put the intermediate hidden-content row at row 10.
-  send -- "\033\[<0;43;10M\033\[<0;43;10m"
+  send -- "\033\[<0;20;10M\033\[<0;20;10m"
   require_ready {REVIEW_READ_FINAL} "$label final detail"
   after 250
   # Seven payload lines put the final collapse row at row 12.
@@ -169,9 +169,9 @@ start_pi "bash-final" "collapse-row-review-bash-session.jsonl"
 require_ready {click.*to expand} "Bash fixture"
 send -- "\033\[<0;12;4M\033\[<0;12;4m"
 require_ready {REVIEW_BASH_03} "Bash normal expansion"
-send -- "\033\[<0;43;8M\033\[<0;43;8m"
+send -- "\033\[<0;20;8M\033\[<0;20;8m"
 require_ready {REVIEW_BASH_05} "Bash standard detail"
-send -- "\033\[<0;43;10M\033\[<0;43;10m"
+send -- "\033\[<0;20;10M\033\[<0;20;10m"
 require_ready {REVIEW_BASH_FINAL} "Bash final detail"
 after 250
 send -- "\033\[<0;12;12M\033\[<0;12;12m"

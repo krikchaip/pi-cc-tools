@@ -7,6 +7,7 @@ set repo_dir [file dirname [file dirname $expect_dir]]
 set extension_path [file join $repo_dir "extensions" "index.ts"]
 set fixture_path [file join $repo_dir "e2e" "fixtures" "collapse-scroll-position-session.jsonl"]
 set assert_path [file join $expect_dir "click-viewport-anchors-assert.py"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
 set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
 set scratch "/tmp/pi-cc-tools-click-viewport-anchors-[pid]"
 set cwd [file join $scratch "cwd"]
@@ -115,12 +116,19 @@ if {![wait_for 3 {click.*to expand}]} { fail "top-anchor collapse did not settle
 if {![capture [file join $scratch "top-after-collapse.ansi"] $columns $rows]} { fail "could not capture top-after-collapse" $scratch }
 
 # The top invariant keeps the result summary on row 13, so reopen it and the
-# effective final layer. Then place the dedicated bottom anchor in view.
+# effective final layer. Locate the detail action from a complete frame because
+# boundary clamping can change its screen row. Then place the bottom anchor in view.
 log_file
 send -- "\033\[<0;15;13M\033\[<0;15;13m"
 if {![wait_for 3 {click.*for more detail}]} { fail "normal preview did not reopen" $scratch }
-send -- "\033\[<0;20;17M\033\[<0;20;17m"
-if {![wait_for 3 {COLLAPSE_SCROLL_PAYLOAD_01}]} { fail "final detail layer did not open" $scratch }
+set reopened_capture [file join $scratch "top-reopened.ansi"]
+if {![capture $reopened_capture $columns $rows]} { fail "could not capture reopened normal preview" $scratch }
+if {[catch {exec python3 $locator_path locate $reopened_capture "click for more detail"} detail_point]} {
+  fail "could not locate reopened detail action: $detail_point" $scratch
+}
+lassign $detail_point detail_x detail_y
+send -- "\033\[<0;${detail_x};${detail_y}M\033\[<0;${detail_x};${detail_y}m"
+if {![wait_for 3 {COLLAPSE_SCROLL_PAYLOAD_04}]} { fail "final detail layer did not open" $scratch }
 send -- "\033\[6~"
 wait_for 1 {COLLAPSE_SCROLL_PAYLOAD}
 send -- "\033\[6~"

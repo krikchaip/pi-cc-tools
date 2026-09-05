@@ -4194,7 +4194,11 @@ function appendLocalCollapseAction(content: string, theme: Theme, enabled: boole
 }
 
 function withProgressivePreviewBranch(content: string, theme: Theme, finalCollapse: boolean): string {
-	return finalCollapse ? withFinalBranchBlock(content, theme) : withBranch(content, theme);
+	const trailingLine = content.split("\n").at(-1) ?? "";
+	const hasTrailingAction = finalCollapse
+		|| (["detail", "detail-extra", "collapse-final"] as EncodedClickHintAction[])
+			.some((action) => trailingLine.includes(`${CLICK_HINT_OPEN}${action}${CLICK_HINT_SEPARATOR}`));
+	return hasTrailingAction ? withFinalBranchBlock(content, theme) : withBranch(content, theme);
 }
 
 function withContinuedProgressiveBranch(content: string, theme: Theme, finalCollapse: boolean): string {
@@ -4911,7 +4915,7 @@ function buildPreviewText(
 			: progressiveClick
 				? deepExpandHint(theme, "muted", true)
 				: toolOutputDetailHint(theme, toolExpanded, true, indicatorState?.localDetailEnabled !== false, indicatorState?.progressiveLocalDetail === true);
-		text += `${text ? "\n" : ""}${theme.fg("muted", `... (${remaining} more lines`)}${detailHint}${theme.fg("muted", ")")}`;
+		text += `${text ? "\n" : ""}${theme.fg("muted", `… (${remaining} more lines`)}${detailHint}${theme.fg("muted", ")")}`;
 	}
 	if (detailExpanded && totalLineCount > maxLines && !finalCollapse) {
 		const capDetailHint = indicatorState?.localDetailEnabled === false
@@ -7112,7 +7116,7 @@ function runningPreviewBlock(
 		indicator,
 	);
 	if (options.tail && !expanded && totalLineCount > previewSource.length) {
-		preview = `${theme.fg("muted", `... (${totalLineCount - previewSource.length} earlier lines`)}${toolOutputDetailHint(theme, expanded, true)}${theme.fg("muted", ")")}\n${preview}`;
+		preview = `${theme.fg("muted", `… (${totalLineCount - previewSource.length} earlier lines`)}${toolOutputDetailHint(theme, expanded, true)}${theme.fg("muted", ")")}\n${preview}`;
 	}
 	return withProgressivePreviewBranch(preview, theme, indicator?.finalCollapse === true);
 }
@@ -7128,7 +7132,7 @@ function buildPersistentBashPreview(lines: string[], theme: Theme): string {
 	}
 	const earlier = start;
 	if (earlier > 0) {
-		preview = `${theme.fg("muted", `... (${earlier} earlier lines)`)}\n${preview}`;
+		preview = `${theme.fg("muted", `… (${earlier} earlier lines)`)}\n${preview}`;
 	}
 	return preview;
 }

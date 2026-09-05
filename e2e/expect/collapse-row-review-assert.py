@@ -164,7 +164,7 @@ if "\x1b[38;2;128;128;128m • click any for details" in group:
 # A non-final hidden-content row has one action only: more detail.
 read_normal = read("read-normal.ansi")
 normal_rows = rows_with(read_normal, "more lines")
-expected_normal = "... (4 more lines • click for more detail)"
+expected_normal = "… (4 more lines • click for more detail)"
 if not any(expected_normal in row for row in normal_rows):
     fail("Read hidden-content row did not keep the exact detail-only shape", "\n".join(normal_rows))
 if any("click to collapse" in row for row in normal_rows):
