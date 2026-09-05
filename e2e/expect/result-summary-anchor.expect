@@ -214,6 +214,12 @@ if {[wait_for 1 {click.*for more detail}]} {
   puts "ARTIFACTS $scratch"
   exit 1
 }
+if {![force_fullscreen_repaint $columns $rows]} {
+  puts stderr "could not capture a complete effective-final level-1 repaint"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
 after 200
 log_file
 set level_one_capture [read_capture $level_one_log]

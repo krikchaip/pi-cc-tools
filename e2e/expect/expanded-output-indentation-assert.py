@@ -152,6 +152,34 @@ if len(sys.argv) > 2 and sys.argv[2] == "read-skill-shapes":
     def is_output_blank(row: str) -> bool:
         return not row.replace("│", "").strip()
 
+    def require_progressive_branch(case: str, layer: str, frame: list[str]) -> None:
+        summary = next((index for index, row in enumerate(frame) if "15 lines loaded" in row), -1)
+        action = max((index for index, row in enumerate(frame) if "click for more detail" in row), default=-1)
+        if summary < 0 or action <= summary:
+            failures.append(f"{case} {layer} missing progressive summary/action rows: summary={summary}, action={action}")
+            return
+        summary_text = frame[summary].find("15 lines loaded")
+        summary_branch = max(
+            frame[summary].rfind("├", 0, summary_text),
+            frame[summary].rfind("└", 0, summary_text),
+        )
+        action_text = frame[action].find("click for more detail")
+        action_branch = max(
+            frame[action].rfind("├", 0, action_text),
+            frame[action].rfind("└", 0, action_text),
+        )
+        if summary_branch < 0 or frame[summary][summary_branch] != "├":
+            failures.append(f"{case} {layer} progressive summary does not open a branch: {frame[summary]!r}")
+            return
+        if action_branch != summary_branch or frame[action][action_branch] != "└":
+            failures.append(f"{case} {layer} progressive detail action does not close the branch: {frame[action]!r}")
+        for row_index in range(summary + 1, action):
+            row = frame[row_index]
+            if summary_branch >= len(row) or row[summary_branch] != "│":
+                failures.append(
+                    f"{case} {layer} progressive payload row {row_index + 1} does not continue the branch: {row!r}"
+                )
+
     for case, header in cases.items():
         case_frames = [
             case_frame(case, "level0", header, "15 lines loaded", "READ_SHAPE_FILLER_2"),
@@ -159,6 +187,8 @@ if len(sys.argv) > 2 and sys.argv[2] == "read-skill-shapes":
             case_frame(case, "level2", header, "15 lines loaded", "READ_SHAPE_END"),
         ]
         for layer, frame in zip(("L0", "L1", "L2"), case_frames):
+            if layer != "L2":
+                require_progressive_branch(case, layer, frame)
             summary = next((index for index, row in enumerate(frame) if "15 lines loaded" in row), -1)
             root = next((index for index, row in enumerate(frame) if "READ_SHAPE_ROOT" in row), -1)
             child = next((index for index, row in enumerate(frame) if "READ_SHAPE_CHILD" in row), -1)

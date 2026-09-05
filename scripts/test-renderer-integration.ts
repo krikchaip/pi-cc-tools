@@ -293,7 +293,7 @@ await withRendererHarness(
       && standaloneActionX(index, "expand") < 0
       && standaloneActionX(index, "detail") >= 0
     ));
-    const detailStart = detailRow < 0 ? -1 : readRows[detailRow].indexOf("...");
+    const detailStart = detailRow < 0 ? -1 : readRows[detailRow].indexOf("…");
     const detailEnd = detailRow < 0 ? -1 : readRows[detailRow].trimEnd().length;
     const detailCoversFullRow = detailRow >= 0
       && detailStart >= 0
@@ -625,6 +625,22 @@ await withRendererHarness(
       };
       if (!findAnchor("expand", "top") || !execution.activateClickAction("expand", "top")) {
         throw new Error(`${fixture.name} summary anchor did not expand`);
+      }
+      const levelZeroRows = execution.render(120).map((line: string) => plain(line));
+      const rowWithAction = (action: string): number => levelZeroRows.findIndex((_: string, y: number) => (
+        Array.from({ length: 120 }, (_: unknown, x: number) => execution.clickActionAtPoint(x, y)).includes(action)
+      ));
+      const levelZeroSummaryRow = rowWithAction("expand");
+      const levelZeroDetailRow = rowWithAction("detail");
+      if (
+        levelZeroSummaryRow < 0
+        || levelZeroDetailRow <= levelZeroSummaryRow
+        || !levelZeroRows[levelZeroSummaryRow].trimStart().startsWith("├")
+        || !levelZeroRows[levelZeroDetailRow].trimStart().startsWith("└")
+        || levelZeroRows.slice(levelZeroSummaryRow + 1, levelZeroDetailRow)
+          .some((line: string) => !line.trimStart().startsWith("│"))
+      ) {
+        throw new Error(`${fixture.name} L0 preview did not branch from its summary through its detail action: ${JSON.stringify(levelZeroRows)}`);
       }
       for (const level of [1, 2]) {
         if (!findAnchor("detail", "top") || !execution.activateClickAction("detail", "top")) {
