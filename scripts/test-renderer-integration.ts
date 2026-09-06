@@ -246,9 +246,9 @@ await withRendererHarness(
       executionStarted: true,
     } as any;
     edit.renderCall(editArgs, theme, editContext);
-    await waitFor(() => typeof editContext.state._ptBody === "string" && editContext.state._ptBody.includes("more edit blocks"));
+    await waitFor(() => typeof editContext.state._ptBody === "string" && editContext.state._ptBody.includes("more edit block"));
     const editRaw = edit.renderCall(editArgs, theme, editContext).render(120).join("\n");
-    assertCollapsedIndicator(editRaw, "more edit blocks");
+    assertCollapsedIndicator(editRaw, "more edit block");
 
     const editErrorComponent = edit.renderResult(
       {
@@ -263,15 +263,15 @@ await withRendererHarness(
     );
     const editErrorRows = editErrorComponent.render(44)
       .map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    const editBranchIndex = editErrorRows.findIndex((line: string) => line.startsWith(" └ "));
+    const editBranchIndex = editErrorRows.findIndex((line: string) => line.startsWith("└ "));
     const editContinuations = editBranchIndex >= 0 ? editErrorRows.slice(editBranchIndex + 1) : [];
     if (editBranchIndex < 0 || editContinuations.length === 0) {
       throw new Error(`Edit final-line wrap regression setup did not wrap: ${JSON.stringify(editErrorRows)}`);
     }
-    if (editContinuations.some((line: string) => line.startsWith(" │ "))) {
+    if (editContinuations.some((line: string) => line.startsWith("│ "))) {
       throw new Error(`wrapped Edit final line kept indentation guides: ${JSON.stringify(editErrorRows)}`);
     }
-    if (editContinuations.some((line: string) => !line.startsWith("   "))) {
+    if (editContinuations.some((line: string) => !line.startsWith("  "))) {
       throw new Error(`wrapped Edit final line lost branch indentation: ${JSON.stringify(editErrorRows)}`);
     }
 
@@ -1310,7 +1310,30 @@ await withRendererHarness(
         () => multiApplyPatchExecution.render(120).some((line: string) => plain(line).includes("2 files")),
         "collapsed multi-file Apply Patch preview",
       );
+      multiApplyPatchExecution.updateResult({
+        content: [{ type: "text", text: "Done!" }],
+        details: {},
+        isError: false,
+      }, false);
       const collapsedMultiApplyRows = multiApplyPatchExecution.render(120).map((line: string) => plain(line));
+      const collapsedMultiApplyContent = collapsedMultiApplyRows.filter((line: string) => line.trim().length > 0);
+      const collapsedApplyHunkRows = collapsedMultiApplyContent.filter((line: string) => line.includes("hunks"));
+      const collapsedApplyHunkRow = collapsedMultiApplyContent.findIndex((line: string) => line.includes("hunks"));
+      const firstApplyBlockRow = collapsedMultiApplyContent.findIndex((line: string) => line.includes("Create apply-multi-a.ts"));
+      const collapsedApplyBlockHeadings = collapsedMultiApplyContent.filter((line: string) => line.includes("Create apply-multi-"));
+      const collapsedApplyLocalRemainders = collapsedMultiApplyContent.filter((line: string) => line.includes("more diff lines"));
+      if (
+        collapsedApplyHunkRows.length !== 1
+        || collapsedApplyHunkRow < 0
+        || collapsedApplyHunkRow >= firstApplyBlockRow
+        || collapsedApplyBlockHeadings.some((line: string) => !/^\s*├ Create apply-multi-/.test(line))
+        || collapsedApplyLocalRemainders.length !== 2
+        || !/^\s*│ …/.test(collapsedApplyLocalRemainders[0] ?? "")
+        || !/^\s*└ …/.test(collapsedApplyLocalRemainders[1] ?? "")
+        || collapsedMultiApplyContent.at(-1) !== collapsedApplyLocalRemainders[1]
+      ) {
+        throw new Error(`collapsed multi-file Apply Patch did not follow aggregate/block/terminal branch grammar: ${JSON.stringify(collapsedMultiApplyContent)}`);
+      }
       const multiApplySummaryRow = collapsedMultiApplyRows.findIndex(
         (line: string) => line.includes("2 files") && line.includes("+80"),
       );
@@ -1332,6 +1355,97 @@ await withRendererHarness(
         () => multiApplyPatchExecution.render(120).some((line: string) => plain(line).includes(collapseText)),
         "normal expanded multi-file Apply Patch bottom collapse anchor",
       );
+      const expandedMultiApplyRows = multiApplyPatchExecution.render(120).map((line: string) => plain(line));
+      const expandedMultiApplyContent = expandedMultiApplyRows.filter((line: string) => line.trim().length > 0);
+      const expandedApplyHunkRows = expandedMultiApplyContent.filter((line: string) => line.includes("hunks"));
+      const expandedApplyBlockHeadings = expandedMultiApplyContent.filter((line: string) => line.includes("Create apply-multi-"));
+      const expandedApplyTerminal = expandedMultiApplyContent.at(-1) ?? "";
+      if (
+        expandedApplyHunkRows.length !== 1
+        || expandedApplyBlockHeadings.some((line: string) => !/^\s*├ Create apply-multi-/.test(line))
+        || !/^\s*└ Output ends here/.test(expandedApplyTerminal)
+      ) {
+        throw new Error(`expanded multi-file Apply Patch did not keep one summary and one terminal collapse row: ${JSON.stringify(expandedMultiApplyContent)}`);
+      }
+    }
+
+    {
+      const restoredEditArgs = {
+        path: "restored-edit-fixture.ts",
+        oldText: "old restored value",
+        newText: "new restored value",
+      };
+      const restoredEditExecution = new ToolExecutionComponent(
+        "edit",
+        "restored_edit_fixture",
+        restoredEditArgs,
+        {},
+        edit,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      restoredEditExecution.updateResult({
+        content: [{ type: "text", text: "Applied edit" }],
+        details: {
+          _type: "editInfo",
+          summary: "+1 -1",
+          editLine: 1,
+          hunks: 1,
+          added: 1,
+          removed: 1,
+        },
+        isError: false,
+      }, false);
+      const restoredEditRows = restoredEditExecution.render(120).map((line: string) => plain(line));
+      if (
+        restoredEditRows.filter((line: string) => line.includes("1 hunk")).length !== 1
+        || !restoredEditRows.some((line: string) => /^└ .*\+1.*-1.*1 hunk/.test(line))
+        || !restoredEditRows.find((line: string) => line.trim())?.startsWith("● Edit")
+      ) {
+        throw new Error(`restored completed Edit was indented or lost its original result summary: ${JSON.stringify(restoredEditRows)}`);
+      }
+    }
+
+    {
+      const addedOnlyEditExecution = new ToolExecutionComponent(
+        "edit",
+        "added_only_edit_fixture",
+        {
+          path: "missing-added-only-edit-fixture.ts",
+          oldText: "anchor line",
+          newText: [
+            "anchor line",
+            ...Array.from(
+              { length: 12 },
+              (_, index) => `added line ${index + 1} ${"wide content ".repeat(16)}`,
+            ),
+          ].join("\n"),
+        },
+        {},
+        edit,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      addedOnlyEditExecution.markExecutionStarted();
+      addedOnlyEditExecution.setArgsComplete();
+      addedOnlyEditExecution.render(120);
+      await waitFor(
+        () => addedOnlyEditExecution.rendererState?._ptAsyncRenderPending !== true
+          && addedOnlyEditExecution.rendererState?._ptTree?.blocks?.[0]?.content,
+        "added-only Edit preview",
+      );
+      const firstAddedOnlyDiffRow = plain(
+        addedOnlyEditExecution.rendererState?._ptTree?.blocks?.[0]?.content?.split("\n")?.[0] ?? "",
+      );
+      const addedOnlyRows = addedOnlyEditExecution.render(120).map((line: string) => plain(line));
+      const addedOnlySummaryRow = addedOnlyRows.findIndex((line: string) => line.includes("1 hunk"));
+      const physicalRowAfterAddedOnlySummary = addedOnlyRows[addedOnlySummaryRow + 1] ?? "";
+      if (
+        !/^─+$/.test(firstAddedOnlyDiffRow.trim())
+        || !/^│ ─+\s*$/.test(physicalRowAfterAddedOnlySummary)
+      ) {
+        throw new Error(`single unified Edit did not place its top border directly after the summary: ${JSON.stringify({ logicalRuleWidth: firstAddedOnlyDiffRow.length, physicalRowAfterAddedOnlySummary, addedOnlyRows })}`);
+      }
     }
 
     {
@@ -1386,21 +1500,37 @@ await withRendererHarness(
         isError: false,
       }, false);
       await waitFor(
-        () => shortEditExecution.render(120).filter((line: string) => {
-          const text = plain(line);
-          return text.includes("+1") && text.includes("-1");
-        }).length === 2,
+        () => {
+          const rows = shortEditExecution.render(120).map((line: string) => plain(line));
+          return rows.filter((line: string) => line.includes("+1") && line.includes("-1")).length === 1
+            && rows.filter((line: string) => line.includes("1 hunk")).length === 1;
+        },
         "complete fully visible short Edit execution",
       );
       const completeShortEditRows = shortEditExecution.render(120).map((line: string) => plain(line));
+      const completeShortEditTree = shortEditExecution.rendererState?._ptTree;
+      const firstShortEditDiffRow = plain(
+        completeShortEditTree?.blocks?.[0]?.content?.split("\n")?.[0] ?? "",
+      );
+      const completeShortEditSummaryRow = completeShortEditRows.findIndex((line: string) => line.includes("1 hunk"));
+      const physicalRowAfterShortEditSummary = completeShortEditRows[completeShortEditSummaryRow + 1] ?? "";
+      if (
+        !completeShortEditTree?.summary?.trim()
+        || !firstShortEditDiffRow.includes("old")
+        || !firstShortEditDiffRow.includes("new")
+        || !firstShortEditDiffRow.includes("┊")
+        || !/^│ old.*┊new/.test(physicalRowAfterShortEditSummary)
+      ) {
+        throw new Error(`single split Edit inserted a physical gap above its diff: ${JSON.stringify(completeShortEditRows)}`);
+      }
       const shortEditAnchorPoints = completeShortEditRows.flatMap((_line: string, y: number) => {
         const x = Array.from({ length: 120 }, (_, candidate) => candidate).find(
           (candidate) => shortEditExecution.clickAnchorAtPoint(candidate, y) !== undefined,
         );
         return x === undefined ? [] : [{ x, y }];
       });
-      if (shortEditAnchorPoints.length < 2) {
-        throw new Error(`complete short Edit did not expose its header and result anchors: ${JSON.stringify(completeShortEditRows)}`);
+      if (shortEditAnchorPoints.length < 1) {
+        throw new Error(`complete short Edit did not retain its inert header anchor: ${JSON.stringify(completeShortEditRows)}`);
       }
       const rowsBeforeNoOpClicks = shortEditExecution.render(120);
       const renderRequestsBeforeNoOpClicks = shortEditRenderRequests;
@@ -1531,7 +1661,7 @@ await withRendererHarness(
 
     {
       const splitLines = (prefix: string, editIndex: number) => Array.from(
-        { length: 20 },
+        { length: 30 },
         (_, lineIndex) => `${prefix} ${editIndex}.${lineIndex}`,
       ).join("\n");
       const editAnchorArgs = {
@@ -1553,11 +1683,46 @@ await withRendererHarness(
       editAnchorExecution.markExecutionStarted();
       editAnchorExecution.setArgsComplete();
       await waitFor(
-        () => editAnchorExecution.render(120).some((line: string) => plain(line).includes("more edit blocks")),
+        () => editAnchorExecution.render(120).some((line: string) => plain(line).includes("more edit block")),
         "collapsed multi-Edit preview",
+      );
+      editAnchorExecution.updateResult({
+        content: [{ type: "text", text: "Applied 4 edits" }],
+        details: {
+          _type: "multiEditInfo",
+          editCount: 4,
+          diffLineCount: 240,
+          hunks: 4,
+          totalAdded: 120,
+          totalRemoved: 120,
+        },
+        isError: false,
+      }, false);
+      await waitFor(
+        () => editAnchorExecution.rendererState?._ptAsyncRenderPending !== true
+          && editAnchorExecution.render(120).some((line: string) => plain(line).includes("more edit block")),
+        "settled collapsed multi-Edit preview",
       );
 
       const collapsedEditRows = editAnchorExecution.render(120).map((line: string) => plain(line));
+      const collapsedEditContentRows = collapsedEditRows.filter((line: string) => line.trim().length > 0);
+      const collapsedHunkRows = collapsedEditContentRows.filter((line: string) => line.includes("hunks"));
+      const collapsedHunkRow = collapsedEditContentRows.findIndex((line: string) => line.includes("hunks"));
+      const firstEditBlockRow = collapsedEditContentRows.findIndex((line: string) => line.includes("Edit 1/4"));
+      const collapsedBlockHeadings = collapsedEditContentRows.filter((line: string) => /Edit \d\/4/.test(line));
+      const collapsedLocalRemainders = collapsedEditContentRows.filter((line: string) => line.includes("more diff lines"));
+      const collapsedTerminalRow = collapsedEditContentRows.at(-1) ?? "";
+      if (
+        collapsedHunkRows.length !== 1
+        || collapsedHunkRow < 0
+        || collapsedHunkRow >= firstEditBlockRow
+        || collapsedBlockHeadings.some((line: string) => !/^\s*├ Edit \d\/4/.test(line))
+        || collapsedLocalRemainders.length === 0
+        || collapsedLocalRemainders.some((line: string) => !/^\s*│ …/.test(line))
+        || !/^\s*└ … 1 more edit block/.test(collapsedTerminalRow)
+      ) {
+        throw new Error(`collapsed multi-Edit did not follow aggregate/block/terminal branch grammar: ${JSON.stringify(collapsedEditContentRows)}`);
+      }
       const editSummaryRow = collapsedEditRows.findIndex((line: string) => line.includes("4 edits +"));
       const editSummaryX = editSummaryRow < 0
         ? -1
@@ -1580,6 +1745,10 @@ await withRendererHarness(
         "expanded multi-Edit bottom collapse anchor",
       );
       const expandedEditRows = editAnchorExecution.render(120).map((line: string) => plain(line));
+      const expandedEditContentRows = expandedEditRows.filter((line: string) => line.trim().length > 0);
+      const expandedHunkRows = expandedEditContentRows.filter((line: string) => line.includes("hunks"));
+      const expandedBlockHeadings = expandedEditContentRows.filter((line: string) => /Edit \d\/4/.test(line));
+      const expandedTerminalRow = expandedEditContentRows.at(-1) ?? "";
       const editCollapseRow = expandedEditRows.findIndex((line: string) => line.includes(collapseText));
       const editCollapseStart = editCollapseRow < 0 ? -1 : expandedEditRows[editCollapseRow].indexOf(collapseText);
       const fullCollapseTarget = editCollapseStart >= 0 && Array.from(
@@ -1589,9 +1758,13 @@ await withRendererHarness(
       if (
         editCollapseRow < 0
         || !fullCollapseTarget
+        || expandedHunkRows.length !== 1
+        || expandedBlockHeadings.some((line: string) => !/^\s*├ Edit \d\/4/.test(line))
+        || !expandedTerminalRow.includes(collapseText)
+        || !/^\s*└ Output ends here/.test(expandedTerminalRow)
         || expandedEditRows.some((line: string) => line.includes("more diff lines"))
       ) {
-        throw new Error(`fully rendered multi-Edit split diff lacked its full bottom collapse target: ${JSON.stringify(expandedEditRows)}`);
+        throw new Error(`fully rendered multi-Edit split diff lacked its canonical bottom collapse row: ${JSON.stringify(expandedEditRows)}`);
       }
     }
 

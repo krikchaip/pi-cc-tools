@@ -1,0 +1,98 @@
+#!/usr/bin/expect -f
+# Known-red real-Pi fullscreen reproduction for the single Edit opening-row gap.
+
+set timeout 20
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set provider_path [file join $repo_dir "e2e" "fixtures" "single-edit-gap-provider.ts"]
+set assert_path [file join $expect_dir "single-edit-gap-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-single-edit-gap-[pid]"
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set rows 40
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":false,"groupToolCalls":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+    set settings [open $path "w"]
+    puts $settings $settings_json
+    close $settings
+}
+
+proc wait_for_marker {} {
+    global spawn_id
+    while {1} {
+        expect {
+            "\033\[c" { send "\033\[?1;2c"; exp_continue }
+            "\033\[?u" { send "\033\[?0u"; exp_continue }
+            "install missing project packages" { return 0 }
+            "E2E_SINGLE_EDIT_COMPLETE" { return 1 }
+            timeout { return 0 }
+            eof { return 0 }
+        }
+    }
+}
+
+proc run_case {layout columns scratch home agent rows pi_bin extension_path provider_path} {
+    global spawn_id
+    set cwd [file join $scratch $layout]
+    file mkdir $cwd
+    set target [open [file join $cwd "single-edit-gap.ts"] "w"]
+    puts $target "export const value = 'before';"
+    close $target
+
+    set capture_path [file join $scratch "${layout}.ansi"]
+    cd $cwd
+    log_user 0
+    log_file -a -noappend $capture_path
+    spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+        $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills --approve \
+        -e $extension_path -e $provider_path --provider single-edit-gap-e2e --model deterministic-edit --api-key e2e-local \
+        --tui-mode fullscreen "Run the deterministic single Edit."
+    stty columns $columns rows $rows
+
+    if {![wait_for_marker]} {
+        send "\003\003"
+        catch {close}
+        catch {wait}
+        log_file
+        log_user 1
+        puts stderr "$layout fixture did not reach deterministic completion"
+        return 0
+    }
+
+    # Trigger one complete fullscreen paint after the async diff renderer settles.
+    after 750
+    set pi_pid [exp_pid]
+    catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}
+    catch {exec kill -WINCH $pi_pid}
+    after 250
+    catch {exec stty columns $columns rows $rows <@ $spawn_id}
+    catch {exec kill -WINCH $pi_pid}
+    after 500
+
+    send "\003\003"
+    catch {close}
+    catch {wait}
+    log_file
+    log_user 1
+    return 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+if {![run_case "unified" 100 $scratch $home $agent $rows $pi_bin $extension_path $provider_path]} {
+    puts "ARTIFACTS $scratch"
+    exit 2
+}
+if {![run_case "split" 180 $scratch $home $agent $rows $pi_bin $extension_path $provider_path]} {
+    puts "ARTIFACTS $scratch"
+    exit 2
+}
+
+set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status
