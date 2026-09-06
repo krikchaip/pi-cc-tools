@@ -4105,11 +4105,37 @@ function withContinuedProgressiveBranch(content: string, theme: Theme, finalColl
 	return finalCollapse ? withFinalBranchBlock(content, theme) : withBranch(content, theme, false, true);
 }
 
-function indentBranchBlock(block: string): string {
-	return block
-		.split("\n")
-		.map((line) => (line ? ` ${line}` : line))
-		.join("\n");
+interface DiffOutputTreeBlock {
+	heading?: string;
+	content: string;
+}
+
+interface DiffOutputTree {
+	summary: string;
+	blocks: DiffOutputTreeBlock[];
+	terminalAction?: string;
+}
+
+function renderDiffOutputTree(
+	summary: string,
+	blocks: DiffOutputTreeBlock[],
+	terminalAction: string | undefined,
+	theme: Theme,
+): string {
+	const rows: Array<{ text: string; sibling: boolean }> = [{ text: summary, sibling: true }];
+	if (blocks[0]?.heading) rows.push({ text: "", sibling: false });
+	blocks.forEach((block, blockIndex) => {
+		if (block.heading) rows.push({ text: block.heading, sibling: true });
+		if (block.content) {
+			for (const line of block.content.split("\n")) rows.push({ text: line, sibling: false });
+		}
+		if (blockIndex < blocks.length - 1) rows.push({ text: "", sibling: false });
+	});
+	if (terminalAction) rows.push({ text: terminalAction, sibling: true });
+	return rows.map((row, index) => {
+		if (index === rows.length - 1) return branchLead(row.text, false, theme);
+		return row.sibling ? branchLead(row.text, true, theme) : branchIndent(row.text, true, theme);
+	}).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -5129,18 +5155,22 @@ function stripBranchMarkupBlock(text: string): string {
 
 function liveBranchDisplay(state: Record<string, unknown> | undefined, theme: Theme): string | undefined {
 	if (!state || typeof state !== "object") return undefined;
+	const tree = state._ptTree as DiffOutputTree | undefined;
+	if (tree && typeof tree.summary === "string" && Array.isArray(tree.blocks)) {
+		return renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme);
+	}
 	const body = state._ptBody;
 	if (typeof body === "string" && body.trim() && !body.includes("(rendering")) {
 		const finalCollapse = state._ptFinalCollapse === true;
-		return indentBranchBlock(withContinuedProgressiveBranch(
+		return withContinuedProgressiveBranch(
 			appendLocalCollapseAction(body, theme, finalCollapse),
 			theme,
 			finalCollapse,
-		));
+		);
 	}
 	const display = state._ptDisplay;
 	if (typeof display === "string" && display.trim()) {
-		return indentBranchBlock(withBranch(stripBranchMarkupBlock(display), theme, false, true));
+		return withBranch(stripBranchMarkupBlock(display), theme, false, true);
 	}
 	return undefined;
 }
@@ -6418,7 +6448,6 @@ function renderEditPreviewBody(
 	operations: Array<{ oldText: string; newText: string }>,
 	diffs: ParsedDiff[],
 	lines: number[],
-	summary: string,
 	localDetailLevel: ToolClickDetailLevel,
 	totalBudget: number,
 	localClickControls: boolean,
@@ -6426,13 +6455,25 @@ function renderEditPreviewBody(
 ): void {
 	const dc = resolveDiffColors(theme);
 	const branchWidth = branchDiffWidth();
+	const totalAdded = diffs.reduce((sum, diff) => sum + diff.added, 0);
+	const totalRemoved = diffs.reduce((sum, diff) => sum + diff.removed, 0);
+	const totalHunks = diffs.reduce((sum, diff) => sum + countDiffHunks(diff), 0);
+	const totalLines = diffs.reduce((sum, diff) => sum + diff.lines.length, 0);
+	const commitTree = (tree: DiffOutputTree): void => {
+		ctx.state._ptTree = tree;
+		ctx.state._ptBody = [
+			tree.summary,
+			...tree.blocks.flatMap((block) => [block.heading ?? "", block.content]),
+			tree.terminalAction ?? "",
+		].filter(Boolean).join("\n");
+		ctx.state._ptDisplay = renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme);
+	};
 	if (operations.length === 1) {
 		const [diff] = diffs;
 		const line = lines[0] ?? getFirstChangedNewLine(diff);
 		const hasHiddenCollapsedContent = !diffFitsRenderLimit(diff, branchWidth, 32);
-		const resultSummary = hasHiddenCollapsedContent
-			? markResultSummary(summarizeDiff(diff.added, diff.removed))
-			: summarizeDiff(diff.added, diff.removed);
+		const summary = `${diffSummaryWithMeta(diff.added, diff.removed, countDiffHunks(diff), "")}${formatLineMeta(line, theme)}`;
+		const resultSummary = hasHiddenCollapsedContent ? markResultSummary(summary) : summary;
 		const previewLines = ctx.expanded ? totalBudget : 32;
 		const finalCollapse = localClickControls
 			&& hasHiddenCollapsedContent
@@ -6442,15 +6483,21 @@ function renderEditPreviewBody(
 		renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
 			.then((rendered) => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = `${resultSummary}${formatLineMeta(line, theme)}\n${rendered}`;
-				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+				commitTree({
+					summary: resultSummary,
+					blocks: [{ content: rendered }],
+					terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
+				});
 				ctx.state._ptAsyncRenderPending = false;
 				safeInvalidate(ctx, pendingViewport);
 			})
 			.catch(() => {
 				if (ctx.state._pk !== key) return;
-				ctx.state._ptBody = `${resultSummary}${formatLineMeta(line, theme)}`;
-				ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+				commitTree({
+					summary: resultSummary,
+					blocks: [],
+					terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
+				});
 				ctx.state._ptAsyncRenderPending = false;
 				safeInvalidate(ctx, pendingViewport);
 			});
@@ -6460,9 +6507,8 @@ function renderEditPreviewBody(
 	const collapsedPreviewLines = Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, collapsedMaxShown)));
 	const hasHiddenCollapsedContent = collapsedMaxShown < operations.length
 		|| diffs.slice(0, collapsedMaxShown).some((diff) => !diffFitsRenderLimit(diff, branchWidth, collapsedPreviewLines));
-	const resultSummary = hasHiddenCollapsedContent
-		? markResultSummary(`${operations.length} edits ${summary}`)
-		: `${operations.length} edits ${summary}`;
+	const aggregateSummary = `${operations.length} edits ${diffSummaryWithMeta(totalAdded, totalRemoved, totalHunks, "")}${totalLines ? ` ${theme.fg("muted", `(${totalLines} diff lines)`)}` : ""}`;
+	const resultSummary = hasHiddenCollapsedContent ? markResultSummary(aggregateSummary) : aggregateSummary;
 	const maxShown = ctx.expanded ? operations.length : collapsedMaxShown;
 	const previewLines = ctx.expanded
 		? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
@@ -6475,25 +6521,28 @@ function renderEditPreviewBody(
 	ctx.state._ptFinalCollapse = finalCollapse;
 	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
 		const line = lines[index] ?? getFirstChangedNewLine(diff);
+		const heading = `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)}`;
 		return renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
-			.then((rendered) => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)}\n${rendered}`)
-			.catch(() => `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)} ${summarizeDiff(diff.added, diff.removed)}`);
+			.then((rendered) => ({ heading, content: rendered }))
+			.catch(() => ({ heading: `${heading} ${summarizeDiff(diff.added, diff.removed)}`, content: "" }));
 	})
-		.then((sections) => {
+		.then((blocks) => {
 			if (ctx.state._pk !== key) return;
 			const remainder = operations.length - maxShown;
-			const suffix = remainder > 0
-				? `\n${theme.fg("muted", `… ${remainder} more edit blocks`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
-				: "";
-			ctx.state._ptBody = `${resultSummary}\n\n${sections.join("\n\n")}${suffix}`;
-			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+			const terminalAction = remainder > 0
+				? `${theme.fg("muted", `… ${remainder} more edit block${remainder === 1 ? "" : "s"}`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
+				: finalCollapse ? localCollapseActionHint(theme) : undefined;
+			commitTree({ summary: resultSummary, blocks, terminalAction });
 			ctx.state._ptAsyncRenderPending = false;
 			safeInvalidate(ctx, pendingViewport);
 		})
 		.catch(() => {
 			if (ctx.state._pk !== key) return;
-			ctx.state._ptBody = resultSummary;
-			ctx.state._ptDisplay = indentBranchBlock(withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._ptBody, theme, finalCollapse), theme, finalCollapse));
+			commitTree({
+				summary: resultSummary,
+				blocks: [],
+				terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
+			});
 			ctx.state._ptAsyncRenderPending = false;
 			safeInvalidate(ctx, pendingViewport);
 		});
@@ -7306,7 +7355,7 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 		|| preview.changes.slice(0, collapsedMaxShown).some(
 			(change) => !diffFitsRenderLimit(change.diff, diffWidth, collapsedPreviewLines),
 		);
-	const resultSummary = (text: string): string => hasHiddenCollapsedContent ? markResultSummary(text) : text;
+	const markSummary = (text: string): string => hasHiddenCollapsedContent ? markResultSummary(text) : text;
 	const maxShown = ctx.expanded ? preview.changes.length : collapsedMaxShown;
 	const previewLines = ctx.expanded
 		? preview.changes.length === 1
@@ -7320,54 +7369,70 @@ function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: stri
 		&& ctx.expanded
 		&& (localDetailLevel >= 2 || allReturnedFits);
 	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
+	const commitTree = (tree: DiffOutputTree): void => {
+		ctx.state._applyPatchPreviewTree = tree;
+		ctx.state._applyPatchPreviewBody = [
+			tree.summary,
+			...tree.blocks.flatMap((block) => [block.heading ?? "", block.content]),
+			tree.terminalAction ?? "",
+		].filter(Boolean).join("\n");
+		ctx.state._applyPatchPreviewDisplay = renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme);
+	};
 	if (ctx.state._applyPatchPreviewKey !== key) {
 		ctx.state._applyPatchPreviewKey = key;
 		ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
-		ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
+		ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
 		const dc = resolveDiffColors(theme);
 		const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
 		if (preview.changes.length === 1) {
 			const [change] = preview.changes;
+			const mode = change.kind === "add" ? "new file" : change.kind === "delete" ? "delete" : "";
+			const aggregateSummary = markSummary(`${describeApplyPatchChange(change)} ${diffSummaryWithMeta(change.diff.added, change.diff.removed, change.hunks, mode)}${formatApplyPatchLine(change, theme)}`);
 			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
 				.then((rendered) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = `${resultSummary(`${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`)}\n${rendered}`;
-					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
+					commitTree({
+						summary: aggregateSummary,
+						blocks: [{ content: rendered }],
+						terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
+					});
 					safeInvalidate(ctx, pendingViewport);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = resultSummary(`${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`);
-					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
+					commitTree({ summary: aggregateSummary, blocks: [] });
 					safeInvalidate(ctx, pendingViewport);
 				});
 		} else {
-			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change, index) =>
-				renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
-					.then((rendered) => `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}\n${rendered}`)
-					.catch(() => `${index + 1}. ${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`),
-			)
-				.then((sections) => {
+			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change) => {
+				const heading = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
+				return renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
+					.then((rendered) => ({ heading, content: rendered }))
+					.catch(() => ({ heading, content: "" }));
+			})
+				.then((blocks) => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
 					const remainder = preview.changes.length - maxShown;
-					const suffix = remainder > 0
-						? `\n${theme.fg("muted", `… ${remainder} more file patches`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
-						: "";
-					const summary = resultSummary(`${preview.changes.length} files ${preview.summary}`);
-					ctx.state._applyPatchPreviewBody = `${summary}\n\n${sections.join("\n\n")}${suffix}`;
-					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
+					const aggregate = `${preview.changes.length} files ${diffSummaryWithMeta(preview.totalAdded, preview.totalRemoved, preview.totalHunks, "")}${preview.totalLines ? ` ${theme.fg("muted", `(${preview.totalLines} diff lines)`)}` : ""}`;
+					const terminalAction = remainder > 0
+						? `${theme.fg("muted", `… ${remainder} more file patch${remainder === 1 ? "" : "es"}`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
+						: finalCollapse ? localCollapseActionHint(theme) : undefined;
+					commitTree({ summary: markSummary(aggregate), blocks, terminalAction });
 					safeInvalidate(ctx, pendingViewport);
 				})
 				.catch(() => {
 					if (ctx.state._applyPatchPreviewKey !== key) return;
-					ctx.state._applyPatchPreviewBody = resultSummary(`${preview.changes.length} files ${preview.summary}`);
-					ctx.state._applyPatchPreviewDisplay = withContinuedProgressiveBranch(appendLocalCollapseAction(ctx.state._applyPatchPreviewBody, theme, finalCollapse), theme, finalCollapse);
+					const aggregate = `${preview.changes.length} files ${diffSummaryWithMeta(preview.totalAdded, preview.totalRemoved, preview.totalHunks, "")}`;
+					commitTree({ summary: markSummary(aggregate), blocks: [] });
 					safeInvalidate(ctx, pendingViewport);
 				});
 		}
 	}
 
-	const body = ctx.state._applyPatchPreviewDisplay as string | undefined;
+	const tree = ctx.state._applyPatchPreviewTree as DiffOutputTree | undefined;
+	const body = tree
+		? renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme)
+		: ctx.state._applyPatchPreviewDisplay as string | undefined;
 	return makeText(ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
 }
 
@@ -7388,6 +7453,7 @@ function renderApplyPatchResult(result: any, isPartial: boolean, theme: Theme, c
 	if (!meta || meta.changeCount === 0) {
 		return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Applied")), theme));
 	}
+	if (ctx.state?._applyPatchPreviewTree) return makeText(ctx.lastComponent, "");
 
 	if (meta.changeCount === 1 && meta.firstChange) {
 		const change = meta.firstChange;
@@ -8739,7 +8805,7 @@ export default function (pi: ExtensionAPI) {
 			const revealSummary = shouldRevealCallArgs(ctx) || (!!fp && hasOwnArg(args, "edits"));
 			const summary = stableCallSummary(ctx, "_callSummary", () => shouldRevealCallArgs(ctx) && operations.length > 1 ? `${sp(fp)} ${theme.fg("muted", `(${operations.length} edits)`)}` : sp(fp), revealSummary);
 			syncToolCallStatus(ctx);
-			const hdr = toolHeader("Edit", summary, theme, ` ${toolStatusDot(ctx, theme)}`, liveLineCountTrailing(ctx, theme));
+			const hdr = toolHeader("Edit", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
 			const diffWidth = branchDiffWidth();
 			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
@@ -8747,14 +8813,14 @@ export default function (pi: ExtensionAPI) {
 			const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
 			const localClickControls = progressiveLocalControlsEnabled();
 			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}:${localClickControls ? 1 : 0}`;
-			const { diffs: fallbackDiffs, summary: editSummary } = getCachedEditOperationSummary(ctx, key, operations);
+			const { diffs: fallbackDiffs } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
 				ctx.state._pk = key;
 				ctx.state._ptAsyncRenderPending = true;
 				if (typeof ctx.state._ptDisplay !== "string" || !ctx.state._ptDisplay.trim()) {
 					ctx.state._ptBody = theme.fg("muted", "(rendering…)");
 					ctx.state._ptFinalCollapse = false;
-					ctx.state._ptDisplay = indentBranchBlock(withBranch(ctx.state._ptBody, theme, false, true));
+					ctx.state._ptDisplay = withBranch(ctx.state._ptBody, theme, false, true);
 				}
 				const lg = lang(fp);
 				const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
@@ -8763,11 +8829,11 @@ export default function (pi: ExtensionAPI) {
 						if (ctx.state._pk !== key) return;
 						const diffs = localizedDiffs?.map((entry) => entry.diff) ?? fallbackDiffs;
 						const lines = localizedDiffs?.map((entry) => entry.line) ?? diffs.map((diff) => getFirstChangedNewLine(diff));
-						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, editSummary, localDetailLevel, totalBudget, localClickControls, pendingViewport);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, localDetailLevel, totalBudget, localClickControls, pendingViewport);
 					})
 					.catch(() => {
 						if (ctx.state._pk !== key) return;
-						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), editSummary, localDetailLevel, totalBudget, localClickControls, pendingViewport);
+						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), localDetailLevel, totalBudget, localClickControls, pendingViewport);
 					});
 			}
 				const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
@@ -8775,7 +8841,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
-				return makeText(ctx.lastComponent, indentBranchBlock(runningPreviewBlock(result, theme.fg("dim", "Editing..."), expanded, theme, ctx)));
+				return makeText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", "Editing..."), expanded, theme, ctx));
 			}
 			clearBlinkTimer(ctx);
 			setToolStatus(ctx, ctx.isError ? "error" : "success");
@@ -8785,20 +8851,24 @@ export default function (pi: ExtensionAPI) {
 						?.filter((c: any) => c.type === "text")
 						.map((c: any) => c.text || "")
 						.join("\n") ?? "Error";
-				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(theme.fg("error", e), theme)));
+				return makeText(ctx.lastComponent, withBranch(theme.fg("error", e), theme));
 			}
-			if ((result as any).details?._type === "editInfo") {
+			const editResultType = (result as any).details?._type;
+			if ((editResultType === "editInfo" || editResultType === "multiEditInfo") && ctx.state?._ptTree) {
+				return makeText(ctx.lastComponent, "");
+			}
+			if (editResultType === "editInfo") {
 				const { editLine, hunks, added, removed } = (result as any).details;
 				const loc = formatLineMeta(editLine ?? 0, theme);
 				const summary = diffSummaryWithMeta(added ?? 0, removed ?? 0, hunks ?? 0, "");
-				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(markResultSummary(`${summary}${loc}`), theme)));
+				return makeText(ctx.lastComponent, withBranch(markResultSummary(`${summary}${loc}`), theme));
 			}
-			if ((result as any).details?._type === "multiEditInfo") {
+			if (editResultType === "multiEditInfo") {
 				const { editCount, diffLineCount, hunks, totalAdded, totalRemoved } = (result as any).details;
 				const summary = diffSummaryWithMeta(totalAdded ?? 0, totalRemoved ?? 0, hunks ?? 0, "");
-				return makeText(ctx.lastComponent, indentBranchBlock(withBranch(markResultSummary(`${editCount} edits ${summary}${typeof diffLineCount === "number" ? ` ${theme.fg("muted", `(${diffLineCount} diff lines)`)}` : ""}`), theme)));
+				return makeText(ctx.lastComponent, withBranch(markResultSummary(`${editCount} edits ${summary}${typeof diffLineCount === "number" ? ` ${theme.fg("muted", `(${diffLineCount} diff lines)`)}` : ""}`), theme));
 			}
-			return makeText(ctx.lastComponent, indentBranchBlock(withBranch(markResultSummary(theme.fg("success", "Applied")), theme)));
+			return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Applied")), theme));
 		},
 	});
 

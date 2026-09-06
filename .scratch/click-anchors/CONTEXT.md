@@ -36,6 +36,30 @@ _Avoid_: First line, top two lines
 A renderer-declared row beneath an execution summary that summarizes status, counts, or a diff without exposing raw payload. It can appear in a standalone tool execution or a tool group. During click expansion, it is a stable expansion anchor: it expands a collapsed execution and collapses an expanded execution.
 _Avoid_: Second line, payload row
 
+**Diff output**:
+The complete rendered diff presentation owned by one tool execution. A Write diff output has one diff block. An Edit or Apply Patch diff output can have one or more diff blocks.
+_Avoid_: Diff message
+
+**Diff block**:
+One contiguous diff presentation for one Write operation, Edit operation, or Apply Patch file change.
+_Avoid_: Hunk, tool block
+
+**Aggregate diff summary row**:
+The one result summary row that reports totals for a diff output, including its edit or file count, added and removed lines, hunk count, and optional diff-line count. It appears before all diff blocks and never repeats per block.
+_Avoid_: Hunk summary, bottom summary
+
+**Block truncation row**:
+A row directly after its diff block that reports omitted rows from that block. It is an action row while another detail layer is available and an inert status row at the hard detail limit.
+_Avoid_: Global truncation row
+
+**Collection remainder row**:
+The terminal action row that reports whole diff blocks omitted from a multi-block diff output. It appears after all rendered diff blocks.
+_Avoid_: More-diff row
+
+**Terminal collapse row**:
+The final nonblank row of a locally expanded diff output. It appears after all summaries, diff blocks, block truncation rows, and separator rows.
+_Avoid_: Footer, bottom anchor
+
 **Action row**:
 A rendered content row that describes an available expansion or detail action, such as `5 lines loaded • click to expand`. A branch connector beside it is structural and is not part of the action row.
 _Avoid_: Hint line, footer
