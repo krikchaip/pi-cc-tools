@@ -7452,7 +7452,7 @@ function runningPreviewBlock(
 	return withProgressivePreviewBranch(preview, theme, indicator?.finalCollapse === true);
 }
 
-function buildPersistentBashPreview(lines: string[], theme: Theme): string {
+function buildPersistentBashPreview(lines: string[], totalLineCount: number, theme: Theme): string {
 	const limit = liveToolPreviewLimit();
 	if (!liveToolPreviewEnabled() || limit <= 0 || lines.length === 0) return "";
 	const start = Math.max(0, lines.length - limit);
@@ -7461,7 +7461,8 @@ function buildPersistentBashPreview(lines: string[], theme: Theme): string {
 		const styled = theme.fg("dim", lines[i]);
 		preview += i === start ? styled : `\n${styled}`;
 	}
-	const earlier = start;
+	const shown = lines.length - start;
+	const earlier = Math.max(0, totalLineCount - shown);
 	if (earlier > 0) {
 		preview = `${theme.fg("muted", `… (${earlier} earlier lines)`)}\n${preview}`;
 	}
@@ -8974,7 +8975,7 @@ export default function (pi: ExtensionAPI) {
 			text += theme.fg("muted", ` (${collected.total} lines)`);
 			if (details?.truncation?.truncated) text += theme.fg("warning", " [truncated]");
 			const persistentPreview = !progressiveLocalControlsEnabled() && shouldPreserveBashPreview(ctx)
-				? buildPersistentBashPreview(collected.lines, theme)
+				? buildPersistentBashPreview(collected.lines, collected.total, theme)
 				: "";
 			if (!expanded && persistentPreview) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}\n${persistentPreview}`, theme));
 			if (!expanded && collected.total > 0) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));
