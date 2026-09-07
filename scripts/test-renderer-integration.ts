@@ -1453,6 +1453,7 @@ await withRendererHarness(
     }
 
     {
+      const shortEditWidth = 180;
       let shortEditRenderRequests = 0;
       const shortEditExecution = new ToolExecutionComponent(
         "edit",
@@ -1470,19 +1471,19 @@ await withRendererHarness(
       shortEditExecution.markExecutionStarted();
       shortEditExecution.setArgsComplete();
       await waitFor(
-        () => shortEditExecution.render(120).some((line: string) => {
+        () => shortEditExecution.render(shortEditWidth).some((line: string) => {
           const text = plain(line);
           return text.includes("+1") && text.includes("-1");
         }),
         "fully visible short Edit preview",
       );
-      const shortEditRows = shortEditExecution.render(120).map((line: string) => plain(line));
+      const shortEditRows = shortEditExecution.render(shortEditWidth).map((line: string) => plain(line));
       const shortEditSummaryRow = shortEditRows.findIndex(
         (line: string) => line.includes("+1") && line.includes("-1"),
       );
       const shortEditSummaryActions = shortEditSummaryRow < 0
         ? []
-        : Array.from({ length: 120 }, (_, x) => shortEditExecution.clickActionAtPoint(x, shortEditSummaryRow))
+        : Array.from({ length: shortEditWidth }, (_, x) => shortEditExecution.clickActionAtPoint(x, shortEditSummaryRow))
           .filter((action) => action !== undefined);
       if (
         shortEditSummaryRow < 0
@@ -1505,13 +1506,13 @@ await withRendererHarness(
       }, false);
       await waitFor(
         () => {
-          const rows = shortEditExecution.render(120).map((line: string) => plain(line));
+          const rows = shortEditExecution.render(shortEditWidth).map((line: string) => plain(line));
           return rows.filter((line: string) => line.includes("+1") && line.includes("-1")).length === 1
             && rows.filter((line: string) => line.includes("1 hunk")).length === 1;
         },
         "complete fully visible short Edit execution",
       );
-      const completeShortEditRows = shortEditExecution.render(120).map((line: string) => plain(line));
+      const completeShortEditRows = shortEditExecution.render(shortEditWidth).map((line: string) => plain(line));
       const completeShortEditTree = shortEditExecution.rendererState?._ptTree;
       const firstShortEditDiffRow = plain(
         completeShortEditTree?.blocks?.[0]?.content?.split("\n")?.[0] ?? "",
@@ -1528,7 +1529,7 @@ await withRendererHarness(
         throw new Error(`single split Edit inserted a physical gap above its diff: ${JSON.stringify(completeShortEditRows)}`);
       }
       const shortEditAnchorPoints = completeShortEditRows.flatMap((_line: string, y: number) => {
-        const x = Array.from({ length: 120 }, (_, candidate) => candidate).find(
+        const x = Array.from({ length: shortEditWidth }, (_, candidate) => candidate).find(
           (candidate) => shortEditExecution.clickAnchorAtPoint(candidate, y) !== undefined,
         );
         return x === undefined ? [] : [{ x, y }];
@@ -1536,7 +1537,7 @@ await withRendererHarness(
       if (shortEditAnchorPoints.length < 1) {
         throw new Error(`complete short Edit did not retain its inert header anchor: ${JSON.stringify(completeShortEditRows)}`);
       }
-      const rowsBeforeNoOpClicks = shortEditExecution.render(120);
+      const rowsBeforeNoOpClicks = shortEditExecution.render(shortEditWidth);
       const renderRequestsBeforeNoOpClicks = shortEditRenderRequests;
       for (const point of shortEditAnchorPoints) {
         const anchor = shortEditExecution.clickAnchorAtPoint(point.x, point.y);
@@ -1548,16 +1549,16 @@ await withRendererHarness(
       if (
         shortEditExecution.expanded === true
         || shortEditRenderRequests !== renderRequestsBeforeNoOpClicks
-        || JSON.stringify(shortEditExecution.render(120)) !== JSON.stringify(rowsBeforeNoOpClicks)
+        || JSON.stringify(shortEditExecution.render(shortEditWidth)) !== JSON.stringify(rowsBeforeNoOpClicks)
       ) {
         throw new Error(`fully visible short Edit repainted after no-op clicks: ${JSON.stringify({ shortEditRenderRequests, renderRequestsBeforeNoOpClicks })}`);
       }
       shortEditExecution.setExpanded(true);
       await waitFor(
-        () => shortEditExecution.render(120).some((line: string) => plain(line).includes("const value = 2;")),
+        () => shortEditExecution.render(shortEditWidth).some((line: string) => plain(line).includes("const value = 2;")),
         "programmatically expanded short Edit preview",
       );
-      const expandedShortEditRows = shortEditExecution.render(120).map((line: string) => plain(line));
+      const expandedShortEditRows = shortEditExecution.render(shortEditWidth).map((line: string) => plain(line));
       if (expandedShortEditRows.some((line: string) => line.includes("click to collapse"))) {
         throw new Error(`fully visible short Edit added a no-op collapse anchor after expansion: ${JSON.stringify(expandedShortEditRows)}`);
       }
@@ -1769,6 +1770,7 @@ await withRendererHarness(
     }
 
     {
+      const editAnchorWidth = 180;
       const splitLines = (prefix: string, editIndex: number) => Array.from(
         { length: 30 },
         (_, lineIndex) => `${prefix} ${editIndex}.${lineIndex}`,
@@ -1792,7 +1794,7 @@ await withRendererHarness(
       editAnchorExecution.markExecutionStarted();
       editAnchorExecution.setArgsComplete();
       await waitFor(
-        () => editAnchorExecution.render(120).some((line: string) => plain(line).includes("more edit block")),
+        () => editAnchorExecution.render(editAnchorWidth).some((line: string) => plain(line).includes("more edit block")),
         "collapsed multi-Edit preview",
       );
       editAnchorExecution.updateResult({
@@ -1809,11 +1811,11 @@ await withRendererHarness(
       }, false);
       await waitFor(
         () => editAnchorExecution.rendererState?._ptAsyncRenderPending !== true
-          && editAnchorExecution.render(120).some((line: string) => plain(line).includes("more edit block")),
+          && editAnchorExecution.render(editAnchorWidth).some((line: string) => plain(line).includes("more edit block")),
         "settled collapsed multi-Edit preview",
       );
 
-      const collapsedEditRows = editAnchorExecution.render(120).map((line: string) => plain(line));
+      const collapsedEditRows = editAnchorExecution.render(editAnchorWidth).map((line: string) => plain(line));
       const collapsedEditContentRows = collapsedEditRows.filter((line: string) => line.trim().length > 0);
       const collapsedHunkRows = collapsedEditContentRows.filter((line: string) => line.includes("hunks"));
       const collapsedHunkRow = collapsedEditContentRows.findIndex((line: string) => line.includes("hunks"));
@@ -1835,7 +1837,7 @@ await withRendererHarness(
       const editSummaryRow = collapsedEditRows.findIndex((line: string) => line.includes("4 edits +"));
       const editSummaryX = editSummaryRow < 0
         ? -1
-        : Array.from({ length: 120 }, (_, x) => x).find(
+        : Array.from({ length: editAnchorWidth }, (_, x) => x).find(
           (x) => editAnchorExecution.clickActionAtPoint(x, editSummaryRow) === "expand",
         ) ?? -1;
       if (
@@ -1850,10 +1852,10 @@ await withRendererHarness(
 
       const collapseText = "Output ends here • click to collapse";
       await waitFor(
-        () => editAnchorExecution.render(120).some((line: string) => plain(line).includes(collapseText)),
+        () => editAnchorExecution.render(editAnchorWidth).some((line: string) => plain(line).includes(collapseText)),
         "expanded multi-Edit bottom collapse anchor",
       );
-      const expandedEditRows = editAnchorExecution.render(120).map((line: string) => plain(line));
+      const expandedEditRows = editAnchorExecution.render(editAnchorWidth).map((line: string) => plain(line));
       const expandedEditContentRows = expandedEditRows.filter((line: string) => line.trim().length > 0);
       const expandedHunkRows = expandedEditContentRows.filter((line: string) => line.includes("hunks"));
       const expandedBlockHeadings = expandedEditContentRows.filter((line: string) => /Edit \d\/4/.test(line));
