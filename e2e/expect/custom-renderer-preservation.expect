@@ -1,0 +1,79 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for preserving an existing custom tool renderer.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "custom-renderer-preservation.ts"]
+set assert_path [file join $expect_dir "custom-renderer-preservation-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-custom-renderer-preservation-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 72
+set rows 32
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"groupToolCalls":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc stop_pi {} {
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  catch {log_file}
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+
+cd $cwd
+set frame_path [file join $scratch "frame.ansi"]
+log_file -noappend $frame_path
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path -e $fixture_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {RESULT_WRAP_END}]} {
+  puts stderr "custom renderer fixture did not become ready with complete wrapped output"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+after 100
+log_file
+
+if {[catch {exec python3 $assert_path $frame_path} assertion]} {
+  puts stderr $assertion
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+puts $assertion
+
+stop_pi
+file delete -force $scratch
+puts "PASS custom renderer preservation fullscreen E2E"

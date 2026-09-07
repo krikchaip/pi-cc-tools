@@ -373,12 +373,10 @@ def token_position(frame: list[str], token: str, label: str) -> tuple[int, int]:
     return -1, -1
 
 
-mixed, _ = token_position(level1, "STANDALONE_INDENT_MIXED", "level 1 mixed-indent row")
-if mixed >= 0 and level1[mixed + 1].strip():
-    failures.append(f"level 1 indented blank row changed payload geometry: {level1[mixed + 1]!r}")
-level2_mixed, _ = token_position(level2, "STANDALONE_INDENT_MIXED", "level 2 mixed-indent row")
-if level2_mixed >= 0 and level2[level2_mixed + 1].strip() != "│":
-    failures.append(f"level 2 indented blank row changed payload geometry: {level2[level2_mixed + 1]!r}")
+for layer, frame in (("level 1", level1), ("level 2", level2)):
+    mixed, _ = token_position(frame, "STANDALONE_INDENT_MIXED", f"{layer} mixed-indent row")
+    if mixed >= 0 and frame[mixed + 1].strip() != "│":
+        failures.append(f"{layer} indented blank row changed payload geometry: {frame[mixed + 1]!r}")
 
 _, ansi_column = token_position(level1, "INDENT_ANSI_L1", "level 1 ANSI line")
 _, level2_ansi_column = token_position(level2, "INDENT_ANSI_L1", "level 2 ANSI line")

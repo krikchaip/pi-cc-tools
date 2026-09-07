@@ -2,6 +2,7 @@
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+PI_BIN=${PI_BIN:-$(command -v pi)}
 SCRATCH="/tmp/pi-cc-reload-markdown-e2e-$$"
 SOCKET="pi-cc-reload-markdown-$$"
 SESSION_NAME="reload-markdown"
@@ -99,7 +100,7 @@ tmux -L "$SOCKET" kill-server 2>/dev/null || true
 tmux -L "$SOCKET" -f /dev/null new-session -d -s "$SESSION_NAME" -x 100 -y 32 /bin/bash
 tmux -L "$SOCKET" set-option -g extended-keys on
 tmux -L "$SOCKET" send-keys -t "$SESSION_NAME" -l \
-  "cd '$CWD' && env HOME='$HOME_DIR' TERM=xterm-256color COLORTERM=truecolor COLUMNS=100 LINES=32 PI_OFFLINE=1 PI_CODING_AGENT_DIR='$AGENT_DIR' pi --session '$SESSION_FILE' --tui-mode fullscreen --no-context-files --no-prompt-templates --no-themes --no-skills"
+  "cd '$CWD' && env HOME='$HOME_DIR' TERM=xterm-256color COLORTERM=truecolor COLUMNS=100 LINES=32 PI_OFFLINE=1 PI_CODING_AGENT_DIR='$AGENT_DIR' '$PI_BIN' --session '$SESSION_FILE' --tui-mode fullscreen --no-context-files --no-prompt-templates --no-themes --no-skills"
 tmux -L "$SOCKET" send-keys -t "$SESSION_NAME" Enter
 
 capture_plain() {

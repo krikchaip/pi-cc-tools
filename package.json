@@ -44,6 +44,7 @@
     "test:mcp-renderer": "bun scripts/test-mcp-renderer.ts",
     "test:renderer-integration": "bun scripts/test-renderer-integration.ts",
     "test:renderers": "npm run test:mcp-renderer && npm run test:renderer-integration",
+    "test:e2e": "npm run test:e2e:click && bash e2e/tmux/reload-markdown.sh && bash e2e/tmux/markdown-layout-delegation.sh",
     "test:e2e:click": "bun scripts/test-click-e2e.ts",
     "test:shell-settings": "bun scripts/test-shell-settings.ts",
     "pack:dry-run": "npm pack --dry-run",
