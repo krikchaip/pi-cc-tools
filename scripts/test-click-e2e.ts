@@ -17,13 +17,16 @@ const expectFiles = [
   "e2e/expect/grouped-output-indentation.expect",
   "e2e/expect/expanded-output-indentation.expect",
   "e2e/expect/standalone-bash-output-shape.expect",
+  "e2e/expect/preserved-bash-completion.expect",
   "e2e/expect/read-skill-output-shape.expect",
   "e2e/expect/async-diff-click.expect",
   "e2e/expect/edit-line-numbers.expect",
   "e2e/expect/single-edit-gap.expect",
   "e2e/expect/reload-click-anchors.expect",
+  "e2e/expect/reload-tool-background.expect",
   "e2e/expect/standalone-skill-anchor.expect",
   "e2e/expect/custom-renderer-preservation.expect",
+  "e2e/expect/historical-status-reconstruction.expect",
 ];
 
 function isExecutable(path: string): boolean {

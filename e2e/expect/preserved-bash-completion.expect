@@ -1,0 +1,119 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for preserved Bash preview completion.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set provider_path [file join $repo_dir "e2e" "fixtures" "preserved-bash-completion-provider.ts"]
+set assert_path [file join $expect_dir "preserved-bash-completion-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-preserved-bash-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":false,"groupToolCalls":false,"liveToolPreview":true,"liveToolPreviewLines":3}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      "install missing project packages" { puts stderr "unexpected package prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  return 1
+}
+
+proc stop_pi {} {
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+set partial_path [file join $scratch "partial.ansi"]
+log_user 0
+log_file -a -noappend $partial_path
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills --approve \
+  -e $extension_path -e $provider_path --provider preserved-bash-completion-e2e --model deterministic-bash --api-key e2e-local \
+  --tui-mode fullscreen "Run the deterministic Bash fixture."
+stty columns $columns rows $rows
+
+if {![wait_for 12 {BASH_PRESERVED_03}]} {
+  log_user 1
+  puts stderr "Bash fixture did not expose partial output"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+
+if {![wait_for 12 {Done.*8 lines}]} {
+  log_user 1
+  puts stderr "Bash fixture did not reach its preserved completed state"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+set final_path [file join $scratch "final.ansi"]
+log_file -a -noappend $final_path
+if {![force_fullscreen_repaint $columns $rows]} {
+  log_user 1
+  puts stderr "could not capture preserved completed Bash frame"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+
+if {![wait_for 10 {E2E_BASH_PRESERVED_COMPLETE}]} {
+  log_user 1
+  puts stderr "deterministic provider did not close after the preserved-preview window"
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+log_user 1
+
+if {[catch {exec python3 $assert_path $scratch} assertion]} {
+  puts stderr $assertion
+  stop_pi
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+puts $assertion
+stop_pi
+file delete -force $scratch
+puts "PASS preserved Bash completion fullscreen E2E"
