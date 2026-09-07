@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
   assertCollapsedIndicator,
   assertExpandedIndicator,
@@ -1556,6 +1560,111 @@ await withRendererHarness(
       const expandedShortEditRows = shortEditExecution.render(120).map((line: string) => plain(line));
       if (expandedShortEditRows.some((line: string) => line.includes("click to collapse"))) {
         throw new Error(`fully visible short Edit added a no-op collapse anchor after expansion: ${JSON.stringify(expandedShortEditRows)}`);
+      }
+    }
+
+    {
+      const postEditDir = mkdtempSync(join(tmpdir(), "pi-cc-tools-post-edit-lines-"));
+      try {
+        const sourceLines = Array.from({ length: 420 }, (_, index) => `ORIGINAL_${index + 1}`);
+        const operation = (prefix: string, start: number, end: number) => ({
+          oldText: Array.from({ length: end - start + 1 }, (_, index) => `ORIGINAL_${start + index}`).join("\n"),
+          newText: Array.from({ length: end - start + 1 }, (_, index) => `${prefix}_${start + index}`).join("\n"),
+        });
+        const operations = [operation("MULTI_A", 101, 140), operation("MULTI_B", 351, 390)];
+        for (const { prefix, start, end } of [
+          { prefix: "MULTI_A", start: 101, end: 140 },
+          { prefix: "MULTI_B", start: 351, end: 390 },
+        ]) {
+          for (let line = start; line <= end; line++) sourceLines[line - 1] = `${prefix}_${line}`;
+        }
+        const postEditPath = join(postEditDir, "post-edit-lines.txt");
+        writeFileSync(postEditPath, `${sourceLines.join("\n")}\n`);
+        const postEditExecution = new ToolExecutionComponent(
+          "edit",
+          "post_edit_line_number_fixture",
+          { path: postEditPath, edits: operations },
+          {},
+          edit,
+          { mode: "fullscreen", requestRender() {} } as any,
+          process.cwd(),
+        ) as any;
+        postEditExecution.markExecutionStarted();
+        postEditExecution.setArgsComplete();
+        await waitFor(
+          () => {
+            postEditExecution.render(180);
+            return postEditExecution.rendererState?._ptAsyncRenderPending !== true
+              && postEditExecution.rendererState?._ptTree?.blocks?.length === 2;
+          },
+          "post-write multi-Edit localization",
+        );
+        const tree = postEditExecution.rendererState?._ptTree;
+        const expectedBlocks = [
+          { token: "MULTI_A_101", line: 101 },
+          { token: "MULTI_B_351", line: 351 },
+        ];
+        for (const [index, expected] of expectedBlocks.entries()) {
+          const heading = plain(tree.blocks[index]?.heading ?? "");
+          const contentRows = plain(tree.blocks[index]?.content ?? "").split("\n");
+          const row = contentRows.find((line: string) => line.includes(expected.token)) ?? "";
+          if (
+            !heading.includes(`at line ${expected.line}`)
+            || !new RegExp(`\\b${expected.line}\\+`).test(row)
+          ) {
+            throw new Error(`post-write multi-Edit lost source line ${expected.line}: ${JSON.stringify({ heading, row })}`);
+          }
+        }
+
+        const retainedLines = Array.from({ length: 140 }, (_, index) => `RETAINED_${index + 1}`);
+        const retainedOperations = [
+          {
+            oldText: "RETAINED_27",
+            newText: ["RETAINED_27", "FIRST_INSERT_1", "FIRST_INSERT_2", "FIRST_INSERT_3", "FIRST_INSERT_4", "FIRST_INSERT_5"].join("\n"),
+          },
+          {
+            oldText: "RETAINED_83",
+            newText: ["RETAINED_83", "SECOND_INSERT_1", "SECOND_INSERT_2", "SECOND_INSERT_3", "SECOND_INSERT_4", "SECOND_INSERT_5", "SECOND_INSERT_6"].join("\n"),
+          },
+        ];
+        for (const operation of [...retainedOperations].reverse()) {
+          const index = retainedLines.indexOf(operation.oldText);
+          retainedLines.splice(index, 1, ...operation.newText.split("\n"));
+        }
+        const retainedPath = join(postEditDir, "retained-prefix-lines.txt");
+        writeFileSync(retainedPath, `${retainedLines.join("\n")}\n`);
+        const retainedExecution = new ToolExecutionComponent(
+          "edit",
+          "post_edit_retained_prefix_fixture",
+          { path: retainedPath, edits: retainedOperations },
+          {},
+          edit,
+          { mode: "fullscreen", requestRender() {} } as any,
+          process.cwd(),
+        ) as any;
+        retainedExecution.markExecutionStarted();
+        retainedExecution.setArgsComplete();
+        await waitFor(
+          () => {
+            retainedExecution.render(180);
+            return retainedExecution.rendererState?._ptAsyncRenderPending !== true
+              && retainedExecution.rendererState?._ptTree?.blocks?.length === 2;
+          },
+          "post-write retained-prefix multi-Edit localization",
+        );
+        const retainedTree = retainedExecution.rendererState?._ptTree;
+        const secondHeading = plain(retainedTree.blocks[1]?.heading ?? "");
+        const secondRows = plain(retainedTree.blocks[1]?.content ?? "").split("\n");
+        const secondAnchorRow = secondRows.find((line: string) => line.includes("RETAINED_83")) ?? "";
+        if (
+          !secondHeading.includes("at line 88")
+          || !/\b83-/.test(secondAnchorRow)
+          || !/\b88\+/.test(secondAnchorRow)
+        ) {
+          throw new Error(`retained-prefix multi-Edit shifted block 2 twice: ${JSON.stringify({ secondHeading, secondAnchorRow })}`);
+        }
+      } finally {
+        rmSync(postEditDir, { recursive: true, force: true });
       }
     }
 

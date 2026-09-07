@@ -6826,41 +6826,77 @@ interface LocalizedEditDiff {
 	line: number;
 }
 
+interface LocalizedEditDiffCache {
+	sourceKey: string;
+	localizedDiffs: LocalizedEditDiff[];
+}
+
 async function computeLocalizedEditDiffs(filePath: string, operations: Array<{ oldText: string; newText: string }>, cwd: string): Promise<LocalizedEditDiff[] | null> {
 	if (!filePath || operations.length === 0) return null;
 	try {
 		const rawContent = await readFileAsync(resolve(cwd, filePath), "utf8");
 		const normalizedContent = normalizeToLf(stripBomText(rawContent));
 		const normalizedOps = operations.map((edit) => ({ oldText: normalizeToLf(edit.oldText), newText: normalizeToLf(edit.newText) }));
-		const baseContent = normalizedOps.some((edit) => findEditMatch(normalizedContent, edit.oldText).usedFuzzyMatch)
-			? normalizeTextForFuzzyMatch(normalizedContent)
-			: normalizedContent;
-		const matches = normalizedOps.map((edit, editIndex) => {
-			const match = findEditMatch(baseContent, edit.oldText);
-			if (!match.found || countFuzzyOccurrences(baseContent, edit.oldText) !== 1) return null;
-			return { editIndex, matchIndex: match.index, matchLength: match.matchLength, newText: edit.newText };
-		});
-		if (matches.some((match) => match === null)) return null;
-		const ordered = [...(matches as Array<{ editIndex: number; matchIndex: number; matchLength: number; newText: string }>)].sort((a, b) => a.matchIndex - b.matchIndex);
-		for (let i = 1; i < ordered.length; i++) {
-			const prev = ordered[i - 1];
-			const current = ordered[i];
-			if (prev.matchIndex + prev.matchLength > current.matchIndex) return null;
-		}
-		const localized: Array<LocalizedEditDiff | null> = Array(operations.length).fill(null);
-		let lineDelta = 0;
-		for (const match of ordered) {
-			const oldChunk = baseContent.slice(match.matchIndex, match.matchIndex + match.matchLength);
-			const oldStartLine = lineNumberAtIndex(baseContent, match.matchIndex);
-			const newStartLine = oldStartLine + lineDelta;
-			const diff = offsetParsedDiff(parseDiff(oldChunk, match.newText), oldStartLine - 1, newStartLine - 1);
-			localized[match.editIndex] = { diff, line: getFirstChangedNewLine(diff) };
-			lineDelta += countLineBreaks(match.newText) - countLineBreaks(oldChunk);
-		}
-		return localized.every(Boolean) ? (localized as LocalizedEditDiff[]) : null;
+		const localize = (state: "before" | "after"): LocalizedEditDiff[] | null => {
+			const chunks = normalizedOps.map((edit) => state === "before" ? edit.oldText : edit.newText);
+			if (chunks.some((chunk) => chunk.length === 0)) return null;
+			const baseContent = chunks.some((chunk) => findEditMatch(normalizedContent, chunk).usedFuzzyMatch)
+				? normalizeTextForFuzzyMatch(normalizedContent)
+				: normalizedContent;
+			const matches = chunks.map((chunk, editIndex) => {
+				const match = findEditMatch(baseContent, chunk);
+				if (!match.found || countFuzzyOccurrences(baseContent, chunk) !== 1) return null;
+				return { editIndex, matchIndex: match.index, matchLength: match.matchLength };
+			});
+			if (matches.some((match) => match === null)) return null;
+			const ordered = [...(matches as Array<{ editIndex: number; matchIndex: number; matchLength: number }>)].sort((a, b) => a.matchIndex - b.matchIndex);
+			for (let i = 1; i < ordered.length; i++) {
+				const prev = ordered[i - 1];
+				const current = ordered[i];
+				if (prev.matchIndex + prev.matchLength > current.matchIndex) return null;
+			}
+			const localized: Array<LocalizedEditDiff | null> = Array(operations.length).fill(null);
+			let lineDelta = 0;
+			for (const match of ordered) {
+				const operation = normalizedOps[match.editIndex];
+				const matchedChunk = baseContent.slice(match.matchIndex, match.matchIndex + match.matchLength);
+				const oldChunk = state === "before" ? matchedChunk : operation.oldText;
+				const newChunk = state === "before" ? operation.newText : matchedChunk;
+				const matchedStartLine = lineNumberAtIndex(baseContent, match.matchIndex);
+				const oldStartLine = state === "before" ? matchedStartLine : matchedStartLine - lineDelta;
+				const newStartLine = state === "before" ? matchedStartLine + lineDelta : matchedStartLine;
+				const diff = offsetParsedDiff(parseDiff(oldChunk, newChunk), oldStartLine - 1, newStartLine - 1);
+				localized[match.editIndex] = { diff, line: getFirstChangedNewLine(diff) };
+				lineDelta += countLineBreaks(newChunk) - countLineBreaks(oldChunk);
+			}
+			return localized.every(Boolean) ? (localized as LocalizedEditDiff[]) : null;
+		};
+		const before = localize("before");
+		const after = localize("after");
+		if (!before) return after;
+		if (!after) return before;
+		const beforeMatchLength = normalizedOps.reduce((total, edit) => total + edit.oldText.length, 0);
+		const afterMatchLength = normalizedOps.reduce((total, edit) => total + edit.newText.length, 0);
+		return afterMatchLength > beforeMatchLength ? after : before;
 	} catch {
 		return null;
 	}
+}
+
+async function getCachedLocalizedEditDiffs(
+	ctx: any,
+	sourceKey: string,
+	filePath: string,
+	operations: Array<{ oldText: string; newText: string }>,
+	cwd: string,
+): Promise<LocalizedEditDiff[] | null> {
+	const cached = ctx.state?._ptLocalizedDiffCache as LocalizedEditDiffCache | undefined;
+	if (cached?.sourceKey === sourceKey) return cached.localizedDiffs;
+	const localizedDiffs = await computeLocalizedEditDiffs(filePath, operations, cwd);
+	if (localizedDiffs && ctx.state) {
+		ctx.state._ptLocalizedDiffCache = { sourceKey, localizedDiffs } satisfies LocalizedEditDiffCache;
+	}
+	return localizedDiffs;
 }
 
 function renderEditPreviewBody(
@@ -9305,7 +9341,9 @@ export default function (pi: ExtensionAPI) {
 			const normalBudget = operations.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
 			const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
 			const localClickControls = progressiveLocalControlsEnabled();
-			const key = `edit:${fp}:${hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"))}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}:${localClickControls ? 1 : 0}`;
+			const operationHash = hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"));
+			const sourceKey = `edit:${fp}:${operationHash}`;
+			const key = `${sourceKey}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}:${localClickControls ? 1 : 0}`;
 			const { diffs: fallbackDiffs } = getCachedEditOperationSummary(ctx, key, operations);
 			if (ctx.state._pk !== key) {
 				ctx.state._pk = key;
@@ -9317,7 +9355,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				const lg = lang(fp);
 				const pendingViewport = claimPendingToolCollapseViewport(ctx.state);
-				void computeLocalizedEditDiffs(fp, operations, cwd)
+				void getCachedLocalizedEditDiffs(ctx, sourceKey, fp, operations, cwd)
 					.then((localizedDiffs) => {
 						if (ctx.state._pk !== key) return;
 						const diffs = localizedDiffs?.map((entry) => entry.diff) ?? fallbackDiffs;

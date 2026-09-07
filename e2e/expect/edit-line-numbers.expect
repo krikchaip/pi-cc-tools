@@ -1,0 +1,168 @@
+#!/usr/bin/expect -f
+# Known-red real-Pi fullscreen reproduction for Edit line-number drift after expansion.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set provider_path [file join $repo_dir "e2e" "fixtures" "edit-line-number-provider.ts"]
+set assert_path [file join $expect_dir "edit-line-numbers-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-edit-line-numbers-[pid]"
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 180
+set rows 80
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"expandedPreviewMaxLines":100,"extraExpandedPreviewMaxLines":200,"groupToolCalls":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+    set settings [open $path "w"]
+    puts $settings $settings_json
+    close $settings
+}
+
+proc wait_for {seconds pattern} {
+    global spawn_id
+    set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+    while {[clock milliseconds] < $deadline} {
+        expect {
+            "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+            "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+            "install missing project packages" { return 0 }
+            -re $pattern { return 1 }
+            timeout {}
+            eof { return 0 }
+        }
+    }
+    return 0
+}
+
+proc drain_repaint {} {
+    wait_for 1 {__PI_CC_TOOLS_EDIT_LINE_DRAIN__}
+}
+
+proc force_fullscreen_repaint {columns rows} {
+    global spawn_id
+    set pi_pid [exp_pid]
+    if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+    catch {exec kill -WINCH $pi_pid}
+    drain_repaint
+    if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+    catch {exec kill -WINCH $pi_pid}
+    drain_repaint
+    return 1
+}
+
+proc capture {path columns rows} {
+    log_file
+    log_file -a -noappend $path
+    if {![force_fullscreen_repaint $columns $rows]} { return 0 }
+    log_file
+    return 1
+}
+
+proc capture_expanded_pages {path columns rows} {
+    log_file
+    log_file -a -noappend $path
+    if {![force_fullscreen_repaint $columns $rows]} { return 0 }
+    for {set page 0} {$page < 2} {incr page} {
+        send -- "\033\[6~"
+        drain_repaint
+        if {![force_fullscreen_repaint $columns $rows]} { return 0 }
+    }
+    log_file
+    return 1
+}
+
+proc locate {assert_path path pattern} {
+    if {[catch {exec python3 $assert_path locate $path $pattern} result]} { return {} }
+    return $result
+}
+
+proc click {x y} {
+    send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+}
+
+proc write_source {path} {
+    set target [open $path "w"]
+    for {set line 1} {$line <= 420} {incr line} {
+        puts $target [format "ORIGINAL_%03d" $line]
+    }
+    close $target
+}
+
+proc run_case {case model summary scratch home agent rows columns pi_bin extension_path provider_path assert_path} {
+    global spawn_id
+    set cwd [file join $scratch $case]
+    file mkdir $cwd
+    write_source [file join $cwd "edit-line-numbers.txt"]
+
+    cd $cwd
+    log_user 0
+    log_file -a -noappend [file join $scratch "${case}-startup.ansi"]
+    spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+        $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills --approve \
+        -e $extension_path -e $provider_path --provider edit-line-number-e2e --model $model --api-key e2e-local \
+        --tui-mode fullscreen "Run the deterministic $case Edit."
+    stty columns $columns rows $rows
+
+    if {![wait_for 12 {E2E_EDIT_LINE_NUMBERS_COMPLETE}]} {
+        send "\003\003"
+        catch {close}
+        catch {wait}
+        log_file
+        log_user 1
+        puts stderr "$case fixture did not reach deterministic completion"
+        return 0
+    }
+    after 750
+
+    set collapsed [file join $scratch "${case}-collapsed.ansi"]
+    if {![capture $collapsed $columns $rows]} { return 0 }
+
+    set point {}
+    set summary_capture [file join $scratch "${case}-summary-search.ansi"]
+    for {set page 0} {$page < 4 && [llength $point] != 2} {incr page} {
+        if {![capture $summary_capture $columns $rows]} { return 0 }
+        set point [locate $assert_path $summary_capture $summary]
+        if {[llength $point] != 2} {
+            send -- "\033\[5~"
+            drain_repaint
+        }
+    }
+    if {[llength $point] != 2} {
+        puts stderr "$case fixture could not locate Edit aggregate summary: $summary"
+        return 0
+    }
+    lassign $point x y
+    click $x $y
+    wait_for 3 {click to collapse|more diff lines}
+    after 500
+
+    set expanded [file join $scratch "${case}-expanded.ansi"]
+    if {![capture_expanded_pages $expanded $columns $rows]} { return 0 }
+
+    send "\003\003"
+    catch {close}
+    catch {wait}
+    log_file
+    log_user 1
+    return 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+if {![run_case "single" "single-edit-lines" "+36 -36" $scratch $home $agent $rows $columns $pi_bin $extension_path $provider_path $assert_path]} {
+    puts "ARTIFACTS $scratch"
+    exit 2
+}
+if {![run_case "multiple" "multi-edit-lines" "4 edits +26 -4" $scratch $home $agent $rows $columns $pi_bin $extension_path $provider_path $assert_path]} {
+    puts "ARTIFACTS $scratch"
+    exit 2
+}
+
+set assertion_status [catch {exec python3 $assert_path $scratch} assertion_output]
+puts $assertion_output
+puts "ARTIFACTS $scratch"
+exit $assertion_status
