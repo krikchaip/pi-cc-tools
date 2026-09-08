@@ -102,7 +102,7 @@ const CLICK_CONTROL_BREAK_MARK = "\uE104";
 const RESULT_SUMMARY_WRAP_MARK = "\uE105";
 const LEGACY_WRAP_MARK = "\uE000";
 const CLIP_MARK = "\uE001";
-const TRAILING_MARK = "  · ";
+const TRAILING_MARK = "\uE106";
 const KITTY_IMAGE_PREFIX = "\x1b_G";
 const ITERM2_IMAGE_PREFIX = "\x1b]1337;File=";
 
@@ -873,14 +873,13 @@ function alignTrailingMarkedLine(line: string, width: number): string {
 	const markerIndex = line.indexOf(TRAILING_MARK);
 	if (markerIndex === -1) return clampLineWidth(line, width);
 	const safeWidth = Math.max(1, width);
-	const left = line.slice(0, markerIndex);
-	const right = line.slice(markerIndex + TRAILING_MARK.length);
+	const left = stripWrapMarks(line.slice(0, markerIndex));
+	const right = stripWrapMarks(line.slice(markerIndex + TRAILING_MARK.length));
 	const rightWidth = visibleWidth(right);
 	if (rightWidth >= safeWidth) return truncateToWidth(right, safeWidth, "", false);
-	const leftBudget = Math.max(0, safeWidth - rightWidth - 2);
+	const leftBudget = Math.max(0, safeWidth - rightWidth);
 	const clippedLeft = leftBudget > 0 ? truncateToWidth(left, leftBudget, "…", false) : "";
-	const gap = Math.max(1, safeWidth - visibleWidth(clippedLeft) - rightWidth);
-	return `${clippedLeft}${" ".repeat(gap)}${right}`;
+	return `${clippedLeft}${right}`;
 }
 
 function getCompactToolLine(tool: any, width: number, groupedLabel?: string, showTrailing = true): string {
@@ -4148,7 +4147,7 @@ function bashHeaderTrailing(ctx: any, theme: Theme): string {
 		const endedAt = ctx?.state?.[BASH_ENDED_AT_KEY];
 		parts.push(formatBashDuration((typeof endedAt === "number" ? endedAt : Date.now()) - startedAt));
 	}
-	return parts.length > 0 ? `${TRAILING_MARK}${theme.fg("muted", parts.join(" · "))}` : "";
+	return parts.length > 0 ? `${TRAILING_MARK}${theme.fg("muted", ` · ${parts.join(" · ")}`)}` : "";
 }
 
 function setToolStatus(ctx: any, status: "pending" | "success" | "error" | "idle"): void {
@@ -4782,11 +4781,11 @@ function expandToolLineTabs(line: string): string {
 }
 
 function wrapMarkedLine(line: string, width: number): string[] {
+	if (line.includes(TRAILING_MARK)) return [alignTrailingMarkedLine(line, width)];
 	const clipIndex = line.indexOf(CLIP_MARK);
 	if (clipIndex !== -1) {
 		const prefix = stripWrapMarks(line.slice(0, clipIndex));
 		const body = stripWrapMarks(line.slice(clipIndex + CLIP_MARK.length));
-		if (body.includes(TRAILING_MARK)) return [alignTrailingMarkedLine(`${prefix}${body}`, width)];
 		const bodyWidth = Math.max(1, width - visibleWidth(prefix));
 		if (visibleWidth(body) <= bodyWidth) return [`${prefix}${body}`];
 		const hint = "…";
@@ -5100,7 +5099,10 @@ function renderBashCommandBlock(
 	if (expanded && presentation.sourceLines.length > sourceLimit) {
 		lines.push(`... ${presentation.sourceLines.length - sourceLimit} more command lines`);
 	}
-	const body = lines.map((line) => theme.fg("accent", line || " ")).join("\n");
+	const visibleSourceLineCount = expanded ? Math.min(presentation.sourceLines.length, sourceLimit) : 0;
+	const body = lines.map((line, index) => (
+		`${index < visibleSourceLineCount ? HEADER_WRAP_MARK : ""}${theme.fg("accent", line || " ")}`
+	)).join("\n");
 	return expanded ? withBranch(body, theme, false, true) : withClippedBranch(body, theme, true);
 }
 
@@ -8929,7 +8931,7 @@ export default function (pi: ExtensionAPI) {
 			const summary = stableCallSummary(ctx, "_bashHeadline", () => presentation.headline);
 			const rtkBadge = rewrite ? theme.fg("muted", " (RTK)") : "";
 			const status = ctx?.state?._toolStatus;
-			const showCommand = ctx.argsComplete === true && (status === "pending" || status === "error" || ctx.expanded === true);
+			const showCommand = shouldRevealCallArgs(ctx) && (status === "pending" || status === "error" || ctx.expanded === true);
 			const commandBlock = showCommand ? renderBashCommandBlock(command, ctx.expanded === true, theme) : "";
 			const headerSummary = ctx.expanded === true && commandBlock ? describeBashSource(presentation) : summary;
 			const header = toolHeader(

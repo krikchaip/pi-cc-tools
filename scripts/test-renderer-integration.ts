@@ -186,7 +186,7 @@ await withRendererHarness(
     }
 
     const bash = fakePi.tools.get("bash");
-    if (typeof bash?.renderResult !== "function") throw new Error("Bash renderer was not registered");
+    if (typeof bash?.renderCall !== "function" || typeof bash?.renderResult !== "function") throw new Error("Bash renderer was not registered");
     const bashContext = {
       state: {},
       isError: false,
@@ -203,6 +203,25 @@ await withRendererHarness(
       bashContext,
     ).render(120).join("\n");
     assertCollapsedIndicator(bashRaw, "earlier lines", true);
+
+    const streamingTimerRows = bash.renderCall(
+      { command: "echo STREAMING_TIMER_INLINE" },
+      theme,
+      {
+        state: { _toolStatus: "pending", _bashStartedAtMs: Date.now() },
+        isError: false,
+        lastComponent: undefined,
+        args: { command: "echo STREAMING_TIMER_INLINE" },
+        argsComplete: true,
+        cwd: process.cwd(),
+        expanded: false,
+        executionStarted: true,
+      } as any,
+    ).render(100).map((line: string) => plain(line));
+    const streamingTimerRow = streamingTimerRows.find((line: string) => line.includes("STREAMING_TIMER_INLINE"));
+    if (!streamingTimerRow?.includes("echo STREAMING_TIMER_INLINE · <1s")) {
+      throw new Error(`streaming Bash timer was not placed directly after the command with one leading space: ${JSON.stringify(streamingTimerRows)}`);
+    }
 
     const groupedIndentPrefixes = ["", "  ", "    ", "       ", "\t", " \t  "];
     const cappedOutput = Array.from({ length: 20 }, (_, index) => {
@@ -280,6 +299,48 @@ await withRendererHarness(
     }
 
     await emitLifecycle("agent_start");
+
+    const bashCommandExecution = new ToolExecutionComponent(
+      "bash",
+      "standalone_bash_command_click_fixture",
+      { command: "echo STANDALONE_COMMAND_SOURCE\necho STANDALONE_COMMAND_CONTINUATION" },
+      {},
+      bash,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    bashCommandExecution.markExecutionStarted();
+    bashCommandExecution.setArgsComplete();
+    bashCommandExecution.updateResult({
+      content: [{
+        type: "text",
+        text: Array.from({ length: 10 }, (_, index) => `standalone Bash result ${index + 1}`).join("\n"),
+      }],
+      isError: false,
+    }, false);
+    const compactBashCommandRows = bashCommandExecution.render(120).map((line: string) => plain(line));
+    const compactBashSummaryRow = compactBashCommandRows.findIndex((line: string) => line.includes("Done (10 lines)"));
+    const compactBashSummaryX = compactBashSummaryRow < 0
+      ? -1
+      : Array.from({ length: 120 }, (_, x) => x)
+        .find((x) => bashCommandExecution.clickActionAtPoint(x, compactBashSummaryRow) === "expand") ?? -1;
+    if (compactBashSummaryX < 0 || !bashCommandExecution.activateClickAction("expand", "top")) {
+      throw new Error(`standalone Bash setup did not expand through its result summary: ${JSON.stringify(compactBashCommandRows)}`);
+    }
+    const bashCommandRows = bashCommandExecution.render(120).map((line: string) => plain(line));
+    const bashCommandRow = bashCommandRows.findIndex((line: string) => line.includes("echo STANDALONE_COMMAND_SOURCE"));
+    const bashCommandStart = bashCommandRow < 0 ? -1 : bashCommandRows[bashCommandRow].indexOf("echo STANDALONE_COMMAND_SOURCE");
+    const bashCommandEnd = bashCommandStart < 0 ? -1 : bashCommandStart + "echo STANDALONE_COMMAND_SOURCE".length;
+    if (
+      bashCommandRow < 0
+      || bashCommandStart < 0
+      || !Array.from({ length: bashCommandEnd - bashCommandStart }, (_, offset) => bashCommandStart + offset)
+        .every((x) => bashCommandExecution.clickActionAtPoint(x, bashCommandRow) === "header")
+      || !bashCommandExecution.activateClickAction("header", "top")
+      || bashCommandExecution.render(120).some((line: string) => plain(line).includes("STANDALONE_COMMAND_CONTINUATION"))
+    ) {
+      throw new Error(`expanded standalone Bash command text did not bind a collapse action: ${JSON.stringify({ bashCommandRows, bashCommandRow, bashCommandStart, bashCommandEnd })}`);
+    }
 
     const readDefinition = fakePi.tools.get("read");
     const skillReadExecution = new ToolExecutionComponent(

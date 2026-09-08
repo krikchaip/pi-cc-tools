@@ -316,12 +316,12 @@ if {[wait_for 1 {peer detail}]} {
   exit 1
 }
 
-# Summary is row 4 and payload is row 5. Isolate the payload click, then force
-# Pi to write a fresh full repaint into this phase's log.
+# The expanded command is row 4, summary is row 5, and payload is row 6.
+# Isolate the payload click, then force Pi to write a fresh full repaint.
 set bash_payload_log [file join $scratch "short-bash-payload-click.ansi"]
 log_file
 log_file -noappend $bash_payload_log
-send -- "\033\[<0;8;5M\033\[<0;8;5m"
+send -- "\033\[<0;8;6M\033\[<0;8;6m"
 if {![force_fullscreen_repaint $columns $rows]} {
   stop_pi
   puts "ARTIFACTS $scratch"
@@ -347,7 +347,7 @@ if {[string first "peer detail" $bash_payload_capture] >= 0
 # Outer indent + branches place the final ')' of Done (1 lines) at column 19.
 set bash_collapse_log [file join $scratch "short-bash-collapse.ansi"]
 log_file -noappend $bash_collapse_log
-send -- "\033\[<0;19;4M\033\[<0;19;4m"
+send -- "\033\[<0;19;5M\033\[<0;19;5m"
 if {![force_fullscreen_repaint $columns $rows]} {
   stop_pi
   puts "ARTIFACTS $scratch"
