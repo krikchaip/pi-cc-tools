@@ -1,0 +1,91 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for clicking a visible collapsed Bash command continuation row.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "bash-command-remainder-click-session.jsonl"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-bash-command-continuation-click-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $fixture_path "r"]
+set content [read $fixture]
+close $fixture
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-bash-command-remainder-click" $cwd] $content]
+close $session
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"groupToolCalls":false,"bashCommandPreviewLines":8}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+set capture_path [file join $scratch "session.ansi"]
+log_user 0
+log_file -a -noappend $capture_path
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {BASH_COLLAPSED_CONTINUATION_TARGET}]} {
+  log_user 1
+  fail "collapsed Bash continuation fixture did not become ready" $scratch
+}
+log_file
+if {[catch {exec python3 $locator_path locate $capture_path "BASH_COLLAPSED_CONTINUATION_TARGET"} location]} {
+  log_user 1
+  fail "could not locate the collapsed Bash continuation row" $scratch
+}
+lassign $location target_column target_row
+send -- "\033\[<0;${target_column};${target_row}M\033\[<0;${target_column};${target_row}m"
+if {![wait_for 5 {BASH_COMMAND_HIDDEN_FINAL}]} {
+  log_user 1
+  fail "clicking a visible collapsed Bash continuation row did not expand the command" $scratch
+}
+
+catch {send "\003\003"}
+catch {close}
+catch {wait}
+file delete -force $scratch
+puts "PASS collapsed Bash command continuation row expands the full command"

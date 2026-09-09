@@ -19,6 +19,8 @@ const expectFiles = [
   "e2e/expect/standalone-bash-output-shape.expect",
   "e2e/expect/bash-command-click.expect",
   "e2e/expect/bash-command-group-click.expect",
+  "e2e/expect/bash-command-remainder-click.expect",
+  "e2e/expect/bash-command-continuation-click.expect",
   "e2e/expect/preserved-bash-completion.expect",
   "e2e/expect/read-skill-output-shape.expect",
   "e2e/expect/async-diff-click.expect",

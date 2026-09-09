@@ -1,0 +1,82 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for a truncated Bash command remainder click.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "bash-command-remainder-click-session.jsonl"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-bash-command-remainder-click-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $fixture_path "r"]
+set content [read $fixture]
+close $fixture
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-bash-command-remainder-click" $cwd] $content]
+close $session
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"groupToolCalls":false,"bashCommandPreviewLines":8}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+log_user 0
+log_file -noappend [file join $scratch "session.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {\.\.\. 2 more lines}]} { fail "truncated Bash command fixture did not become ready" $scratch }
+# Header is row 3. Seven preview lines place the omission action on row 11.
+send -- "\033\[<0;8;11M\033\[<0;8;11m"
+if {![wait_for 5 {BASH_COMMAND_HIDDEN_FINAL}]} {
+  log_user 1
+  fail "clicking the Bash command omission row did not reveal the hidden command lines" $scratch
+}
+
+catch {send "\003\003"}
+catch {close}
+catch {wait}
+catch {log_file}
+file delete -force $scratch
+puts "PASS Bash command omission row expands the full command"

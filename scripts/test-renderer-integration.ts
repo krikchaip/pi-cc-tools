@@ -342,6 +342,75 @@ await withRendererHarness(
       throw new Error(`expanded standalone Bash command text did not bind a collapse action: ${JSON.stringify({ bashCommandRows, bashCommandRow, bashCommandStart, bashCommandEnd })}`);
     }
 
+    const bashCommandPreviewLines = [
+      "for i in 1 2 3; do",
+      "  : # BASH_COLLAPSED_CONTINUATION_TARGET",
+      "  sleep 0.1",
+      "done",
+      ": # BASH_COMMAND_VISIBLE_1",
+      ": # BASH_COMMAND_VISIBLE_2",
+      ": # BASH_COMMAND_VISIBLE_3",
+      ": # BASH_COMMAND_HIDDEN_1",
+      ": # BASH_COMMAND_HIDDEN_FINAL",
+    ];
+    const bashCommandWrappedExecution = new ToolExecutionComponent(
+      "bash",
+      "standalone_bash_command_continuation_click_fixture",
+      { command: bashCommandPreviewLines.join("\n") },
+      {},
+      bash,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    bashCommandWrappedExecution.markExecutionStarted();
+    bashCommandWrappedExecution.setArgsComplete();
+    bashCommandWrappedExecution.updateResult({
+      content: [{ type: "text", text: "fixture failed" }],
+      isError: true,
+    }, false);
+    const bashCommandWrappedRows = bashCommandWrappedExecution.render(40).map((line: string) => plain(line));
+    const bashCommandWrappedRow = bashCommandWrappedRows.findIndex((line: string) => line.includes("BASH_COLLAPSED"));
+    const bashCommandWrappedStart = bashCommandWrappedRow < 0
+      ? -1
+      : bashCommandWrappedRows[bashCommandWrappedRow].indexOf("BASH_COLLAPSED");
+    if (
+      bashCommandWrappedStart < 0
+      || bashCommandWrappedExecution.clickActionAtPoint(bashCommandWrappedStart, bashCommandWrappedRow) !== "header"
+      || !bashCommandWrappedExecution.activateClickAction("header", "top")
+      || !bashCommandWrappedExecution.render(40).some((line: string) => plain(line).includes("BASH_COMMAND_HIDDEN_FINAL"))
+    ) {
+      throw new Error(`collapsed Bash command continuation row did not bind an expansion action: ${JSON.stringify({ bashCommandWrappedRows, bashCommandWrappedRow, bashCommandWrappedStart })}`);
+    }
+
+    const bashCommandRemainderExecution = new ToolExecutionComponent(
+      "bash",
+      "standalone_bash_command_remainder_click_fixture",
+      { command: bashCommandPreviewLines.join("\n") },
+      {},
+      bash,
+      { mode: "fullscreen", requestRender() {} } as any,
+      process.cwd(),
+    ) as any;
+    bashCommandRemainderExecution.markExecutionStarted();
+    bashCommandRemainderExecution.setArgsComplete();
+    bashCommandRemainderExecution.updateResult({
+      content: [{ type: "text", text: "fixture failed" }],
+      isError: true,
+    }, false);
+    const bashCommandPreviewRows = bashCommandRemainderExecution.render(120).map((line: string) => plain(line));
+    const bashCommandRemainderRow = bashCommandPreviewRows.findIndex((line: string) => line.includes("... 2 more lines"));
+    const bashCommandRemainderStart = bashCommandRemainderRow < 0
+      ? -1
+      : bashCommandPreviewRows[bashCommandRemainderRow].indexOf("... 2 more lines");
+    if (
+      bashCommandRemainderStart < 0
+      || bashCommandRemainderExecution.clickActionAtPoint(bashCommandRemainderStart, bashCommandRemainderRow) !== "expand"
+      || !bashCommandRemainderExecution.activateClickAction("expand", "top")
+      || !bashCommandRemainderExecution.render(120).some((line: string) => plain(line).includes("BASH_COMMAND_HIDDEN_FINAL"))
+    ) {
+      throw new Error(`collapsed Bash command remainder did not bind an expansion action: ${JSON.stringify({ bashCommandPreviewRows, bashCommandRemainderRow, bashCommandRemainderStart })}`);
+    }
+
     const readDefinition = fakePi.tools.get("read");
     const skillReadExecution = new ToolExecutionComponent(
       "read",
