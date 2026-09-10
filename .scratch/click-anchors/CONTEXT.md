@@ -45,7 +45,7 @@ A renderer-declared row beneath an execution summary that summarizes status, cou
 _Avoid_: Second line, payload row
 
 **MCP response summary row**:
-The one result summary row for a completed MCP tool execution. An object or array response reports its root shape and field or item count. A scalar or image response reports its type. A successful unstructured text response reports only its returned logical line count. An error response shows its complete first error line, including every wrapped physical row. An empty response reports **Done** or **Failed**.
+The one result summary row for a completed MCP tool execution. A successful response begins **Responded**. An object or array response then reports its root shape and field or item count, for example `Responded [object] (8 fields)`. A scalar or image response reports its type. A successful unstructured text response reports only its returned logical line count, for example `Responded (115 lines)`. The shape and count use the visible dim style (`muted` theme token). Successful raw payload uses the visible dimmer style (`dim` theme token). An error response shows its complete first error line, including every wrapped physical row, and retains error color. An empty response reports **Done** or **Failed**.
 _Avoid_: MCP payload preview
 
 **MCP summary mode**:

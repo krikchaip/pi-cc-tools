@@ -60,7 +60,7 @@ if {![wait_for 10 {click.*any for details}]} {
   puts "ARTIFACTS $scratch"
   exit 1
 }
-if {[wait_for 1 {Response|MCP_FIRST_PAYLOAD|MCP_SECOND_PAYLOAD}]} {
+if {[wait_for 1 {Responded|MCP_FIRST_PAYLOAD|MCP_SECOND_PAYLOAD}]} {
   puts stderr "collapsed MCP group rendered result content before child expansion"
   send "\003\003"
   catch {close}
@@ -72,7 +72,7 @@ log_file
 log_file -noappend [file join $scratch "first-expanded.ansi"]
 # Row 3 is the first grouped execution. Its branch connector ends before terminal column 6.
 send -- "\033\[<0;6;3M\033\[<0;6;3m"
-if {![wait_for 5 {Response.*object.*\(2 fields\)}]} {
+if {![wait_for 5 {Responded.*\[object\].*\(2 fields\)}]} {
   puts stderr "expanded grouped MCP execution did not show its shape-aware result summary"
   send "\003\003"
   catch {close}

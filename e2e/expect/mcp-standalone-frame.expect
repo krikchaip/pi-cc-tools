@@ -67,8 +67,8 @@ if {![wait_for 10 {─{20,}}]} {
 if {![wait_for 2 {MCP.*github:get_repository}]} {
   fail "standalone MCP top border did not precede its execution row" $scratch
 }
-if {![wait_for 2 {Response.*object.*\(6 fields\).*click.*expand}]} {
-  fail "standalone MCP summary did not use 'Response object (6 fields) • click to expand'" $scratch
+if {![wait_for 2 {Responded.*\[object\].*\(6 fields\).*click.*expand}]} {
+  fail "standalone MCP summary did not use 'Responded [object] (6 fields) • click to expand'" $scratch
 }
 if {![wait_for 2 {─{20,}}]} {
   fail "standalone MCP did not retain its bottom border" $scratch

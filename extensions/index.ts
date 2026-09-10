@@ -940,7 +940,7 @@ function getCollapsedToolEntryLines(entry: CollapsedToolEntry, width: number, gr
 function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: string): string[] {
 	const rendered = stripToolChrome(tool.render(Math.max(1, width)));
 	const jsonTreeRootIndex = rendered.findIndex((line, lineIndex) => (
-		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+\(/.test(stripAnsi(line).trimStart())
+		lineIndex > 0 && /^[├└]\s+Responded\s+\[(?:object|array)\]\s+\(/.test(stripAnsi(line).trimStart())
 	));
 	const closedContinuationTrims = closedBranchContinuationTrims(rendered);
 	const lines = rendered.map((line, lineIndex) => {
@@ -977,7 +977,7 @@ function formatBranchedToolLines(
 	const output: string[] = [];
 	const safeContent = lines.length > 0 ? lines : [""];
 	const jsonTreeRootIndex = safeContent.findIndex((line, lineIndex) => (
-		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+·/.test(stripAnsi(line).trimStart())
+		lineIndex > 0 && /^[├└]\s+Responded\s+\[(?:object|array)\]\s+\(/.test(stripAnsi(line).trimStart())
 	));
 	const jsonTreeBaseIndent = jsonTreeRootIndex >= 0
 		? (stripAnsi(safeContent[jsonTreeRootIndex] ?? "").match(/^[ \t]*/)?.[0].length ?? 0)
@@ -8037,23 +8037,41 @@ function mcpJsonEntries(value: unknown[] | Record<string, unknown>): Array<[stri
 		: Object.entries(value);
 }
 
-function mcpJsonContainerMetadata(
-	value: unknown[] | Record<string, unknown>,
-	theme: Theme,
-	summary = false,
-): string {
+function mcpSummaryDetail(text: string, theme: Theme): string {
+	// The lighter secondary tone keeps result metadata below its success label.
+	return theme.fg("muted", text);
+}
+
+function mcpPayload(text: string, theme: Theme): string {
+	// Raw MCP data stays one visual level below response metadata.
+	return theme.fg("dim", text);
+}
+
+function mcpRespondedSummary(detail: string, theme: Theme): string {
+	return `${theme.fg("success", "Responded")} ${mcpSummaryDetail(detail, theme)}`;
+}
+
+function describeMcpJsonContainer(value: unknown[] | Record<string, unknown>): { kind: "array" | "object"; countText: string } {
 	const count = Array.isArray(value) ? value.length : Object.keys(value).length;
 	const kind = Array.isArray(value) ? "array" : "object";
 	const unit = Array.isArray(value) ? "item" : "field";
-	const countText = `${count} ${unit}${count === 1 ? "" : "s"}`;
-	return `${theme.fg("accent", kind)}${theme.fg("dim", summary ? ` (${countText})` : ` · ${countText}`)}`;
+	return { kind, countText: `${count} ${unit}${count === 1 ? "" : "s"}` };
+}
+
+function mcpJsonContainerPayloadMetadata(value: unknown[] | Record<string, unknown>, theme: Theme): string {
+	const { kind, countText } = describeMcpJsonContainer(value);
+	return mcpPayload(`${kind} · ${countText}`, theme);
+}
+
+function mcpJsonContainerSummary(value: unknown[] | Record<string, unknown>, theme: Theme): string {
+	const { kind, countText } = describeMcpJsonContainer(value);
+	return mcpRespondedSummary(`[${kind}] (${countText})`, theme);
 }
 
 function formatMcpJsonPrimitive(value: unknown, theme: Theme): string {
-	if (value === null) return theme.fg("muted", "null");
-	if (typeof value === "string") return theme.fg("toolOutput", value.replace(/\s+/g, " ").trim() || " ");
-	if (typeof value === "boolean") return theme.fg(value ? "success" : "warning", String(value));
-	return theme.fg("accent", String(value));
+	if (value === null) return mcpPayload("null", theme);
+	if (typeof value === "string") return mcpPayload(value.replace(/\s+/g, " ").trim() || " ", theme);
+	return mcpPayload(String(value), theme);
 }
 
 function mcpJsonPrimitiveType(value: unknown): string {
@@ -8065,7 +8083,7 @@ function parseMcpJsonResponse(raw: string, theme: Theme): McpResponsePresentatio
 		const parsed: unknown = JSON.parse(raw);
 		if (!isMcpJsonContainer(parsed)) {
 			return {
-				summary: `${theme.bold("Response")} ${theme.fg("accent", mcpJsonPrimitiveType(parsed))}`,
+				summary: mcpRespondedSummary(`[${mcpJsonPrimitiveType(parsed)}]`, theme),
 				payloadLines: [formatMcpJsonPrimitive(parsed, theme)],
 				totalPayloadLines: 1,
 			};
@@ -8090,19 +8108,19 @@ function parseMcpJsonResponse(raw: string, theme: Theme): McpResponsePresentatio
 				const connector = last ? "└" : "├";
 				const lead = `${currentToolBranchAnsi(theme)}${prefix}${connector}${TRANSPARENT_RESET} `;
 				const paddedLabel = `${label}${" ".repeat(Math.max(0, keyWidth - visibleWidth(label)))}`;
-				const key = theme.fg("muted", paddedLabel);
+				const key = mcpPayload(paddedLabel, theme);
 				if (!isMcpJsonContainer(child)) {
-					addLine(`${lead}${key}${theme.fg("dim", "  ")}${formatMcpJsonPrimitive(child, theme)}`);
+					addLine(`${lead}${key}${mcpPayload("  ", theme)}${formatMcpJsonPrimitive(child, theme)}`);
 					return;
 				}
-				addLine(`${lead}${key}${theme.fg("dim", "  ")}${mcpJsonContainerMetadata(child, theme)}`);
+				addLine(`${lead}${key}${mcpPayload("  ", theme)}${mcpJsonContainerPayloadMetadata(child, theme)}`);
 				const nextPrefix = `${prefix}${last ? "  " : "│ "}`;
 				renderChildren(child, nextPrefix);
 			});
 		};
 		renderChildren(parsed, "");
 		return {
-			summary: `${theme.bold("Response")} ${mcpJsonContainerMetadata(parsed, theme, true)}`,
+			summary: mcpJsonContainerSummary(parsed, theme),
 			payloadLines,
 			totalPayloadLines,
 		};
@@ -8127,17 +8145,18 @@ function parseMcpKeyValueFields(lines: string[]): McpKeyValueField[] | null {
 function renderMcpKeyValueFields(fields: McpKeyValueField[], theme: Theme): string[] {
 	const keyWidth = Math.max(...fields.map(({ key }) => visibleWidth(key)));
 	return fields.map(({ key, value }) => (
-		`${theme.fg("muted", `${key}${" ".repeat(Math.max(0, keyWidth - visibleWidth(key)))}`)}  ${theme.fg("toolOutput", value || " ")}`
+		`${mcpPayload(`${key}${" ".repeat(Math.max(0, keyWidth - visibleWidth(key)))}`, theme)}${mcpPayload("  ", theme)}${mcpPayload(value || " ", theme)}`
 	));
 }
 
 function mcpTextPresentation(lines: string[], theme: Theme): McpResponsePresentation {
 	const fields = parseMcpKeyValueFields(lines);
+	const lineCount = `${lines.length} line${lines.length === 1 ? "" : "s"}`;
 	return {
-		summary: theme.fg("muted", `Response · ${lines.length} line${lines.length === 1 ? "" : "s"}`),
+		summary: mcpRespondedSummary(`(${lineCount})`, theme),
 		payloadLines: fields
 			? renderMcpKeyValueFields(fields, theme)
-			: lines.map((line) => theme.fg("toolOutput", line || " ")),
+			: lines.map((line) => mcpPayload(line || " ", theme)),
 		totalPayloadLines: lines.length,
 	};
 }
@@ -8176,8 +8195,9 @@ function mcpExpandedPresentation(
 
 function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean, theme: Theme, ctx: any): Text {
 	if (isPartial) {
-		return makeMcpText(ctx.lastComponent, runningPreviewBlock(result, theme.fg("dim", "MCP running..."), expanded, theme, ctx, {
-			styleLine: (line) => theme.fg("toolOutput", line || " "),
+		const partialColor = ctx.isError ? "error" : "dim";
+		return makeMcpText(ctx.lastComponent, runningPreviewBlock(result, theme.fg(partialColor, "MCP running..."), expanded, theme, ctx, {
+			styleLine: (line) => theme.fg(partialColor, line || " "),
 		}));
 	}
 	clearBlinkTimer(ctx);
@@ -8203,8 +8223,8 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 	} else if (image) {
 		const mimeType = typeof image.mimeType === "string" && image.mimeType ? image.mimeType : "image";
 		presentation = {
-			summary: `${theme.bold("Response")} ${theme.fg("accent", "image")} ${theme.fg("dim", `· ${mimeType}`)}`,
-			payloadLines: lines.map((line) => theme.fg("toolOutput", line || " ")),
+			summary: mcpRespondedSummary(`[image] (${mimeType})`, theme),
+			payloadLines: lines.map((line) => mcpPayload(line || " ", theme)),
 			totalPayloadLines: lines.length,
 			revealsImage: true,
 		};

@@ -46,8 +46,8 @@ await withRendererHarness(
     const summaryResult = {
       content: [{ type: "text", text: JSON.stringify({ ok: true, count: 2 }) }],
     };
-    assertResultSummaryAnchor(fakePi, "mcp", summaryResult, false, "Response");
-    assertResultSummaryAnchor(fakePi, "mcp", summaryResult, true, "Response");
+    assertResultSummaryAnchor(fakePi, "mcp", summaryResult, false, "Responded");
+    assertResultSummaryAnchor(fakePi, "mcp", summaryResult, true, "Responded");
     assertPayloadRowInert(
       fakePi,
       "mcp",
@@ -64,13 +64,21 @@ await withRendererHarness(
       "Updated: 2026-07-31",
     ].join("\n");
 
-    const collapsed = render(fields);
-    if (!collapsed.includes("Response · 6 lines") || collapsed.includes("Repository") || collapsed.includes("example-org/example-repo")) {
+    const collapsedRaw = renderRaw(fields);
+    const collapsed = plain(collapsedRaw);
+    if (!collapsed.includes("Responded (6 lines)") || collapsed.includes("Repository") || collapsed.includes("example-org/example-repo")) {
       throw new Error(`collapsed MCP field output was not summary-only: ${JSON.stringify(collapsed)}`);
     }
+    if (!collapsedRaw.includes(theme.fg("success", "Responded")) || !collapsedRaw.includes(theme.fg("muted", "(6 lines)"))) {
+      throw new Error(`MCP text summary did not use success plus dim metadata: ${JSON.stringify(collapsedRaw)}`);
+    }
 
-    const expanded = render(fields, true);
-    for (const expected of ["Response · 6 lines", "Repository", "example-org/example-repo", "Default branch  main", "Latest release", "Updated"]) {
+    const expandedRaw = renderRaw(fields, true);
+    const expanded = plain(expandedRaw);
+    if (!expandedRaw.includes(theme.fg("dim", "example-org/example-repo"))) {
+      throw new Error(`MCP field payload did not use the dimmer raw-output color: ${JSON.stringify(expandedRaw)}`);
+    }
+    for (const expected of ["Responded (6 lines)", "Repository", "example-org/example-repo", "Default branch  main", "Latest release", "Updated"]) {
       if (!expanded.includes(expected)) {
         throw new Error(`MCP L0 field output missed ${JSON.stringify(expected)}: ${JSON.stringify(expanded)}`);
       }
@@ -98,17 +106,26 @@ await withRendererHarness(
     });
     const jsonCollapsedRaw = renderRaw(githubGetMe);
     const jsonCollapsed = plain(jsonCollapsedRaw);
-    for (const expected of ["Response object (5 fields)", "to expand"]) {
+    for (const expected of ["Responded [object] (5 fields)", "to expand"]) {
       if (!jsonCollapsed.includes(expected)) {
         throw new Error(`collapsed JSON MCP output missed summary content ${JSON.stringify(expected)}`);
       }
+    }
+    if (!jsonCollapsedRaw.includes(theme.fg("success", "Responded")) || !jsonCollapsedRaw.includes(theme.fg("muted", "[object] (5 fields)"))) {
+      throw new Error(`MCP JSON summary did not use success plus dim metadata: ${JSON.stringify(jsonCollapsedRaw)}`);
     }
     for (const hidden of ["login", "example-user", "profile_url", "details", '{"login"']) {
       if (jsonCollapsed.includes(hidden)) {
         throw new Error(`collapsed JSON MCP output exposed payload ${JSON.stringify(hidden)}`);
       }
     }
-    const jsonExpanded = render(githubGetMe, true);
+    const jsonExpandedRaw = renderRaw(githubGetMe, true);
+    const jsonExpanded = plain(jsonExpandedRaw);
+    for (const payload of ["example-user", "12345678", "true"]) {
+      if (!jsonExpandedRaw.includes(theme.fg("dim", payload))) {
+        throw new Error(`MCP JSON payload did not use the dimmer raw-output color for ${JSON.stringify(payload)}: ${JSON.stringify(jsonExpandedRaw)}`);
+      }
+    }
     if (!jsonExpanded.includes("details") || !jsonExpanded.includes("name") || !jsonExpanded.includes("Example User")) {
       throw new Error("expanded JSON MCP output did not preserve nested object fields");
     }
@@ -138,6 +155,11 @@ await withRendererHarness(
         throw new Error(`expanded JSON MCP output missed nested array content ${JSON.stringify(expected)}`);
       }
     }
+    for (const payload of ["total_count", "array · 2 items", "Example Author"]) {
+      if (!commitsExpandedRaw.includes(theme.fg("dim", payload))) {
+        throw new Error(`nested MCP JSON payload did not use the dimmer raw-output color for ${JSON.stringify(payload)}: ${JSON.stringify(commitsExpandedRaw)}`);
+      }
+    }
     for (const expected of [
       "total_count  2",
       "commits      array · 2 items",
@@ -154,7 +176,7 @@ await withRendererHarness(
     const ansiBefore = (index: number): string | undefined => (
       [...commitsExpandedRaw.slice(0, index).matchAll(/\x1b\[[0-9;]*m/g)].at(-1)?.[0]
     );
-    const responseIndex = commitsExpandedRaw.indexOf("Response");
+    const responseIndex = commitsExpandedRaw.indexOf("Responded");
     const rootConnectorIndex = commitsExpandedRaw.lastIndexOf("├", responseIndex);
     const childConnectorIndex = commitsExpandedRaw.indexOf("├", responseIndex);
     if (rootConnectorIndex < 0 || childConnectorIndex < 0) {
@@ -167,11 +189,15 @@ await withRendererHarness(
     }
 
     const proseCollapsed = render("Found one repository\nOwner is example-org\nReady to inspect");
-    if (!proseCollapsed.includes("Response · 3 lines") || proseCollapsed.includes("Found one repository")) {
+    if (!proseCollapsed.includes("Responded (3 lines)") || proseCollapsed.includes("Found one repository")) {
       throw new Error(`collapsed prose MCP output was not summary-only: ${JSON.stringify(proseCollapsed)}`);
     }
-    const proseExpanded = render("Found one repository\nOwner is example-org\nReady to inspect", true);
-    if (!proseExpanded.includes("Response · 3 lines") || !proseExpanded.includes("Found one repository") || !proseExpanded.includes("Owner is example-org")) {
+    const proseExpandedRaw = renderRaw("Found one repository\nOwner is example-org\nReady to inspect", true);
+    const proseExpanded = plain(proseExpandedRaw);
+    if (!proseExpandedRaw.includes(theme.fg("dim", "Found one repository"))) {
+      throw new Error(`MCP prose payload did not use the dimmer raw-output color: ${JSON.stringify(proseExpandedRaw)}`);
+    }
+    if (!proseExpanded.includes("Responded (3 lines)") || !proseExpanded.includes("Found one repository") || !proseExpanded.includes("Owner is example-org")) {
       throw new Error("MCP prose L0 did not reveal its verbatim payload");
     }
 
@@ -196,12 +222,17 @@ await withRendererHarness(
     }
 
     const scalarCollapsed = render("42");
-    const scalarExpanded = render("42", true);
-    if (!scalarCollapsed.includes("Response number") || scalarCollapsed.includes("└ 42")) {
+    const scalarExpandedRaw = renderRaw("42", true);
+    const scalarExpanded = plain(scalarExpandedRaw);
+    if (!scalarCollapsed.includes("Responded [number]") || scalarCollapsed.includes("└ 42")) {
       throw new Error(`collapsed scalar MCP output was not type-only: ${JSON.stringify(scalarCollapsed)}`);
     }
-    if (!scalarExpanded.includes("Response number") || !scalarExpanded.includes("42")) {
-      throw new Error(`MCP scalar L0 did not reveal its value: ${JSON.stringify(scalarExpanded)}`);
+    if (!scalarExpanded.includes("Responded [number]") || !scalarExpanded.includes("42") || !scalarExpandedRaw.includes(theme.fg("dim", "42"))) {
+      throw new Error(`MCP scalar L0 did not reveal a dimmer raw value: ${JSON.stringify(scalarExpandedRaw)}`);
+    }
+    const arrayCollapsed = render("[true]");
+    if (!arrayCollapsed.includes("Responded [array] (1 item)")) {
+      throw new Error(`collapsed array MCP output did not use an item-count summary: ${JSON.stringify(arrayCollapsed)}`);
     }
 
     const errorComponent = mcp.renderResult(
@@ -210,9 +241,13 @@ await withRendererHarness(
       theme,
       { state: {}, isError: true, lastComponent: undefined },
     );
-    const collapsedError = plain(errorComponent.render(120).join("\n"));
+    const collapsedErrorRaw = errorComponent.render(120).join("\n");
+    const collapsedError = plain(collapsedErrorRaw);
     if (!collapsedError.includes("Error: complete first failure line") || collapsedError.includes("request id: fixture-123")) {
       throw new Error(`collapsed MCP error did not preserve only its first line: ${JSON.stringify(collapsedError)}`);
+    }
+    if (!collapsedErrorRaw.includes(theme.fg("error", "Error: complete first failure line"))) {
+      throw new Error(`collapsed MCP error summary did not retain its error color: ${JSON.stringify(collapsedErrorRaw)}`);
     }
     const expandedErrorComponent = mcp.renderResult(
       { content: [{ type: "text", text: "Error: complete first failure line\nrequest id: fixture-123" }] },
@@ -220,9 +255,35 @@ await withRendererHarness(
       theme,
       { state: {}, isError: true, lastComponent: undefined },
     );
-    const expandedError = plain(expandedErrorComponent.render(120).join("\n"));
+    const expandedErrorRaw = expandedErrorComponent.render(120).join("\n");
+    const expandedError = plain(expandedErrorRaw);
     if ((expandedError.match(/Error: complete first failure line/g) ?? []).length !== 1 || !expandedError.includes("request id: fixture-123")) {
       throw new Error(`expanded MCP error duplicated its summary or hid detail: ${JSON.stringify(expandedError)}`);
+    }
+    if (!expandedErrorRaw.includes(theme.fg("error", "request id: fixture-123"))) {
+      throw new Error(`expanded MCP error payload did not retain its error color: ${JSON.stringify(expandedErrorRaw)}`);
+    }
+
+    const partialComponent = mcp.renderResult(
+      { content: [{ type: "text", text: "partial MCP payload" }] },
+      { expanded: true, isPartial: true },
+      theme,
+      { state: {}, isError: false, lastComponent: undefined },
+    );
+    const partialRaw = partialComponent.render(120).join("\n");
+    if (!partialRaw.includes(theme.fg("dim", "partial MCP payload"))) {
+      throw new Error(`partial MCP payload did not use the dimmer raw-output color: ${JSON.stringify(partialRaw)}`);
+    }
+
+    const partialErrorComponent = mcp.renderResult(
+      { content: [{ type: "text", text: "partial MCP error" }] },
+      { expanded: true, isPartial: true },
+      theme,
+      { state: {}, isError: true, lastComponent: undefined },
+    );
+    const partialErrorRaw = partialErrorComponent.render(120).join("\n");
+    if (!partialErrorRaw.includes(theme.fg("error", "partial MCP error"))) {
+      throw new Error(`partial MCP error payload did not retain its error color: ${JSON.stringify(partialErrorRaw)}`);
     }
 
     const legacyRenderer = {
@@ -258,14 +319,14 @@ await withRendererHarness(
     execution.updateResult({ content: [{ type: "text", text: fields }], isError: false }, false);
     const integratedRows = execution.render(120).map((line: string) => plain(line));
     const integrated = integratedRows.join("\n");
-    if (!integrated.includes("Response · 6 lines") || integrated.includes("Repository") || integrated.includes("6 lines returned")) {
+    if (!integrated.includes("Responded (6 lines)") || integrated.includes("Repository") || integrated.includes("6 lines returned")) {
       throw new Error(`ToolExecutionComponent did not render the MCP collapsed summary layer: ${JSON.stringify(integrated)}`);
     }
     const integratedContentRows = integratedRows.filter((line: string) => line.trim());
     if (!/^─+$/.test(integratedContentRows[0] ?? "") || !/^─+$/.test(integratedContentRows.at(-1) ?? "")) {
       throw new Error(`standalone MCP did not retain its top and bottom borders: ${JSON.stringify(integratedRows)}`);
     }
-    const responseRow = integrated.split("\n").find((line: string) => line.includes("Response · 6 lines"));
+    const responseRow = integrated.split("\n").find((line: string) => line.includes("Responded (6 lines)"));
     if (!responseRow?.startsWith("└")) {
       throw new Error(`MCP renderer ignored outputPad 0: ${JSON.stringify(responseRow)}`);
     }
@@ -345,12 +406,12 @@ await withRendererHarness(
     writeAgentSettings({ outputPad: 1 });
     await new Promise((resolve) => setTimeout(resolve, 300));
     const directPadded = render(fields);
-    const directPaddedResponseRow = directPadded.split("\n").find((line) => line.includes("Response · 6 lines"));
+    const directPaddedResponseRow = directPadded.split("\n").find((line) => line.includes("Responded (6 lines)"));
     if (!directPaddedResponseRow?.startsWith(" └")) {
       throw new Error(`self-rendered MCP output ignored outputPad 1: ${JSON.stringify(directPaddedResponseRow)}`);
     }
     const padded = plain(execution.render(120).join("\n"));
-    const paddedResponseRow = padded.split("\n").find((line: string) => line.includes("Response · 6 lines"));
+    const paddedResponseRow = padded.split("\n").find((line: string) => line.includes("Responded (6 lines)"));
     if (!paddedResponseRow?.startsWith(" └")) {
       throw new Error(`MCP renderer ignored outputPad 1: ${JSON.stringify(paddedResponseRow)}`);
     }
@@ -389,14 +450,14 @@ await withRendererHarness(
     const firstChildX = firstChildRow < 0 ? -1 : collapsedGroupRows[firstChildRow].indexOf("get_repository");
     if (
       firstChildX < 0
-      || collapsedGroupRows.some((line: string) => line.includes("Response") || line.includes("MCP_FIRST_UNIT_PAYLOAD"))
+      || collapsedGroupRows.some((line: string) => line.includes("Responded") || line.includes("MCP_FIRST_UNIT_PAYLOAD"))
       || !shortGroup.toggleToolAtPoint(firstChildX, firstChildRow)
     ) {
       throw new Error(`short grouped MCP child did not activate from its execution summary: ${JSON.stringify(collapsedGroupRows)}`);
     }
     const firstChildExpandedRows = shortGroupParent.render(120).map((line: string) => plain(line));
     if (
-      !firstChildExpandedRows.some((line: string) => line.includes("Response object (2 fields)"))
+      !firstChildExpandedRows.some((line: string) => line.includes("Responded [object] (2 fields)"))
       || !firstChildExpandedRows.some((line: string) => line.includes("MCP_FIRST_UNIT_PAYLOAD"))
       || firstChildExpandedRows.some((line: string) => line.includes("MCP_SECOND_UNIT_PAYLOAD"))
     ) {
@@ -500,7 +561,7 @@ await withRendererHarness(
     jsonGroup.setExpanded(true);
     const jsonGroupLines = jsonGroupParent.render(120).map((line: string) => plain(line));
     const jsonCallRow = jsonGroupLines.find((line: string) => line.includes("MCP") && line.includes("list_commits"));
-    const jsonResponseRow = jsonGroupLines.find((line: string) => line.includes("Response") && line.includes("object"));
+    const jsonResponseRow = jsonGroupLines.find((line: string) => line.includes("Responded") && line.includes("[object]"));
     const jsonRootFieldRow = jsonGroupLines.find((line: string) => line.includes("total_count"));
     const jsonArrayItemRow = jsonGroupLines.find((line: string) => line.includes("[1]") && line.includes("object"));
     const jsonNestedFieldRow = jsonGroupLines.find((line: string) => line.includes("sha") && line.includes("a1b2c3d4"));
@@ -530,7 +591,7 @@ await withRendererHarness(
       { state: {}, isError: false, lastComponent: undefined },
     );
     const imageRows = imageComponent.render(120).map((line: string) => plain(line));
-    if (!imageRows.some((line: string) => line.includes("Response image") && line.includes("image/png"))) {
+    if (!imageRows.some((line: string) => line.includes("Responded [image] (image/png)"))) {
       throw new Error(`MCP image response did not report its type: ${JSON.stringify(imageRows)}`);
     }
 
@@ -582,7 +643,7 @@ await withRendererHarness(
     );
     const summaryOnlyRows = summaryOnlyComponent.render(120).map((line: string) => plain(line));
     if (
-      !summaryOnlyRows.some((line: string) => line.includes("Response object (2 fields)"))
+      !summaryOnlyRows.some((line: string) => line.includes("Responded [object] (2 fields)"))
       || summaryOnlyRows.some((line: string) => line.includes("ok") || line.includes("count"))
       || (summaryOnlyComponent as any).getSemanticRows().length > 0
     ) {
@@ -595,7 +656,7 @@ await withRendererHarness(
     const summaryGroup = (summaryGroupParent as any).children[0];
     const summaryGroupRows = summaryGroupParent.render(120).map((line: string) => plain(line));
     if (
-      summaryGroupRows.some((line: string) => line.includes("click any for details") || line.includes("Response"))
+      summaryGroupRows.some((line: string) => line.includes("click any for details") || line.includes("Responded"))
       || summaryGroup.clickAnchors.length > 0
     ) {
       throw new Error(`MCP summary-mode group exposed dead click anchors: ${JSON.stringify({ summaryGroupRows, clickAnchors: summaryGroup.clickAnchors })}`);
