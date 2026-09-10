@@ -253,10 +253,15 @@ if __name__ == "__main__":
     elif len(sys.argv) == 4 and sys.argv[1] == "final-contains":
         frame = frames(Path(sys.argv[2]))[-1]
         raise SystemExit(0 if any(sys.argv[3] in row for row in frame) else 1)
+    elif len(sys.argv) == 5 and sys.argv[1] == "matching-row-contains":
+        frame = matching_frame(Path(sys.argv[2]), sys.argv[3])
+        row = next(text for text in frame if sys.argv[3] in text)
+        raise SystemExit(0 if sys.argv[4] in row else 1)
     elif len(sys.argv) == 2:
         main_assert(Path(sys.argv[1]))
     else:
         raise SystemExit(
             "usage: async-diff-click-assert.py <scratch> | "
-            "locate|final-contains <capture> <pattern>"
+            "locate|final-contains <capture> <pattern> | "
+            "matching-row-contains <capture> <anchor> <pattern>"
         )

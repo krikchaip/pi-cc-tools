@@ -6,6 +6,7 @@ set expect_dir [file dirname [file normalize [info script]]]
 set repo_dir [file dirname [file dirname $expect_dir]]
 set extension_path [file join $repo_dir "extensions" "index.ts"]
 set fixture_path [file join $repo_dir "e2e" "fixtures" "bash-command-remainder-click-session.jsonl"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
 set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
 set scratch "/tmp/pi-cc-tools-bash-command-remainder-click-[pid]"
 set cwd [file join $scratch "cwd"]
@@ -59,16 +60,26 @@ proc fail {message scratch} {
 
 puts "PI_VERSION [exec $pi_bin --version]"
 cd $cwd
+set capture_path [file join $scratch "session.ansi"]
 log_user 0
-log_file -noappend [file join $scratch "session.ansi"]
+log_file -a -noappend $capture_path
 spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
   $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
   -e $extension_path --tui-mode fullscreen
 stty columns $columns rows $rows
 
 if {![wait_for 10 {\.\.\. 2 more lines}]} { fail "truncated Bash command fixture did not become ready" $scratch }
-# Header is row 3. Seven preview lines place the omission action on row 11.
-send -- "\033\[<0;8;11M\033\[<0;8;11m"
+# Drain the rest of the synchronized repaint before parsing the terminal frame.
+wait_for 1 {__pi_cc_tools_no_such_frame_marker__}
+log_file
+if {![catch {exec python3 $locator_path matching-row-contains $capture_path "... 2 more lines" "click to expand"}]} {
+  fail "truncated Bash command omission row showed unwanted click guidance" $scratch
+}
+if {[catch {exec python3 $locator_path locate $capture_path "... 2 more lines"} location]} {
+  fail "could not locate the truncated Bash command omission row" $scratch
+}
+lassign $location target_column target_row
+send -- "\033\[<0;${target_column};${target_row}M\033\[<0;${target_column};${target_row}m"
 if {![wait_for 5 {BASH_COMMAND_HIDDEN_FINAL}]} {
   log_user 1
   fail "clicking the Bash command omission row did not reveal the hidden command lines" $scratch

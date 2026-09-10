@@ -404,11 +404,12 @@ await withRendererHarness(
       : bashCommandPreviewRows[bashCommandRemainderRow].indexOf("... 2 more lines");
     if (
       bashCommandRemainderStart < 0
-      || bashCommandRemainderExecution.clickActionAtPoint(bashCommandRemainderStart, bashCommandRemainderRow) !== "expand"
-      || !bashCommandRemainderExecution.activateClickAction("expand", "top")
+      || bashCommandPreviewRows[bashCommandRemainderRow].includes("click to expand")
+      || bashCommandRemainderExecution.clickActionAtPoint(bashCommandRemainderStart, bashCommandRemainderRow) !== "header"
+      || !bashCommandRemainderExecution.activateClickAction("header", "top")
       || !bashCommandRemainderExecution.render(120).some((line: string) => plain(line).includes("BASH_COMMAND_HIDDEN_FINAL"))
     ) {
-      throw new Error(`collapsed Bash command remainder did not bind an expansion action: ${JSON.stringify({ bashCommandPreviewRows, bashCommandRemainderRow, bashCommandRemainderStart })}`);
+      throw new Error(`collapsed Bash command remainder did not stay terse and clickable: ${JSON.stringify({ bashCommandPreviewRows, bashCommandRemainderRow, bashCommandRemainderStart })}`);
     }
 
     const readDefinition = fakePi.tools.get("read");

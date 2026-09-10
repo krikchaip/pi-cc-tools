@@ -5136,14 +5136,12 @@ function renderBashCommandBlock(
 	if (expanded && presentation.sourceLines.length > sourceLimit) {
 		lines.push(`... ${presentation.sourceLines.length - sourceLimit} more command lines`);
 	}
-	const collapsedRemainderIndex = !expanded && presentation.sourceLines.length > limit ? lines.length - 1 : -1;
-	const actionableSourceLineCount = expanded
+	const actionableLineCount = expanded
 		? Math.min(presentation.sourceLines.length, sourceLimit)
-		: collapsedRemainderIndex >= 0 ? collapsedRemainderIndex : lines.length;
-	const body = lines.map((line, index) => {
-		const remainderAction = index === collapsedRemainderIndex ? encodedClickHint("expand", "") : "";
-		return `${index < actionableSourceLineCount ? HEADER_WRAP_MARK : ""}${theme.fg("accent", line || " ")}${remainderAction}`;
-	}).join("\n");
+		: lines.length;
+	const body = lines.map((line, index) => (
+		`${index < actionableLineCount ? HEADER_WRAP_MARK : ""}${theme.fg("accent", line || " ")}`
+	)).join("\n");
 	return expanded ? withBranch(body, theme, false, true) : withClippedBranch(body, theme, true);
 }
 
