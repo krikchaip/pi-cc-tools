@@ -286,16 +286,49 @@ await withRendererHarness(
     );
     const editErrorRows = editErrorComponent.render(44)
       .map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
-    const editBranchIndex = editErrorRows.findIndex((line: string) => line.startsWith("└ "));
-    const editContinuations = editBranchIndex >= 0 ? editErrorRows.slice(editBranchIndex + 1) : [];
-    if (editBranchIndex < 0 || editContinuations.length === 0) {
-      throw new Error(`Edit final-line wrap regression setup did not wrap: ${JSON.stringify(editErrorRows)}`);
+    const editErrorStart = editErrorRows.findIndex((line: string) => line.startsWith("  Could not find"));
+    const editContinuations = editErrorStart >= 0 ? editErrorRows.slice(editErrorStart + 1) : [];
+    if (editErrorStart < 0 || editContinuations.length === 0) {
+      throw new Error(`Edit error indentation regression setup did not wrap: ${JSON.stringify(editErrorRows)}`);
     }
-    if (editContinuations.some((line: string) => line.startsWith("│ "))) {
-      throw new Error(`wrapped Edit final line kept indentation guides: ${JSON.stringify(editErrorRows)}`);
+    if (editErrorRows.some((line: string) => /^[ ]*[├│└] /.test(line))) {
+      throw new Error(`Edit error retained a branch connector: ${JSON.stringify(editErrorRows)}`);
     }
     if (editContinuations.some((line: string) => !line.startsWith("  "))) {
-      throw new Error(`wrapped Edit final line lost branch indentation: ${JSON.stringify(editErrorRows)}`);
+      throw new Error(`wrapped Edit error lost two-space indentation: ${JSON.stringify(editErrorRows)}`);
+    }
+
+    for (const name of ["write", "apply_patch", "web_search", "TaskList"]) {
+      const definition = fakePi.tools.get(name);
+      const errorRows = definition.renderResult(
+        { content: [{ type: "text", text: "AUDIT failure detail" }], details: {} },
+        { expanded: false, isPartial: false },
+        theme,
+        {
+          state: {},
+          args: {},
+          argsComplete: true,
+          cwd: process.cwd(),
+          expanded: false,
+          isError: true,
+          lastComponent: undefined,
+        },
+      ).render(80).map((line: string) => plain(line));
+      const errorRow = errorRows.find((line: string) => line.includes("AUDIT failure detail"));
+      if (!errorRow?.startsWith("  ") || /^[ ]*[├│└] /.test(errorRow)) {
+        throw new Error(`${name} error did not use two-space connector-free indentation: ${JSON.stringify(errorRows)}`);
+      }
+    }
+
+    const readNoTextRows = fakePi.tools.get("read").renderResult(
+      { content: [], details: {} },
+      { expanded: false, isPartial: false },
+      theme,
+      { state: {}, args: {}, expanded: false, isError: true, lastComponent: undefined },
+    ).render(80).map((line: string) => plain(line));
+    const readNoTextRow = readNoTextRows.find((line: string) => line.includes("No text content"));
+    if (!readNoTextRow?.startsWith("  ") || /^[ ]*[├│└] /.test(readNoTextRow)) {
+      throw new Error(`Read no-text error did not use two-space connector-free indentation: ${JSON.stringify(readNoTextRows)}`);
     }
 
     await emitLifecycle("agent_start");

@@ -249,6 +249,10 @@ await withRendererHarness(
     if (!collapsedErrorRaw.includes(theme.fg("error", "Error: complete first failure line"))) {
       throw new Error(`collapsed MCP error summary did not retain its error color: ${JSON.stringify(collapsedErrorRaw)}`);
     }
+    const collapsedErrorRow = collapsedError.split("\n").find((line) => line.includes("Error: complete first failure line"));
+    if (!collapsedErrorRow?.startsWith("  ") || /^[ ]*[├│└] /.test(collapsedErrorRow)) {
+      throw new Error(`collapsed MCP error retained a branch connector: ${JSON.stringify(collapsedError)}`);
+    }
     const expandedErrorComponent = mcp.renderResult(
       { content: [{ type: "text", text: "Error: complete first failure line\nrequest id: fixture-123" }] },
       { expanded: true, isPartial: false },
@@ -262,6 +266,10 @@ await withRendererHarness(
     }
     if (!expandedErrorRaw.includes(theme.fg("error", "request id: fixture-123"))) {
       throw new Error(`expanded MCP error payload did not retain its error color: ${JSON.stringify(expandedErrorRaw)}`);
+    }
+    const expandedErrorRows = expandedError.split("\n").filter((line) => line.trim().length > 0);
+    if (expandedErrorRows.some((line) => !line.startsWith("  ") || /^[ ]*[├│└] /.test(line))) {
+      throw new Error(`expanded MCP error retained branch connectors: ${JSON.stringify(expandedErrorRows)}`);
     }
 
     const partialComponent = mcp.renderResult(

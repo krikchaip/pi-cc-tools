@@ -4457,6 +4457,11 @@ function withBranch(content: string, theme: Theme, _isError = false, continued =
 	return `${branchLead(first, continued, theme)}\n${rest.join("\n")}`;
 }
 
+function withToolErrorIndent(content: string): string {
+	if (!content || !content.trim()) return "";
+	return content.split("\n").map((line) => `  ${WRAP_MARK}${line}`).join("\n");
+}
+
 function withClippedBranch(content: string, theme: Theme, continued = false): string {
 	return withBranch(content, theme, false, continued).replaceAll(WRAP_MARK, CLIP_MARK);
 }
@@ -7979,7 +7984,7 @@ function renderApplyPatchResult(result: any, isPartial: boolean, theme: Theme, c
 	if (ctx.isError) {
 		const raw = getTextContent(result).trim();
 		const firstLine = raw ? raw.split("\n")[0] : "Apply patch failed";
-		return makeText(ctx.lastComponent, withBranch(theme.fg("error", firstLine), theme));
+		return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", firstLine)));
 	}
 
 	const meta = getApplyPatchResultMeta(ctx.args, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
@@ -8166,6 +8171,7 @@ function mcpExpandedPresentation(
 	expanded: boolean,
 	theme: Theme,
 	ctx: any,
+	connectorFreeError = false,
 ): string {
 	if (presentation.revealsImage && presentation.totalPayloadLines === 0) {
 		const collapse = encodedClickHint("expand", expandHint(theme, "collapse"));
@@ -8190,7 +8196,7 @@ function mcpExpandedPresentation(
 		indicator,
 	);
 	const body = `${markResultSummary(presentation.summary)}${payload ? `\n${payload}` : ""}`;
-	return withFinalBranchBlock(body, theme);
+	return connectorFreeError ? withToolErrorIndent(body) : withFinalBranchBlock(body, theme);
 }
 
 function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean, theme: Theme, ctx: any): Text {
@@ -8240,15 +8246,14 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 
 	const hasDetail = presentation.totalPayloadLines > 0 || presentation.revealsImage === true;
 	if (mode === "summary" || !hasDetail) {
-		return makeMcpText(ctx.lastComponent, withBranch(presentation.summary, theme));
+		const body = ctx.isError ? withToolErrorIndent(presentation.summary) : withBranch(presentation.summary, theme);
+		return makeMcpText(ctx.lastComponent, body);
 	}
 	if (!expanded) {
-		return makeMcpText(
-			ctx.lastComponent,
-			withBranch(`${markResultSummary(presentation.summary)}${toolOutputDetailHint(theme, false)}`, theme),
-		);
+		const content = `${markResultSummary(presentation.summary)}${toolOutputDetailHint(theme, false)}`;
+		return makeMcpText(ctx.lastComponent, ctx.isError ? withToolErrorIndent(content) : withBranch(content, theme));
 	}
-	return makeMcpText(ctx.lastComponent, mcpExpandedPresentation(presentation, expanded, theme, ctx));
+	return makeMcpText(ctx.lastComponent, mcpExpandedPresentation(presentation, expanded, theme, ctx, ctx.isError));
 }
 
 function summarizeOpenAiToolCall(name: string, args: any, theme: Theme, sp: (path: string) => string): string {
@@ -8494,9 +8499,11 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 	if (lines.length === 0) {
 		if (patchFiles.length > 0) {
 			const suffix = patchFiles.length === 1 ? patchFiles[0] : `${patchFiles.length} files`;
-			return makeText(ctx.lastComponent, withBranch(markResultSummary(`${theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Applied")} ${theme.fg("muted", suffix)}`), theme));
+			const content = `${theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Applied")} ${theme.fg("muted", suffix)}`;
+			return makeText(ctx.lastComponent, ctx.isError ? withToolErrorIndent(content) : withBranch(markResultSummary(content), theme));
 		}
-		return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done")), theme));
+		const content = theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done");
+		return makeText(ctx.lastComponent, ctx.isError ? withToolErrorIndent(content) : withBranch(markResultSummary(content), theme));
 	}
 
 	if (!ctx.isError && name === "TaskList") {
@@ -8507,12 +8514,13 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 		? theme.fg("error", lines[0])
 		: markResultSummary(theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`));
 	if (!expanded) {
-		return makeText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
+		const content = `${statusText}${toolOutputDetailHint(theme, expanded)}`;
+		return makeText(ctx.lastComponent, ctx.isError ? withToolErrorIndent(content) : withBranch(content, theme));
 	}
 
 	if (ctx.isError) {
 		const errorText = lines.map((line) => theme.fg("error", line || " ")).join("\n");
-		return makeText(ctx.lastComponent, withBranch(errorText, theme));
+		return makeText(ctx.lastComponent, withToolErrorIndent(errorText));
 	}
 
 	if (lines.length === 1) {
@@ -9036,7 +9044,7 @@ export default function (pi: ExtensionAPI) {
 			if (getFirstImageBlock(result)) return renderReadImageResult(result, expanded, theme, ctx);
 			const details = result.details as ReadToolDetails | undefined;
 			const content = result.content.find((block: any) => block?.type === "text");
-			if (content?.type !== "text") return makeText(ctx.lastComponent, withBranch(theme.fg("error", "No text content"), theme));
+			if (content?.type !== "text") return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", "No text content")));
 			const lines = content.text.split("\n");
 			let text = markResultSummary(theme.fg("muted", `${lines.length} lines loaded`));
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
@@ -9340,7 +9348,7 @@ export default function (pi: ExtensionAPI) {
 						?.filter((c: any) => c.type === "text")
 						.map((c: any) => c.text || "")
 						.join("\n") ?? "Error";
-				return makeText(ctx.lastComponent, withBranch(theme.fg("error", e), theme));
+				return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", e)));
 			}
 			const d = (result as any).details;
 			if (d?._type === "diff") {
@@ -9521,7 +9529,7 @@ export default function (pi: ExtensionAPI) {
 						?.filter((c: any) => c.type === "text")
 						.map((c: any) => c.text || "")
 						.join("\n") ?? "Error";
-				return makeText(ctx.lastComponent, withBranch(theme.fg("error", e), theme));
+				return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", e)));
 			}
 			const editResultType = (result as any).details?._type;
 			if ((editResultType === "editInfo" || editResultType === "multiEditInfo") && ctx.state?._ptTree) {

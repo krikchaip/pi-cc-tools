@@ -27,6 +27,7 @@ const expectFiles = [
   "e2e/expect/read-skill-output-shape.expect",
   "e2e/expect/async-diff-click.expect",
   "e2e/expect/edit-line-numbers.expect",
+  "e2e/expect/edit-error-prefix.expect",
   "e2e/expect/single-edit-gap.expect",
   "e2e/expect/reload-click-anchors.expect",
   "e2e/expect/reload-tool-background.expect",
