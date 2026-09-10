@@ -1,4 +1,8 @@
 import {
+  getCapabilities,
+  setCapabilities,
+} from "../node_modules/@earendil-works/pi-coding-agent/node_modules/@earendil-works/pi-tui/dist/index.js";
+import {
   assertPayloadRowInert,
   assertResultSummaryAnchor,
   plain,
@@ -18,6 +22,7 @@ await withRendererHarness(
     Container,
     emitLifecycle,
     writeAgentSettings,
+    writePiSettings,
   }) => {
     const mcp = fakePi.tools.get("mcp");
     if (typeof mcp?.renderResult !== "function") throw new Error("MCP renderer was not registered");
@@ -60,25 +65,18 @@ await withRendererHarness(
     ].join("\n");
 
     const collapsed = render(fields);
-    if (!collapsed.includes("Repository") || !collapsed.includes("example-org/example-repo")) {
-      throw new Error("collapsed MCP field output did not show key/value content");
-    }
-    if (!collapsed.includes("Default branch  main")) {
-      throw new Error("collapsed MCP field output did not align key/value columns");
-    }
-    if (collapsed.includes("Latest release")) {
-      throw new Error("collapsed MCP field output exceeded the four-row scan limit");
-    }
-    if (!collapsed.includes("2 more")) {
-      throw new Error("collapsed MCP field output did not show the hidden-row count");
+    if (!collapsed.includes("Response · 6 lines") || collapsed.includes("Repository") || collapsed.includes("example-org/example-repo")) {
+      throw new Error(`collapsed MCP field output was not summary-only: ${JSON.stringify(collapsed)}`);
     }
 
     const expanded = render(fields, true);
-    if (!expanded.includes("Latest release") || !expanded.includes("Updated")) {
-      throw new Error("expanded MCP field output did not show all rows");
+    for (const expected of ["Response · 6 lines", "Repository", "example-org/example-repo", "Default branch  main", "Latest release", "Updated"]) {
+      if (!expanded.includes(expected)) {
+        throw new Error(`MCP L0 field output missed ${JSON.stringify(expected)}: ${JSON.stringify(expanded)}`);
+      }
     }
-    if (expanded.includes("2 more")) {
-      throw new Error("expanded MCP field output kept the collapsed hidden-row hint");
+    if (expanded.includes("more lines")) {
+      throw new Error("MCP L0 field output kept a hidden-row hint after exhausting the response");
     }
 
     const githubGetMe = JSON.stringify({
@@ -98,17 +96,17 @@ await withRendererHarness(
         updated_at: "2026-05-17T08:02:00Z",
       },
     });
-    const jsonCollapsed = render(githubGetMe);
-    for (const expected of ["Response", "object · 5 fields", "login", "example-user", "profile_url", "details", "object · 9 fields", "7 more"]) {
+    const jsonCollapsedRaw = renderRaw(githubGetMe);
+    const jsonCollapsed = plain(jsonCollapsedRaw);
+    for (const expected of ["Response object (5 fields)", "to expand"]) {
       if (!jsonCollapsed.includes(expected)) {
-        throw new Error(`collapsed JSON MCP output missed branch-tree content ${JSON.stringify(expected)}`);
+        throw new Error(`collapsed JSON MCP output missed summary content ${JSON.stringify(expected)}`);
       }
     }
-    if (jsonCollapsed.includes('{"login"')) {
-      throw new Error("collapsed JSON MCP output kept the raw JSON line");
-    }
-    if (!renderRaw(githubGetMe).includes(theme.fg("muted", ")"))) {
-      throw new Error("collapsed JSON MCP hint did not restore muted color for its closing parenthesis");
+    for (const hidden of ["login", "example-user", "profile_url", "details", '{"login"']) {
+      if (jsonCollapsed.includes(hidden)) {
+        throw new Error(`collapsed JSON MCP output exposed payload ${JSON.stringify(hidden)}`);
+      }
     }
     const jsonExpanded = render(githubGetMe, true);
     if (!jsonExpanded.includes("details") || !jsonExpanded.includes("name") || !jsonExpanded.includes("Example User")) {
@@ -157,7 +155,7 @@ await withRendererHarness(
       [...commitsExpandedRaw.slice(0, index).matchAll(/\x1b\[[0-9;]*m/g)].at(-1)?.[0]
     );
     const responseIndex = commitsExpandedRaw.indexOf("Response");
-    const rootConnectorIndex = commitsExpandedRaw.lastIndexOf("└", responseIndex);
+    const rootConnectorIndex = commitsExpandedRaw.lastIndexOf("├", responseIndex);
     const childConnectorIndex = commitsExpandedRaw.indexOf("├", responseIndex);
     if (rootConnectorIndex < 0 || childConnectorIndex < 0) {
       throw new Error("expanded JSON MCP output did not render root and child connectors");
@@ -168,17 +166,18 @@ await withRendererHarness(
       throw new Error(`nested JSON guide color did not match root branch: ${JSON.stringify({ rootConnectorColor, childConnectorColor })}`);
     }
 
-    const prose = render("Found one repository\nOwner is example-org\nReady to inspect");
-    if (!prose.includes("Found one repository") || !prose.includes("Owner is example-org")) {
-      throw new Error("non-field MCP output did not fall back to a verbatim preview");
+    const proseCollapsed = render("Found one repository\nOwner is example-org\nReady to inspect");
+    if (!proseCollapsed.includes("Response · 3 lines") || proseCollapsed.includes("Found one repository")) {
+      throw new Error(`collapsed prose MCP output was not summary-only: ${JSON.stringify(proseCollapsed)}`);
     }
-    if (prose.includes("3 lines returned")) {
-      throw new Error("non-field MCP output regressed to the count-only result");
+    const proseExpanded = render("Found one repository\nOwner is example-org\nReady to inspect", true);
+    if (!proseExpanded.includes("Response · 3 lines") || !proseExpanded.includes("Found one repository") || !proseExpanded.includes("Owner is example-org")) {
+      throw new Error("MCP prose L0 did not reveal its verbatim payload");
     }
 
     const wrappedFinalRows = render(
       "The earlier MCP output line is long enough to wrap before the final line\nThe final MCP output line is long enough to wrap across several terminal rows",
-      false,
+      true,
       32,
     ).split("\n");
     const finalBranchIndex = wrappedFinalRows.findIndex((line) => line.startsWith("└ "));
@@ -194,6 +193,36 @@ await withRendererHarness(
     }
     if (finalContinuations.some((line) => !line.startsWith("  "))) {
       throw new Error(`wrapped MCP final line lost branch indentation: ${JSON.stringify(wrappedFinalRows)}`);
+    }
+
+    const scalarCollapsed = render("42");
+    const scalarExpanded = render("42", true);
+    if (!scalarCollapsed.includes("Response number") || scalarCollapsed.includes("└ 42")) {
+      throw new Error(`collapsed scalar MCP output was not type-only: ${JSON.stringify(scalarCollapsed)}`);
+    }
+    if (!scalarExpanded.includes("Response number") || !scalarExpanded.includes("42")) {
+      throw new Error(`MCP scalar L0 did not reveal its value: ${JSON.stringify(scalarExpanded)}`);
+    }
+
+    const errorComponent = mcp.renderResult(
+      { content: [{ type: "text", text: "Error: complete first failure line\nrequest id: fixture-123" }] },
+      { expanded: false, isPartial: false },
+      theme,
+      { state: {}, isError: true, lastComponent: undefined },
+    );
+    const collapsedError = plain(errorComponent.render(120).join("\n"));
+    if (!collapsedError.includes("Error: complete first failure line") || collapsedError.includes("request id: fixture-123")) {
+      throw new Error(`collapsed MCP error did not preserve only its first line: ${JSON.stringify(collapsedError)}`);
+    }
+    const expandedErrorComponent = mcp.renderResult(
+      { content: [{ type: "text", text: "Error: complete first failure line\nrequest id: fixture-123" }] },
+      { expanded: true, isPartial: false },
+      theme,
+      { state: {}, isError: true, lastComponent: undefined },
+    );
+    const expandedError = plain(expandedErrorComponent.render(120).join("\n"));
+    if ((expandedError.match(/Error: complete first failure line/g) ?? []).length !== 1 || !expandedError.includes("request id: fixture-123")) {
+      throw new Error(`expanded MCP error duplicated its summary or hid detail: ${JSON.stringify(expandedError)}`);
     }
 
     const legacyRenderer = {
@@ -227,13 +256,18 @@ await withRendererHarness(
     }
     execution.setArgsComplete();
     execution.updateResult({ content: [{ type: "text", text: fields }], isError: false }, false);
-    const integrated = plain(execution.render(120).join("\n"));
-    if (!integrated.includes("Repository") || integrated.includes("6 lines returned")) {
-      throw new Error("ToolExecutionComponent kept Pi's existing MCP renderer instead of the key/value scan");
+    const integratedRows = execution.render(120).map((line: string) => plain(line));
+    const integrated = integratedRows.join("\n");
+    if (!integrated.includes("Response · 6 lines") || integrated.includes("Repository") || integrated.includes("6 lines returned")) {
+      throw new Error(`ToolExecutionComponent did not render the MCP collapsed summary layer: ${JSON.stringify(integrated)}`);
     }
-    const repositoryRow = integrated.split("\n").find((line: string) => line.includes("Repository"));
-    if (!repositoryRow?.startsWith("├")) {
-      throw new Error(`MCP renderer ignored outputPad 0: ${JSON.stringify(repositoryRow)}`);
+    const integratedContentRows = integratedRows.filter((line: string) => line.trim());
+    if (!/^─+$/.test(integratedContentRows[0] ?? "") || !/^─+$/.test(integratedContentRows.at(-1) ?? "")) {
+      throw new Error(`standalone MCP did not retain its top and bottom borders: ${JSON.stringify(integratedRows)}`);
+    }
+    const responseRow = integrated.split("\n").find((line: string) => line.includes("Response · 6 lines"));
+    if (!responseRow?.startsWith("└")) {
+      throw new Error(`MCP renderer ignored outputPad 0: ${JSON.stringify(responseRow)}`);
     }
 
     const mcpAnchorExecution = new ToolExecutionComponent(
@@ -261,22 +295,48 @@ await withRendererHarness(
       }
       return undefined;
     };
+    const assertMcpFrame = (rows: string[], state: string): void => {
+      const contentRows = rows.filter((line) => line.trim());
+      if (!/^─+$/.test(contentRows[0] ?? "") || !/^─+$/.test(contentRows.at(-1) ?? "")) {
+        throw new Error(`standalone MCP ${state} lost its top or bottom border: ${JSON.stringify(rows)}`);
+      }
+    };
+    const collapsedMcpRows = mcpAnchorExecution.render(120).map((line: string) => plain(line));
+    assertMcpFrame(collapsedMcpRows, "collapsed layer");
+    if (collapsedMcpRows.some((line: string) => line.includes("MCP payload 1"))) {
+      throw new Error(`collapsed standalone MCP exposed payload: ${JSON.stringify(collapsedMcpRows)}`);
+    }
     if (!findMcpAnchor("expand") || !mcpAnchorExecution.activateClickAction("expand", "top")) {
       throw new Error("MCP collapsed expansion anchor did not activate");
     }
-    if (!findMcpAnchor("expand") || !findMcpAnchor("detail-extra")) {
-      throw new Error("expanded capped MCP output lacked inline collapse or extra-detail anchors");
+    const l0McpRows = mcpAnchorExecution.render(120).map((line: string) => plain(line));
+    assertMcpFrame(l0McpRows, "L0");
+    const l0Mcp = l0McpRows.join("\n");
+    if (!l0Mcp.includes("MCP payload 8") || l0Mcp.includes("MCP payload 9") || !findMcpAnchor("detail")) {
+      throw new Error(`MCP L0 did not stop at previewLines=8: ${JSON.stringify(l0Mcp)}`);
     }
-    if (!mcpAnchorExecution.activateClickAction("detail-extra", "top")
+    if (!mcpAnchorExecution.activateClickAction("detail", "top")
+      || mcpAnchorExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== 1) {
+      throw new Error("MCP L1 detail anchor did not activate");
+    }
+    const l1McpRows = mcpAnchorExecution.render(120).map((line: string) => plain(line));
+    assertMcpFrame(l1McpRows, "L1");
+    const l1Mcp = l1McpRows.join("\n");
+    if (!l1Mcp.includes("MCP payload 10") || l1Mcp.includes("MCP payload 11") || !findMcpAnchor("detail")) {
+      throw new Error(`MCP L1 did not stop at expandedPreviewMaxLines=10: ${JSON.stringify(l1Mcp)}`);
+    }
+    if (!mcpAnchorExecution.activateClickAction("detail", "top")
       || mcpAnchorExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== 2) {
-      throw new Error("MCP extra-detail anchor did not activate maximum detail");
+      throw new Error("MCP L2 detail anchor did not activate");
     }
-    if (!findMcpAnchor("detail-extra") || !mcpAnchorExecution.activateClickAction("detail-extra", "top")
-      || mcpAnchorExecution.rendererState[Symbol.for("pi-claude-style-tools:tool-click-detail-level")] !== undefined) {
-      throw new Error("MCP less-detail anchor did not return to normal detail");
+    const l2McpRows = mcpAnchorExecution.render(120).map((line: string) => plain(line));
+    assertMcpFrame(l2McpRows, "L2");
+    const l2Mcp = l2McpRows.join("\n");
+    if (!l2Mcp.includes("MCP payload 15") || l2Mcp.includes("MCP payload 16") || !findMcpAnchor("expand", "bottom")) {
+      throw new Error(`MCP L2 did not stop at extraExpandedPreviewMaxLines=15 with a collapse row: ${JSON.stringify(l2Mcp)}`);
     }
-    if (!mcpAnchorExecution.activateClickAction("expand", "top") || mcpAnchorExecution.expanded) {
-      throw new Error("MCP inline collapse anchor did not collapse");
+    if (!mcpAnchorExecution.activateClickAction("expand", "bottom") || mcpAnchorExecution.expanded) {
+      throw new Error("MCP terminal collapse anchor did not collapse");
     }
     if (!findMcpAnchor("header") || !mcpAnchorExecution.activateClickAction("header", "top") || !mcpAnchorExecution.expanded) {
       throw new Error("MCP header anchor did not expand");
@@ -285,14 +345,62 @@ await withRendererHarness(
     writeAgentSettings({ outputPad: 1 });
     await new Promise((resolve) => setTimeout(resolve, 300));
     const directPadded = render(fields);
-    const directPaddedRepositoryRow = directPadded.split("\n").find((line) => line.includes("Repository"));
-    if (!directPaddedRepositoryRow?.startsWith(" ├")) {
-      throw new Error(`self-rendered MCP output ignored outputPad 1: ${JSON.stringify(directPaddedRepositoryRow)}`);
+    const directPaddedResponseRow = directPadded.split("\n").find((line) => line.includes("Response · 6 lines"));
+    if (!directPaddedResponseRow?.startsWith(" └")) {
+      throw new Error(`self-rendered MCP output ignored outputPad 1: ${JSON.stringify(directPaddedResponseRow)}`);
     }
     const padded = plain(execution.render(120).join("\n"));
-    const paddedRepositoryRow = padded.split("\n").find((line: string) => line.includes("Repository"));
-    if (!paddedRepositoryRow?.startsWith(" ├")) {
-      throw new Error(`MCP renderer ignored outputPad 1: ${JSON.stringify(paddedRepositoryRow)}`);
+    const paddedResponseRow = padded.split("\n").find((line: string) => line.includes("Response · 6 lines"));
+    if (!paddedResponseRow?.startsWith(" └")) {
+      throw new Error(`MCP renderer ignored outputPad 1: ${JSON.stringify(paddedResponseRow)}`);
+    }
+
+    const makeShortGroupedExecution = (id: string, toolName: string, payload: string) => {
+      const component = new ToolExecutionComponent(
+        "mcp",
+        id,
+        { server: "github", tool: toolName },
+        {},
+        legacyDefinition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      component.markExecutionStarted();
+      component.setArgsComplete();
+      component.updateResult({ content: [{ type: "text", text: payload }], isError: false }, false);
+      return component;
+    };
+    const groupedFirst = makeShortGroupedExecution(
+      "call_short_group_1",
+      "get_repository",
+      JSON.stringify({ repository: "MCP_FIRST_UNIT_PAYLOAD", private: false }),
+    );
+    const groupedSecond = makeShortGroupedExecution(
+      "call_short_group_2",
+      "list_commits",
+      JSON.stringify({ commits: ["MCP_SECOND_UNIT_PAYLOAD"] }),
+    );
+    const shortGroupParent = new Container();
+    shortGroupParent.addChild(groupedFirst);
+    shortGroupParent.addChild(groupedSecond);
+    const shortGroup = (shortGroupParent as any).children[0];
+    const collapsedGroupRows = shortGroupParent.render(120).map((line: string) => plain(line));
+    const firstChildRow = collapsedGroupRows.findIndex((line: string) => line.includes("get_repository"));
+    const firstChildX = firstChildRow < 0 ? -1 : collapsedGroupRows[firstChildRow].indexOf("get_repository");
+    if (
+      firstChildX < 0
+      || collapsedGroupRows.some((line: string) => line.includes("Response") || line.includes("MCP_FIRST_UNIT_PAYLOAD"))
+      || !shortGroup.toggleToolAtPoint(firstChildX, firstChildRow)
+    ) {
+      throw new Error(`short grouped MCP child did not activate from its execution summary: ${JSON.stringify(collapsedGroupRows)}`);
+    }
+    const firstChildExpandedRows = shortGroupParent.render(120).map((line: string) => plain(line));
+    if (
+      !firstChildExpandedRows.some((line: string) => line.includes("Response object (2 fields)"))
+      || !firstChildExpandedRows.some((line: string) => line.includes("MCP_FIRST_UNIT_PAYLOAD"))
+      || firstChildExpandedRows.some((line: string) => line.includes("MCP_SECOND_UNIT_PAYLOAD"))
+    ) {
+      throw new Error(`grouped MCP child expansion did not isolate L0: ${JSON.stringify(firstChildExpandedRows)}`);
     }
 
     const groupedPeer = new ToolExecutionComponent(
@@ -318,7 +426,7 @@ await withRendererHarness(
     const childCallRow = expandedGroupLines.find((line: string) => line.includes("MCP") && line.includes("get_repository"));
     const nestedResultRow = expandedGroupLines.find((line: string) => line.includes("Repository"));
     const childFirstCharacterColumn = childCallRow?.indexOf("●") ?? -1;
-    const nestedGuideColumn = nestedResultRow ? Math.max(nestedResultRow.indexOf("├"), nestedResultRow.indexOf("└")) : -1;
+    const nestedGuideColumn = nestedResultRow ? Math.max(nestedResultRow.lastIndexOf("│"), nestedResultRow.lastIndexOf("├"), nestedResultRow.lastIndexOf("└")) : -1;
     if (childFirstCharacterColumn < 0 || nestedGuideColumn !== childFirstCharacterColumn) {
       throw new Error(`grouped nested guide was not below the child row's first character: ${JSON.stringify({ childCallRow, nestedResultRow })}`);
     }
@@ -415,6 +523,84 @@ await withRendererHarness(
       throw new Error(`grouped JSON tree lost one or more indentation levels: ${JSON.stringify({ groupedJsonColumns, jsonCallRow, jsonResponseRow, jsonRootFieldRow, jsonArrayItemRow, jsonNestedFieldRow })}`);
     }
 
-    console.log("OK  MCP scan, JSON, prose, wrapping, renderer priority, lifecycle, outputPad, and grouped alignment");
+    const imageComponent = mcp.renderResult(
+      { content: [{ type: "image", data: "", mimeType: "image/png" }] },
+      { expanded: false, isPartial: false },
+      theme,
+      { state: {}, isError: false, lastComponent: undefined },
+    );
+    const imageRows = imageComponent.render(120).map((line: string) => plain(line));
+    if (!imageRows.some((line: string) => line.includes("Response image") && line.includes("image/png"))) {
+      throw new Error(`MCP image response did not report its type: ${JSON.stringify(imageRows)}`);
+    }
+
+    const savedCapabilities = getCapabilities();
+    setCapabilities({ ...savedCapabilities, images: "iterm2" });
+    try {
+      const imageExecution = new ToolExecutionComponent(
+        "mcp",
+        "call_image_fixture",
+        { server: "fixture", tool: "image" },
+        {},
+        mcp,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      imageExecution.markExecutionStarted();
+      imageExecution.setArgsComplete();
+      imageExecution.updateResult({
+        content: [{
+          type: "image",
+          data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+          mimeType: "image/png",
+        }],
+        isError: false,
+      }, false);
+      if (imageExecution.imageComponents.length !== 0) {
+        throw new Error("collapsed MCP image exposed its payload before local expansion");
+      }
+      const imageActivated = imageExecution.activateClickAction("expand", "top");
+      if (!imageActivated || imageExecution.imageComponents.length !== 1) {
+        throw new Error(`expanded MCP image did not reveal its image payload: ${JSON.stringify({ imageActivated, expanded: imageExecution.expanded, imageCount: imageExecution.imageComponents.length, rows: imageExecution.render(120).map((line: string) => plain(line)) })}`);
+      }
+    } finally {
+      setCapabilities(savedCapabilities);
+    }
+
+    writePiSettings({
+      clickExpansion: true,
+      expandedPreviewMaxLines: 10,
+      extraExpandedPreviewMaxLines: 15,
+      mcpOutputMode: "summary",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const summaryOnlyComponent = mcp.renderResult(
+      summaryResult,
+      { expanded: true, isPartial: false },
+      theme,
+      { state: {}, isError: false, lastComponent: undefined },
+    );
+    const summaryOnlyRows = summaryOnlyComponent.render(120).map((line: string) => plain(line));
+    if (
+      !summaryOnlyRows.some((line: string) => line.includes("Response object (2 fields)"))
+      || summaryOnlyRows.some((line: string) => line.includes("ok") || line.includes("count"))
+      || (summaryOnlyComponent as any).getSemanticRows().length > 0
+    ) {
+      throw new Error(`MCP summary mode exposed payload or click anchors: ${JSON.stringify({ summaryOnlyRows, semanticRows: (summaryOnlyComponent as any).getSemanticRows() })}`);
+    }
+
+    const summaryGroupParent = new Container();
+    summaryGroupParent.addChild(makeShortGroupedExecution("call_summary_group_1", "get_repository", summaryResult.content[0].text));
+    summaryGroupParent.addChild(makeShortGroupedExecution("call_summary_group_2", "list_commits", summaryResult.content[0].text));
+    const summaryGroup = (summaryGroupParent as any).children[0];
+    const summaryGroupRows = summaryGroupParent.render(120).map((line: string) => plain(line));
+    if (
+      summaryGroupRows.some((line: string) => line.includes("click any for details") || line.includes("Response"))
+      || summaryGroup.clickAnchors.length > 0
+    ) {
+      throw new Error(`MCP summary-mode group exposed dead click anchors: ${JSON.stringify({ summaryGroupRows, clickAnchors: summaryGroup.clickAnchors })}`);
+    }
+
+    console.log("OK  MCP collapsed summary, L0/L1/L2, shapes, errors, renderer priority, and grouped child isolation");
   },
 );

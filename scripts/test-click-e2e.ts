@@ -14,6 +14,8 @@ const expectFiles = [
   "e2e/expect/collapse-scroll-position.expect",
   "e2e/expect/tool-group-click.expect",
   "e2e/expect/mcp-batch-anchor.expect",
+  "e2e/expect/mcp-group-click.expect",
+  "e2e/expect/mcp-standalone-frame.expect",
   "e2e/expect/grouped-output-indentation.expect",
   "e2e/expect/expanded-output-indentation.expect",
   "e2e/expect/standalone-bash-output-shape.expect",

@@ -1,0 +1,80 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen reproduction for the standalone MCP frame and collapsed summary grammar.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set registration_fixture [file join $repo_dir "e2e" "fixtures" "register-mcp.ts"]
+set session_fixture [file join $repo_dir "e2e" "fixtures" "mcp-standalone-frame-session.jsonl"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-mcp-standalone-frame-e2e-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set session_path [file join $scratch "session.jsonl"]
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $session_fixture "r"]
+set session_content [read $fixture]
+close $fixture
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-mcp-standalone-frame-e2e" $cwd] $session_content]
+close $session
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"groupToolCalls":true,"mcpOutputMode":"preview","previewLines":8,"expandedPreviewMaxLines":4000,"extraExpandedPreviewMaxLines":12000}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  send "\003\003"
+  catch {close}
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+cd $cwd
+log_file -noappend [file join $scratch "standalone.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=100 LINES=40 PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $extension_path -e $registration_fixture --tui-mode fullscreen
+stty columns 100 rows 40
+
+if {![wait_for 10 {─{20,}}]} {
+  fail "standalone MCP did not render its top border" $scratch
+}
+if {![wait_for 2 {MCP.*github:get_repository}]} {
+  fail "standalone MCP top border did not precede its execution row" $scratch
+}
+if {![wait_for 2 {Response.*object.*\(6 fields\).*click.*expand}]} {
+  fail "standalone MCP summary did not use 'Response object (6 fields) • click to expand'" $scratch
+}
+if {![wait_for 2 {─{20,}}]} {
+  fail "standalone MCP did not retain its bottom border" $scratch
+}
+
+send "\003\003"
+catch {close}
+file delete -force $scratch
+puts "PASS standalone MCP frame and collapsed summary grammar"

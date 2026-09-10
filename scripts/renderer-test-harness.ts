@@ -41,6 +41,8 @@ export async function withRendererHarness(
   };
   const writePiSettings = (settings: Record<string, unknown>): void => {
     fs.writeFileSync(path.join(tempPiDir, "settings.json"), JSON.stringify(settings));
+    const cache = (globalThis as any)[Symbol.for("pi-claude-style-tools:settings-cache")];
+    if (cache) cache.entry = null;
   };
   writeAgentSettings(config.agentSettings ?? { outputPad: 0 });
   writePiSettings(config.piSettings ?? {

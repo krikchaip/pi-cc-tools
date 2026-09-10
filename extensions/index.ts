@@ -940,7 +940,7 @@ function getCollapsedToolEntryLines(entry: CollapsedToolEntry, width: number, gr
 function getExpandedToolGroupLines(tool: any, width: number, groupedLabel?: string): string[] {
 	const rendered = stripToolChrome(tool.render(Math.max(1, width)));
 	const jsonTreeRootIndex = rendered.findIndex((line, lineIndex) => (
-		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+·/.test(stripAnsi(line).trimStart())
+		lineIndex > 0 && /^[├└]\s+Response\s+(?:object|array)\s+\(/.test(stripAnsi(line).trimStart())
 	));
 	const closedContinuationTrims = closedBranchContinuationTrims(rendered);
 	const lines = rendered.map((line, lineIndex) => {
@@ -1223,7 +1223,9 @@ class ToolGroupComponent extends Container {
 	}
 
 	private clickAnchorsEnabled(): boolean {
-		return !this.expanded && this.tools.some((tool) => toolClickExpansionActive(tool));
+		return !this.expanded && this.tools.some((tool) => (
+			toolClickExpansionActive(tool) && toolHasEffectiveClickAction(tool)
+		));
 	}
 
 	clickAnchorAtPoint(x: number, y: number): ToolGroupClickAnchor | undefined {
@@ -1324,7 +1326,12 @@ class ToolGroupComponent extends Container {
 				getToolStatusForGroup(tool),
 				{ agentBreathe: isAgentFamilyToolName(getToolName(tool)) },
 			);
-			if (clicksEnabled && branched.length > 0) {
+			if (
+				clicksEnabled
+				&& toolClickExpansionActive(tool)
+				&& toolHasEffectiveClickAction(tool)
+				&& branched.length > 0
+			) {
 				const callRows = isToolTextComponent(tool.callRendererComponent)
 					? tool.callRendererComponent.getSemanticRows().filter((row: ToolTextSemanticRow) => row.action === "header").length
 					: 0;
@@ -2592,7 +2599,9 @@ function toolSupportsProgressiveLocalDetail(tool: any): boolean {
 		|| name === "apply_patch"
 		|| name === "find"
 		|| name === "ls"
-		|| name === "tasklist";
+		|| name === "tasklist"
+		|| isMcpToolName(name)
+		|| isMcpToolCandidate(tool?.toolDefinition);
 }
 
 function tieredToolNormalPreviewLimit(tool: any): number {
@@ -3820,7 +3829,11 @@ function patchReadImageExpansion(): void {
 	proto.updateDisplay = function patchedReadImageUpdateDisplay(...args: any[]) {
 		const result = originalUpdateDisplay.apply(this, args);
 		const hasImage = Array.isArray(this.result?.content) && this.result.content.some((block: any) => block?.type === "image");
-		if (this.toolName === "read" && hasImage && this.expanded !== true) {
+		const isMcp = isMcpToolName(this.toolName ?? "") || isMcpToolCandidate(this.toolDefinition);
+		const mcpMode = getMode(readSettings().mcpOutputMode, ["hidden", "summary", "preview"] as const, "preview");
+		const hideImage = this.toolName === "read" && this.expanded !== true
+			|| isMcp && (this.expanded !== true || mcpMode !== "preview");
+		if (hasImage && hideImage) {
 			removeImageChildren(this);
 			clearToolRenderCache(this);
 		}
@@ -3921,6 +3934,28 @@ function activateToolClickAction(
 	return true;
 }
 
+function frameStandaloneMcpLines(rendered: string[], width: number): string[] {
+	let start = 0;
+	while (start < rendered.length && isBlankLine(rendered[start])) start++;
+	let end = rendered.length - 1;
+	while (end >= start && isBlankLine(rendered[end])) end--;
+	if (start > end) return rendered;
+
+	const safeWidth = Math.max(1, width);
+	const { textLines, imageLines } = splitRenderedImageBlock(rendered.slice(start, end + 1));
+	const core = textLines.map((line) => (
+		clampLineWidth(stripOuterBackgroundAnsi(normalizeLeadingCheckGlyph(line)), safeWidth)
+	));
+	if (core.length === 0) return rendered;
+	return [
+		" ".repeat(safeWidth),
+		borderLine(safeWidth),
+		...core,
+		borderLine(safeWidth),
+		...imageLines,
+	];
+}
+
 function patchToolExecutionRenderers(): void {
 	const proto = ToolExecutionComponent.prototype as any;
 	if (proto[TOOL_EXECUTION_PATCH_FLAG]) return;
@@ -3938,8 +3973,10 @@ function patchToolExecutionRenderers(): void {
 				if (isToolTextComponent(component)) (component as any)[TOOL_CLICK_OWNER] = this;
 			}
 			const rendered = originalRender.call(this, width);
-			updateToolClickAnchors(this, rendered);
-			return rendered;
+			const isMcp = isMcpToolName(this.toolName ?? "") || isMcpToolCandidate(this.toolDefinition);
+			const output = isMcp ? frameStandaloneMcpLines(rendered, width) : rendered;
+			updateToolClickAnchors(this, output);
+			return output;
 		};
 	}
 
@@ -7983,13 +8020,13 @@ interface McpKeyValueField {
 	value: string;
 }
 
-const MCP_COLLAPSED_SCAN_LINES = 4;
-const MCP_MAX_JSON_TREE_LINES = 1_000;
 const MCP_FIELD_KEY_PATTERN = /^[\p{L}\p{N}][\p{L}\p{N} _./()-]{0,31}$/u;
 
-interface McpJsonTree {
-	lines: string[];
-	totalLineCount: number;
+interface McpResponsePresentation {
+	summary: string;
+	payloadLines: string[];
+	totalPayloadLines: number;
+	revealsImage?: boolean;
 }
 
 function isMcpJsonContainer(value: unknown): value is unknown[] | Record<string, unknown> {
@@ -8002,35 +8039,56 @@ function mcpJsonEntries(value: unknown[] | Record<string, unknown>): Array<[stri
 		: Object.entries(value);
 }
 
-function mcpJsonContainerMetadata(value: unknown[] | Record<string, unknown>, theme: Theme): string {
+function mcpJsonContainerMetadata(
+	value: unknown[] | Record<string, unknown>,
+	theme: Theme,
+	summary = false,
+): string {
 	const count = Array.isArray(value) ? value.length : Object.keys(value).length;
 	const kind = Array.isArray(value) ? "array" : "object";
 	const unit = Array.isArray(value) ? "item" : "field";
-	return `${theme.fg("accent", kind)}${theme.fg("dim", ` · ${count} ${unit}${count === 1 ? "" : "s"}`)}`;
+	const countText = `${count} ${unit}${count === 1 ? "" : "s"}`;
+	return `${theme.fg("accent", kind)}${theme.fg("dim", summary ? ` (${countText})` : ` · ${countText}`)}`;
 }
 
 function formatMcpJsonPrimitive(value: unknown, theme: Theme): string {
 	if (value === null) return theme.fg("muted", "null");
-	if (typeof value === "string") return theme.fg("toolOutput", value.replace(/\s+/g, " ").trim());
+	if (typeof value === "string") return theme.fg("toolOutput", value.replace(/\s+/g, " ").trim() || " ");
 	if (typeof value === "boolean") return theme.fg(value ? "success" : "warning", String(value));
 	return theme.fg("accent", String(value));
 }
 
-function parseMcpJsonTree(raw: string, theme: Theme): McpJsonTree | null {
+function mcpJsonPrimitiveType(value: unknown): string {
+	return value === null ? "null" : typeof value;
+}
+
+function parseMcpJsonResponse(raw: string, theme: Theme): McpResponsePresentation | null {
 	try {
 		const parsed: unknown = JSON.parse(raw);
-		if (!isMcpJsonContainer(parsed)) return null;
-		const lines: string[] = [];
-		let totalLineCount = 1;
+		if (!isMcpJsonContainer(parsed)) {
+			return {
+				summary: `${theme.bold("Response")} ${theme.fg("accent", mcpJsonPrimitiveType(parsed))}`,
+				payloadLines: [formatMcpJsonPrimitive(parsed, theme)],
+				totalPayloadLines: 1,
+			};
+		}
+
+		const payloadLines: string[] = [];
+		let totalPayloadLines = 0;
+		const storedLineLimit = Math.max(
+			previewLimit(),
+			configuredExpandedPreviewLimit(false),
+			configuredExpandedPreviewLimit(true),
+		);
 		const addLine = (line: string): void => {
-			if (lines.length < MCP_MAX_JSON_TREE_LINES) lines.push(line);
+			if (payloadLines.length < storedLineLimit) payloadLines.push(line);
 		};
 		const renderChildren = (container: unknown[] | Record<string, unknown>, prefix: string): void => {
 			const children = mcpJsonEntries(container);
 			const keyWidth = Math.max(0, ...children.map(([label]) => visibleWidth(label)));
 			children.forEach(([label, child], index) => {
 				const last = index === children.length - 1;
-				totalLineCount += 1;
+				totalPayloadLines += 1;
 				const connector = last ? "└" : "├";
 				const lead = `${currentToolBranchAnsi(theme)}${prefix}${connector}${TRANSPARENT_RESET} `;
 				const paddedLabel = `${label}${" ".repeat(Math.max(0, keyWidth - visibleWidth(label)))}`;
@@ -8044,17 +8102,15 @@ function parseMcpJsonTree(raw: string, theme: Theme): McpJsonTree | null {
 				renderChildren(child, nextPrefix);
 			});
 		};
-		addLine(`${theme.bold("Response")}  ${mcpJsonContainerMetadata(parsed, theme)}`);
 		renderChildren(parsed, "");
-		return { lines, totalLineCount };
+		return {
+			summary: `${theme.bold("Response")} ${mcpJsonContainerMetadata(parsed, theme, true)}`,
+			payloadLines,
+			totalPayloadLines,
+		};
 	} catch {
 		return null;
 	}
-}
-
-function renderMcpJsonTree(tree: McpJsonTree, expanded: boolean, theme: Theme): string {
-	const lines = tree.lines.map((line, index) => index === 0 ? markResultSummary(line) : line);
-	return buildPreviewText(lines, expanded, theme, previewLimit(), tree.totalLineCount);
 }
 
 function parseMcpKeyValueFields(lines: string[]): McpKeyValueField[] | null {
@@ -8070,13 +8126,54 @@ function parseMcpKeyValueFields(lines: string[]): McpKeyValueField[] | null {
 	return fields;
 }
 
-function renderMcpKeyValueFields(fields: McpKeyValueField[], expanded: boolean, theme: Theme): string {
-	const keyWidth = Math.max(...fields.map(({ key }) => key.length));
-	const rows = fields.map(({ key, value }) => (
-		`${theme.fg("muted", key.padEnd(keyWidth))}  ${theme.fg("toolOutput", value || " ")}`
+function renderMcpKeyValueFields(fields: McpKeyValueField[], theme: Theme): string[] {
+	const keyWidth = Math.max(...fields.map(({ key }) => visibleWidth(key)));
+	return fields.map(({ key, value }) => (
+		`${theme.fg("muted", `${key}${" ".repeat(Math.max(0, keyWidth - visibleWidth(key)))}`)}  ${theme.fg("toolOutput", value || " ")}`
 	));
-	const collapsedLimit = Math.min(MCP_COLLAPSED_SCAN_LINES, previewLimit());
-	return buildPreviewText(rows, expanded, theme, collapsedLimit, fields.length);
+}
+
+function mcpTextPresentation(lines: string[], theme: Theme): McpResponsePresentation {
+	const fields = parseMcpKeyValueFields(lines);
+	return {
+		summary: theme.fg("muted", `Response · ${lines.length} line${lines.length === 1 ? "" : "s"}`),
+		payloadLines: fields
+			? renderMcpKeyValueFields(fields, theme)
+			: lines.map((line) => theme.fg("toolOutput", line || " ")),
+		totalPayloadLines: lines.length,
+	};
+}
+
+function mcpExpandedPresentation(
+	presentation: McpResponsePresentation,
+	expanded: boolean,
+	theme: Theme,
+	ctx: any,
+): string {
+	if (presentation.revealsImage && presentation.totalPayloadLines === 0) {
+		const collapse = encodedClickHint("expand", expandHint(theme, "collapse"));
+		return withBranch(`${markResultSummary(presentation.summary)}${collapse}`, theme);
+	}
+	const localClickControls = progressiveLocalControlsEnabled();
+	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
+	const detailExpanded = localClickControls ? localDetailLevel > 0 : expanded;
+	const indicator = progressivePreviewIndicator(
+		expanded,
+		ctx.state,
+		presentation.totalPayloadLines,
+		previewLimit(),
+	);
+	const payload = buildPreviewText(
+		presentation.payloadLines,
+		detailExpanded,
+		theme,
+		previewLimit(),
+		presentation.totalPayloadLines,
+		undefined,
+		indicator,
+	);
+	const body = `${markResultSummary(presentation.summary)}${payload ? `\n${payload}` : ""}`;
+	return withFinalBranchBlock(body, theme);
 }
 
 function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean, theme: Theme, ctx: any): Text {
@@ -8093,30 +8190,47 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 
 	const raw = getTextContent(result).trim();
 	const lines = raw ? raw.split("\n") : [];
-	if (lines.length === 0) {
-		return makeMcpText(ctx.lastComponent, withBranch(markResultSummary(theme.fg(ctx.isError ? "error" : "success", ctx.isError ? "Failed" : "Done")), theme));
-	}
+	const image = Array.isArray(result?.content)
+		? result.content.find((block: any) => block?.type === "image")
+		: undefined;
+	let presentation: McpResponsePresentation;
 
-	const statusText = ctx.isError
-		? theme.fg("error", lines[0])
-		: markResultSummary(theme.fg("muted", `${lines.length} line${lines.length === 1 ? "" : "s"} returned`));
-	if (mode === "summary") return makeMcpText(ctx.lastComponent, withBranch(statusText, theme));
 	if (ctx.isError) {
-		if (!expanded) return makeMcpText(ctx.lastComponent, withBranch(`${statusText}${toolOutputDetailHint(theme, expanded)}`, theme));
-		const errorPreview = buildPreviewText(lines, true, theme, previewLimit(), lines.length, (line) => theme.fg("error", line || " "));
-		return makeMcpText(ctx.lastComponent, withFinalBranchBlock(errorPreview, theme));
+		const firstLine = lines[0] || "Failed";
+		presentation = {
+			summary: theme.fg("error", firstLine),
+			payloadLines: lines.slice(1).map((line) => theme.fg("error", line || " ")),
+			totalPayloadLines: Math.max(0, lines.length - 1),
+		};
+	} else if (image) {
+		const mimeType = typeof image.mimeType === "string" && image.mimeType ? image.mimeType : "image";
+		presentation = {
+			summary: `${theme.bold("Response")} ${theme.fg("accent", "image")} ${theme.fg("dim", `· ${mimeType}`)}`,
+			payloadLines: lines.map((line) => theme.fg("toolOutput", line || " ")),
+			totalPayloadLines: lines.length,
+			revealsImage: true,
+		};
+	} else if (lines.length === 0) {
+		presentation = {
+			summary: theme.fg("success", "Done"),
+			payloadLines: [],
+			totalPayloadLines: 0,
+		};
+	} else {
+		presentation = parseMcpJsonResponse(raw, theme) ?? mcpTextPresentation(lines, theme);
 	}
 
-	const jsonTree = parseMcpJsonTree(raw, theme);
-	if (jsonTree) {
-		const preview = renderMcpJsonTree(jsonTree, expanded, theme);
-		return makeMcpText(ctx.lastComponent, withBranch(preview, theme));
+	const hasDetail = presentation.totalPayloadLines > 0 || presentation.revealsImage === true;
+	if (mode === "summary" || !hasDetail) {
+		return makeMcpText(ctx.lastComponent, withBranch(presentation.summary, theme));
 	}
-	const fields = parseMcpKeyValueFields(lines);
-	const preview = fields
-		? renderMcpKeyValueFields(fields, expanded, theme)
-		: buildPreviewText(lines, expanded, theme, previewLimit(), lines.length, (line) => theme.fg("toolOutput", line || " "));
-	return makeMcpText(ctx.lastComponent, withFinalBranchBlock(preview, theme));
+	if (!expanded) {
+		return makeMcpText(
+			ctx.lastComponent,
+			withBranch(`${markResultSummary(presentation.summary)}${toolOutputDetailHint(theme, false)}`, theme),
+		);
+	}
+	return makeMcpText(ctx.lastComponent, mcpExpandedPresentation(presentation, expanded, theme, ctx));
 }
 
 function summarizeOpenAiToolCall(name: string, args: any, theme: Theme, sp: (path: string) => string): string {
