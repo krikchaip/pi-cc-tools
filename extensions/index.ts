@@ -1010,7 +1010,13 @@ function formatBranchedToolLines(
 	return output;
 }
 
-const NON_GROUPABLE_TOOL_NAMES = new Set(["edit", "write", "apply_patch"]);
+const NON_GROUPABLE_TOOL_NAMES = new Set([
+	"edit",
+	"write",
+	"apply_patch",
+	"ask_parent",
+	"subagent_done",
+]);
 // /reload keeps old group instances alive while commands run from the new module.
 const ACTIVE_TOOL_GROUPS = ((globalThis as any)[ACTIVE_TOOL_GROUPS_KEY] ??= new Set<any>()) as Set<any>;
 
@@ -1057,6 +1063,18 @@ let activeNativeMouseDispatch: {
 	renderer: ToolGroupFullscreenRenderer;
 } | undefined;
 
+function requestedToolClickViewportAnchor(
+	tool: any,
+	action: ToolClickAction,
+	viewportAnchor: ToolViewportAnchor,
+): RequestedToolCollapseViewportAnchor {
+	return action === "expand"
+		&& tool?.expanded === true
+		&& isSideQuestBinaryTool(tool)
+		? "adaptive"
+		: viewportAnchor;
+}
+
 function captureToolClickState(
 	tool: any,
 	action?: ToolClickAction,
@@ -1066,7 +1084,12 @@ function captureToolClickState(
 		expanded: tool?.expanded === true,
 		locallyExpanded: tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true,
 		detailLevel: toolLocalDetailLevel(tool),
-		collapseViewport: action ? captureToolCollapseViewport(tool, viewportAnchor) : undefined,
+		collapseViewport: action
+			? captureToolCollapseViewport(
+				tool,
+				requestedToolClickViewportAnchor(tool, action, viewportAnchor),
+			)
+			: undefined,
 	};
 }
 
@@ -4036,7 +4059,10 @@ function activateToolClickAction(
 	if ((action === "header" || action === "expand") && !toolHasEffectiveClickAction(tool)) return false;
 	if (action === "detail" && toolSupportsProgressiveLocalDetail(tool) && toolLocalDetailLevel(tool) === 2) return false;
 	clearPendingToolCollapseViewport(tool.rendererState);
-	const clickViewport = captureToolCollapseViewport(tool, viewportAnchor);
+	const clickViewport = captureToolCollapseViewport(
+		tool,
+		requestedToolClickViewportAnchor(tool, action, viewportAnchor),
+	);
 	const pendingViewport = clickViewport
 		? queuePendingToolCollapseViewport(tool.rendererState, clickViewport)
 		: undefined;

@@ -34,6 +34,8 @@ const expectFiles = [
   "e2e/expect/standalone-skill-anchor.expect",
   "e2e/expect/custom-renderer-preservation.expect",
   "e2e/expect/side-quests-click-adapter.expect",
+  "e2e/expect/side-quests-ask-parent-viewport.expect",
+  "e2e/expect/side-quests-wrap-up-group-viewport.expect",
   "e2e/expect/historical-status-reconstruction.expect",
 ];
 
