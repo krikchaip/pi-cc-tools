@@ -10,6 +10,7 @@ interface RendererHarnessConfig {
   stubTools: string[];
   agentSettings?: Record<string, unknown>;
   piSettings?: Record<string, unknown>;
+  beforeExtension?: (context: { fakePi: any; ToolExecutionComponent: any }) => void | Promise<void>;
 }
 
 interface RendererHarness {
@@ -81,12 +82,13 @@ export async function withRendererHarness(
   };
 
   try {
-    const extension = await import("../extensions/index.ts");
-    extension.default(fakePi as any);
-    await emitLifecycle("session_start");
     const { ToolExecutionComponent } = await import(
       "../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/tool-execution.js"
     );
+    await config.beforeExtension?.({ fakePi, ToolExecutionComponent });
+    const extension = await import("../extensions/index.ts");
+    extension.default(fakePi as any);
+    await emitLifecycle("session_start");
     const { Container } = await import("../node_modules/@earendil-works/pi-tui/dist/tui.js");
     try {
       await run({

@@ -33,6 +33,7 @@ const expectFiles = [
   "e2e/expect/reload-tool-background.expect",
   "e2e/expect/standalone-skill-anchor.expect",
   "e2e/expect/custom-renderer-preservation.expect",
+  "e2e/expect/side-quests-click-adapter.expect",
   "e2e/expect/historical-status-reconstruction.expect",
 ];
 

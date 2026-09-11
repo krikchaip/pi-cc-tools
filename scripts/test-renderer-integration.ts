@@ -12,18 +12,46 @@ import {
   withRendererHarness,
 } from "./renderer-test-harness.ts";
 
+const PRELOADED_AGENT_GETTER = Symbol.for("pi-cc-tools:test-preloaded-agent-getter");
+
 await withRendererHarness(
   {
     name: "renderer-integration",
-    stubTools: ["apply_patch", "web_search", "TaskList"],
+    stubTools: ["apply_patch", "web_search", "TaskList", "Agent", "ask_parent", "subagent_done"],
+    beforeExtension: ({ ToolExecutionComponent }) => {
+      const prototype = ToolExecutionComponent.prototype as any;
+      const delegatedGetter = prototype.getResultRenderer;
+      const producerGetter = function (this: any): any {
+        if (this.toolName === "Agent" && this.isPartial !== true && this.result?.isError !== true) {
+          return this.toolDefinition?.renderResult;
+        }
+        return delegatedGetter.call(this);
+      };
+      prototype.getResultRenderer = producerGetter;
+      (globalThis as any)[PRELOADED_AGENT_GETTER] = producerGetter;
+    },
   },
   async ({ fakePi, theme, ToolExecutionComponent, Container, emitLifecycle, writePiSettings }) => {
     const {
       BashExecutionComponent,
       BranchSummaryMessageComponent,
       CompactionSummaryMessageComponent,
+      CustomMessageComponent,
     } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/index.js");
+    const { Box, Text } = await import("../node_modules/@earendil-works/pi-tui/dist/index.js");
+    const reportedDefects: string[] = [];
     const builtinWidth = 72;
+    const hasExactPaintedVerticalPadding = (rows: string[]): boolean => {
+      if (rows.length < 4) return false;
+      const painted = rows.map((line) => line.includes("\x1b[48;"));
+      return !painted[0]
+        && plain(rows[0]).trim().length === 0
+        && painted.slice(1).every(Boolean)
+        && plain(rows[1]).trim().length === 0
+        && plain(rows[2]).trim().length > 0
+        && plain(rows.at(-2) ?? "").trim().length > 0
+        && plain(rows.at(-1) ?? "").trim().length === 0;
+    };
     const assertWholeComponentToggle = (component: any, expandedNeedle: string, label: string): void => {
       const collapsedRows = component.render(builtinWidth).map((line: string) => plain(line));
       for (const y of collapsedRows.keys()) {
@@ -31,10 +59,10 @@ await withRendererHarness(
           component.clickActionAtPoint?.(0, y) !== "expand"
           || component.clickActionAtPoint?.(builtinWidth - 1, y) !== "expand"
         ) {
-          throw new Error(`${label} collapsed component was not clickable across its full bounds at row ${y}`);
+          throw new Error(`${label} collapsed component was not clickable across its full bounds at row ${y}: ${JSON.stringify({ left: component.clickActionAtPoint?.(0, y), right: component.clickActionAtPoint?.(builtinWidth - 1, y), collapsedRows })}`);
         }
       }
-      if (!component.activateClickAction?.("expand") || component.expanded !== true) {
+      if (!component.activateClickAction?.("expand") || (component.expanded ?? component._expanded) !== true) {
         throw new Error(`${label} did not expand from its whole-component action`);
       }
       const expandedRows = component.render(builtinWidth).map((line: string) => plain(line));
@@ -49,7 +77,7 @@ await withRendererHarness(
           throw new Error(`${label} expanded component was not clickable across its full bounds at row ${y}`);
         }
       }
-      if (!component.activateClickAction?.("expand") || component.expanded !== false) {
+      if (!component.activateClickAction?.("expand") || (component.expanded ?? component._expanded) !== false) {
         throw new Error(`${label} did not collapse from its whole-component action`);
       }
     };
@@ -92,6 +120,40 @@ await withRendererHarness(
       throw new Error("fully visible ! shell output accepted a no-op expansion action");
     }
 
+    const customMessageText = Array.from({ length: 12 }, (_, index) => `SIDE_QUEST_EVENT_${index + 1}`).join("\n");
+    const sideQuestMessageRenderer = (message: any, options: any, messageTheme: any) => {
+      const text = typeof message.content === "string" ? message.content : "";
+      const box = new Box(2, 1, (line: string) => messageTheme.bg("customMessageBg", line));
+      box.addChild(new Text(options.expanded ? text : `${text.slice(0, 24)}… dynamic-key for details`, 0, 0));
+      return box;
+    };
+    for (const customType of ["side-quest-result", "side-quest-continuation"]) {
+      const customMessage = new CustomMessageComponent(
+        { role: "custom", customType, content: customMessageText, display: true, timestamp: Date.now() },
+        sideQuestMessageRenderer,
+      );
+      const customRendered = customMessage.render(builtinWidth);
+      const customRows = customRendered.map((line: string) => plain(line));
+      if (customRows.some((line: string) => /^─+$/.test(line.trim()))) {
+        reportedDefects.push(`${customType} retained standalone border rows`);
+      }
+      if (!hasExactPaintedVerticalPadding(customRendered)) {
+        reportedDefects.push(`${customType} did not preserve exactly one painted top/bottom padding row`);
+      }
+      assertWholeComponentToggle(
+        customMessage,
+        "SIDE_QUEST_EVENT_12",
+        `${customType} custom message`,
+      );
+    }
+    const unrelatedCustomMessage = new CustomMessageComponent(
+      { role: "custom", customType: "unrelated", content: customMessageText, display: true, timestamp: Date.now() },
+      sideQuestMessageRenderer,
+    ) as any;
+    if (unrelatedCustomMessage.clickActionAtPoint?.(1, 1) !== undefined) {
+      throw new Error("an unrelated custom message received a Side Quests click target");
+    }
+
     const summaryCases: Array<[string, any, string, Record<string, unknown>?]> = [
       ["read", { content: [{ type: "text", text: "read one\nread two" }] }, "2 lines loaded"],
       ["read", { content: [{ type: "image", data: "", mimeType: "image/png" }] }, "Image loaded"],
@@ -114,6 +176,342 @@ await withRendererHarness(
     assertPayloadRowInert(fakePi, "write", { content: [{ type: "text", text: "write failed raw payload" }] }, "write failed raw payload", { isError: true });
     assertPayloadRowInert(fakePi, "web_search", { content: [{ type: "text", text: "search failed raw payload\nsecond error line" }] }, "search failed raw payload", { isError: true });
 
+    writePiSettings({
+      clickExpansion: true,
+      previewLines: 3,
+      expandedPreviewMaxLines: 5,
+      extraExpandedPreviewMaxLines: 7,
+    });
+    const agentDefinition = fakePi.tools.get("Agent");
+    agentDefinition.renderCall = (args: any) => new Text(`● Agent general-purpose :: ${args.description}`, 0, 0);
+    agentDefinition.renderResult = (result: any, options: any, renderTheme: any, ctx: any) => {
+      const statuses = result.details?.sideQuestPresentation?.statuses ?? [];
+      const payload = statuses.length ? ` [${statuses.join(" | ")}]` : "";
+      const summary = `${renderTheme.fg("success", "Spawned")}${renderTheme.fg("muted", payload)}`;
+      if (!options.expanded) return new Text(`└ ${summary} • dynamic-key for details`, 0, 0);
+      const sessionPath = result.details?.sessionPath ?? "Unavailable";
+      return new Text(
+        [`└ ${summary}`, `  session path: ${sessionPath}`, "  ⠀", ...String(ctx.args?.prompt ?? "").split("\n").map((line) => `  ${line}`)].join("\n"),
+        0,
+        0,
+      );
+    };
+    const createAgentExecution = (id: string, version = 1, promptLineCount = 7): any => {
+      const execution = new ToolExecutionComponent(
+        "Agent",
+        id,
+        {
+          description: `Agent fixture ${id}`,
+          inherit_context: true,
+          interactive: true,
+          prompt: Array.from({ length: promptLineCount }, (_, index) => `AGENT_${id}_PROMPT_${index + 1}`).join("\n"),
+        },
+        {},
+        agentDefinition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      execution.markExecutionStarted();
+      execution.setArgsComplete();
+      execution.updateResult({
+        content: [{ type: "text", text: "Subagent launched." }],
+        details: {
+          sessionPath: `/tmp/${id}/session.jsonl`,
+          sideQuestPresentation: { version, surface: "agent", statuses: ["inherited", "interactive"] },
+        },
+        isError: false,
+      }, false);
+      return execution;
+    };
+    const toolPrototype = ToolExecutionComponent.prototype as any;
+    const installSimulatedSideQuestsOuterGetter = (): (() => any) => {
+      const delegatedGetter = toolPrototype.getResultRenderer;
+      const sideQuestsGetter = function (this: any): any {
+        const delegated = delegatedGetter.call(this);
+        if (this.toolName === "Agent" && this.isPartial !== true && this.result?.isError !== true) {
+          return agentDefinition.renderResult;
+        }
+        return delegated;
+      };
+      toolPrototype.getResultRenderer = sideQuestsGetter;
+      return sideQuestsGetter;
+    };
+    const assertAgentOrderAdapter = (execution: any, label: string): void => {
+      const rows = execution.render(100).map((line: string) => plain(line));
+      const summaryRow = rows.findIndex((line: string) => line.includes("Spawned [inherited | interactive]"));
+      const summaryX = rows[summaryRow]?.indexOf("Spawned") ?? -1;
+      if (summaryRow < 0 || execution.clickActionAtPoint?.(summaryX, summaryRow) !== "expand") {
+        throw new Error(`${label} did not retain the Agent summary adapter: ${JSON.stringify(rows)}`);
+      }
+    };
+
+    const producerFirstGetter = (globalThis as any)[PRELOADED_AGENT_GETTER];
+    const initialCcToolsGetter = toolPrototype.getResultRenderer;
+    assertAgentOrderAdapter(createAgentExecution("producer_first"), "Side Quests → cc-tools");
+    if (initialCcToolsGetter === producerFirstGetter || toolPrototype.getResultRenderer !== initialCcToolsGetter) {
+      throw new Error("Side Quests → cc-tools did not install one stable outer adapter");
+    }
+
+    const cachedBeforeLateProducer = createAgentExecution("cached_before_late");
+    cachedBeforeLateProducer.render(100);
+    const producerLateGetter = installSimulatedSideQuestsOuterGetter();
+    assertAgentOrderAdapter(cachedBeforeLateProducer, "cc-tools → Side Quests cached execution");
+    if (toolPrototype.getResultRenderer !== producerLateGetter) {
+      throw new Error("cc-tools → Side Quests replaced the late producer getter");
+    }
+    for (let cycle = 1; cycle <= 12; cycle++) {
+      await emitLifecycle("session_start");
+      assertAgentOrderAdapter(createAgentExecution(`reload_${cycle}`), `reload cycle ${cycle}`);
+      if (toolPrototype.getResultRenderer !== producerLateGetter) {
+        throw new Error(`reload cycle ${cycle} grew the result-renderer wrapper chain`);
+      }
+    }
+
+    const ownGetterExecution = createAgentExecution("own_getter");
+    const ownGetter = function (this: any): any {
+      return this.toolDefinition?.renderResult;
+    };
+    Object.defineProperty(ownGetterExecution, "getResultRenderer", {
+      configurable: false,
+      enumerable: false,
+      writable: false,
+      value: ownGetter,
+    });
+    const ownDescriptorBefore = Object.getOwnPropertyDescriptor(ownGetterExecution, "getResultRenderer");
+    assertAgentOrderAdapter(ownGetterExecution, "non-configurable own getter");
+    const ownDescriptorAfter = Object.getOwnPropertyDescriptor(ownGetterExecution, "getResultRenderer");
+    if (
+      ownDescriptorAfter?.value !== ownDescriptorBefore?.value
+      || ownDescriptorAfter?.configurable !== ownDescriptorBefore?.configurable
+      || ownDescriptorAfter?.enumerable !== ownDescriptorBefore?.enumerable
+      || ownDescriptorAfter?.writable !== ownDescriptorBefore?.writable
+    ) {
+      throw new Error("Agent adaptation changed the execution's own result-renderer descriptor");
+    }
+
+    const shortAgentExecution = createAgentExecution("short_standalone", 1, 2);
+    if (!shortAgentExecution.activateClickAction?.("expand")) {
+      throw new Error("short standalone Agent did not expand from its result summary");
+    }
+    const shortStandaloneRows = shortAgentExecution.render(100).map((line: string) => plain(line));
+    if (shortStandaloneRows.some((line: string) => line.includes("Output ends here"))) {
+      reportedDefects.push("short standalone Agent retained a bottom collapse anchor below the L0 gate");
+    }
+
+    const shortGroupedFirst = createAgentExecution("short_grouped_first", 1, 3);
+    const shortGroupedSecond = createAgentExecution("short_grouped_second", 1, 3);
+    const shortGroupParent = new Container();
+    shortGroupParent.addChild(shortGroupedFirst);
+    shortGroupParent.addChild(shortGroupedSecond);
+    const shortGroup = (shortGroupParent as any).children[0];
+    shortGroupParent.render(100);
+    let shortHeader: { x: number; y: number } | undefined;
+    for (let y = 0; y < 20 && !shortHeader; y++) {
+      for (let x = 0; x < 100; x++) {
+        if (shortGroup.clickAnchorAtPoint?.(x, y)?.tool === shortGroupedFirst) {
+          shortHeader = { x, y };
+          break;
+        }
+      }
+    }
+    if (!shortHeader || !shortGroup.toggleToolAtPoint(shortHeader.x, shortHeader.y)) {
+      throw new Error("short grouped Agent did not expand from its header");
+    }
+    const shortGroupedRows = shortGroupParent.render(100).map((line: string) => plain(line));
+    if (shortGroupedRows.some((line: string) => line.includes("Output ends here"))) {
+      reportedDefects.push("short grouped Agent retained a bottom collapse anchor below the L0 gate");
+    }
+
+    const agentExecution = createAgentExecution("standalone");
+    const collapsedAgentRows = agentExecution.render(100).map((line: string) => plain(line));
+    const nonBlankAgentRows = collapsedAgentRows.filter((line: string) => line.trim().length > 0);
+    if (!/^─+$/.test(nonBlankAgentRows[0]?.trim() ?? "") || !/^─+$/.test(nonBlankAgentRows.at(-1)?.trim() ?? "")) {
+      throw new Error(`standalone Agent output did not retain top and bottom borders: ${JSON.stringify(collapsedAgentRows)}`);
+    }
+    const collapsedAgentSummary = collapsedAgentRows.findIndex((line: string) => line.includes("Spawned [inherited | interactive]"));
+    const collapsedAgentX = collapsedAgentRows[collapsedAgentSummary]?.indexOf("Spawned") ?? -1;
+    if (collapsedAgentSummary < 0 || agentExecution.clickActionAtPoint?.(collapsedAgentX, collapsedAgentSummary) !== "expand") {
+      throw new Error(`standalone Agent result summary was not clickable: ${JSON.stringify(collapsedAgentRows)}`);
+    }
+    if (!agentExecution.activateClickAction?.("expand")) throw new Error("standalone Agent did not enter L0");
+    const agentL0 = agentExecution.render(100).map((line: string) => plain(line));
+    if (!agentL0.some((line: string) => line.includes("AGENT_standalone_PROMPT_3")) || agentL0.some((line: string) => line.includes("AGENT_standalone_PROMPT_4")) || !agentL0.some((line: string) => line.includes("click for more detail"))) {
+      throw new Error(`standalone Agent L0 did not use the configured compact preview: ${JSON.stringify(agentL0)}`);
+    }
+    const agentL0Summary = agentL0.find((line: string) => line.includes("Spawned"));
+    if (agentL0Summary?.includes("click to collapse")) {
+      throw new Error(`expanded Agent top summary exposed a collapse hint: ${JSON.stringify(agentL0Summary)}`);
+    }
+    const activateAgentDetail = (expectedLastLine: number, expectFinal: boolean): void => {
+      const rows = agentExecution.render(100).map((line: string) => plain(line));
+      const detailRow = rows.findIndex((line: string) => line.includes("click for more detail"));
+      if (detailRow < 0) throw new Error(`Agent detail action was missing: ${JSON.stringify(rows)}`);
+      const x = rows[detailRow]?.indexOf("click for more detail") ?? -1;
+      const action = agentExecution.clickAnchorAtPoint?.(x, detailRow);
+      if (!action || !agentExecution.activateClickAction?.(action.action, action.viewportAnchor)) {
+        throw new Error(`Agent detail action did not activate: ${JSON.stringify({ rows, action })}`);
+      }
+      const nextRows = agentExecution.render(100).map((line: string) => plain(line));
+      if (!nextRows.some((line: string) => line.includes(`AGENT_standalone_PROMPT_${expectedLastLine}`))) {
+        throw new Error(`Agent detail layer omitted prompt line ${expectedLastLine}: ${JSON.stringify(nextRows)}`);
+      }
+      if (expectFinal !== nextRows.some((line: string) => line.includes("Output ends here • click to collapse"))) {
+        throw new Error(`Agent final collapse row mismatch: ${JSON.stringify(nextRows)}`);
+      }
+    };
+    activateAgentDetail(5, false);
+    activateAgentDetail(7, true);
+    const agentFinalRows = agentExecution.render(100).map((line: string) => plain(line));
+    const agentFinalRow = agentFinalRows.findIndex((line: string) => line.includes("Output ends here • click to collapse"));
+    const agentFinalX = agentFinalRows[agentFinalRow]?.indexOf("Output ends here") ?? -1;
+    const agentCollapse = agentExecution.clickAnchorAtPoint?.(agentFinalX, agentFinalRow);
+    if (!agentCollapse || !agentExecution.activateClickAction?.(agentCollapse.action, agentCollapse.viewportAnchor) || agentExecution.expanded) {
+      throw new Error("Agent final collapse action did not restore compact output");
+    }
+
+    const groupedAgentFirst = createAgentExecution("grouped_first");
+    const groupedAgentSecond = createAgentExecution("grouped_second");
+    const agentGroupParent = new Container();
+    agentGroupParent.addChild(groupedAgentFirst);
+    agentGroupParent.addChild(groupedAgentSecond);
+    const agentGroup = (agentGroupParent as any).children[0];
+    if ((agentGroupParent as any).children.length !== 1 || typeof agentGroup?.clickAnchorAtPoint !== "function") {
+      throw new Error("Agent executions did not enter the standard tool group");
+    }
+    const compactAgentGroupRows = agentGroupParent.render(100).map((line: string) => plain(line));
+    let groupedAgentHeader: { x: number; y: number } | undefined;
+    for (let y = 0; y < compactAgentGroupRows.length && !groupedAgentHeader; y++) {
+      for (let x = 0; x < 100; x++) {
+        const anchor = agentGroup.clickAnchorAtPoint(x, y);
+        if (anchor?.tool === groupedAgentFirst && anchor.action === "header") {
+          groupedAgentHeader = { x, y };
+          break;
+        }
+      }
+    }
+    if (!groupedAgentHeader || !agentGroup.toggleToolAtPoint(groupedAgentHeader.x, groupedAgentHeader.y)) {
+      throw new Error(`grouped Agent header did not expand its execution: ${JSON.stringify(compactAgentGroupRows)}`);
+    }
+    const expandedAgentGroupRows = agentGroupParent.render(100).map((line: string) => plain(line));
+    if (!expandedAgentGroupRows.some((line: string) => line.includes("AGENT_grouped_first_PROMPT_3")) || expandedAgentGroupRows.some((line: string) => /^─+$/.test(line.trim()))) {
+      throw new Error(`grouped Agent output did not preserve L0 content without standalone borders: ${JSON.stringify(expandedAgentGroupRows)}`);
+    }
+    const groupedAgentSummaryRow = expandedAgentGroupRows.findIndex((line: string) => line.includes("Spawned [inherited | interactive]"));
+    const groupedAgentSummaryX = Array.from({ length: 100 }, (_, x) => x).find((x) => {
+      const anchor = agentGroup.clickAnchorAtPoint(x, groupedAgentSummaryRow);
+      return anchor?.tool === groupedAgentFirst && anchor.action === "expand";
+    });
+    if (groupedAgentSummaryX === undefined || !agentGroup.toggleToolAtPoint(groupedAgentSummaryX, groupedAgentSummaryRow) || groupedAgentFirst.expanded) {
+      throw new Error(`grouped Agent result summary did not collapse its execution: ${JSON.stringify(expandedAgentGroupRows)}`);
+    }
+    if (
+      !groupedAgentFirst.activateClickAction?.("expand")
+      || !groupedAgentFirst.activateClickAction?.("detail")
+      || !groupedAgentFirst.activateClickAction?.("detail")
+    ) {
+      throw new Error("grouped Agent did not advance to its final detail layer");
+    }
+    const finalAgentGroupRows = agentGroupParent.render(100).map((line: string) => plain(line));
+    if (
+      !finalAgentGroupRows.some((line: string) => line.includes("AGENT_grouped_first_PROMPT_7"))
+      || !finalAgentGroupRows.some((line: string) => line.includes("Output ends here • click to collapse"))
+      || finalAgentGroupRows.some((line: string) => /^─+$/.test(line.trim()))
+    ) {
+      throw new Error(`long grouped Agent omitted its unframed final detail layer or collapse row: ${JSON.stringify(finalAgentGroupRows)}`);
+    }
+
+    const unknownAgent = createAgentExecution("future", 99);
+    const unknownAgentRows = unknownAgent.render(100).map((line: string) => plain(line));
+    if (!unknownAgentRows.some((line: string) => line.includes("dynamic-key for details")) || unknownAgentRows.some((_: string, y: number) => unknownAgent.clickActionAtPoint?.(10, y) !== undefined)) {
+      throw new Error(`unknown Agent presentation version did not fail closed: ${JSON.stringify(unknownAgentRows)}`);
+    }
+
+    const longBanner = Array.from({ length: 30 }, (_, index) => `BANNER_${index + 1}`).join(" ");
+    for (const [name, field, expandedNeedle] of [
+      ["ask_parent", "prompt", "BANNER_30"],
+      ["subagent_done", "result", "BANNER_30"],
+    ] as const) {
+      const definition = fakePi.tools.get(name);
+      definition.renderShell = "self";
+      definition.renderCall = (_args: any, _theme: any, ctx: any) => ctx.isPartial ? new Text(longBanner.slice(0, 48), 0, 0) : new Text("", 0, 0);
+      definition.renderResult = (_result: any, options: any, bannerTheme: any) => {
+        const box = new Box(2, 1, (line: string) => bannerTheme.bg("customMessageBg", line));
+        box.addChild(new Text(options.expanded ? longBanner : `${longBanner.slice(0, 48)}… dynamic-key for details`, 0, 0));
+        return box;
+      };
+      const banner = new ToolExecutionComponent(
+        name,
+        `${name}_binary_fixture`,
+        { [field]: longBanner },
+        {},
+        definition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      banner.markExecutionStarted();
+      banner.setArgsComplete();
+      banner.updateResult({ content: [{ type: "text", text: "recorded" }], isError: false }, false);
+      const bannerRendered = banner.render(72);
+      const bannerRows = bannerRendered.map((line: string) => plain(line));
+      if (bannerRows.some((line: string) => /^─+$/.test(line.trim()))) {
+        reportedDefects.push(`${name} retained standalone border rows`);
+      }
+      if (!hasExactPaintedVerticalPadding(bannerRendered)) {
+        reportedDefects.push(`${name} did not preserve exactly one painted top/bottom padding row`);
+      }
+      const firstPaintedRow = bannerRendered.findIndex((line: string) => line.includes("\x1b[48;"));
+      const deadRow = bannerRows.findIndex((_: string, y: number) => y >= firstPaintedRow && (
+        banner.clickActionAtPoint?.(0, y) !== "expand" || banner.clickActionAtPoint?.(71, y) !== "expand"
+      ));
+      const activeOuterSpacer = Array.from({ length: Math.max(0, firstPaintedRow) }, (_, y) => y)
+        .find((y) => banner.clickActionAtPoint?.(0, y) !== undefined || banner.clickActionAtPoint?.(71, y) !== undefined);
+      if (firstPaintedRow < 0 || deadRow >= 0 || activeOuterSpacer !== undefined) {
+        throw new Error(`${name} banner click bounds did not cover only the painted block: ${JSON.stringify({ bannerRows, firstPaintedRow, deadRow, activeOuterSpacer })}`);
+      }
+      if (!banner.activateClickAction?.("expand")) throw new Error(`${name} banner did not expand`);
+      const expandedBannerRendered = banner.render(72);
+      if (!expandedBannerRendered.some((line: string) => plain(line).includes(expandedNeedle))) {
+        throw new Error(`${name} banner did not reveal its full content`);
+      }
+      if (!hasExactPaintedVerticalPadding(expandedBannerRendered)) {
+        reportedDefects.push(`${name} expanded output did not preserve exactly one painted top/bottom padding row`);
+      }
+    }
+
+    for (const [name, field, content] of [
+      ["ask_parent", "prompt", "😀".repeat(121)],
+      ["subagent_done", "result", `${" ".repeat(241)}short`],
+    ] as const) {
+      const definition = fakePi.tools.get(name);
+      definition.renderShell = "self";
+      definition.renderCall = () => new Text("", 0, 0);
+      definition.renderResult = (_result: any, _options: any, _theme: any, ctx: any) => {
+        const shown = name === "subagent_done" ? String(ctx.args?.[field] ?? "").trim() : String(ctx.args?.[field] ?? "");
+        return new Text(shown, 0, 0);
+      };
+      const banner = new ToolExecutionComponent(
+        name,
+        `${name}_unicode_noop_fixture`,
+        { [field]: content },
+        {},
+        definition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      banner.markExecutionStarted();
+      banner.setArgsComplete();
+      banner.updateResult({ content: [{ type: "text", text: "recorded" }], isError: false }, false);
+      const rows = banner.render(72);
+      if (rows.some((_: string, y: number) => banner.clickActionAtPoint?.(1, y) !== undefined) || banner.activateClickAction?.("expand") === true) {
+        throw new Error(`${name} exposed a no-op click target for fully visible Unicode-normalized content`);
+      }
+    }
+
+    writePiSettings({
+      clickExpansion: true,
+      expandedPreviewMaxLines: 10,
+      extraExpandedPreviewMaxLines: 15,
+    });
     const write = fakePi.tools.get("write");
     if (typeof write?.renderResult !== "function") throw new Error("Write renderer was not registered");
     const diffLines = [
@@ -2121,6 +2519,9 @@ await withRendererHarness(
       throw new Error("global collapse did not restore compact clickable group rows");
     }
 
+    if (reportedDefects.length > 0) {
+      throw new Error(`reported Side Quests banner regressions:\n- ${reportedDefects.join("\n- ")}`);
+    }
     console.log("OK  renderer summaries, payloads, indicators, click detail layers, async diffs, and grouped controls");
   },
 );

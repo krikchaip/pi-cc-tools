@@ -131,9 +131,9 @@ const neq = (a: string[], b: string[], label: string) => {
 }
 
 // ---------------------------------------------------------------------------
-// 5. Custom (subagent) message framing follows toolBackgroundMode. Switching
-//    mode must invalidate the cached framing. Uses an isolated temp HOME so the
-//    real ~/.pi/settings.json is never touched.
+// 5. Custom (subagent) banner spacing follows toolBackgroundMode without
+//    border rows. Switching mode must invalidate the cached spacing. Uses an
+//    isolated temp HOME so the real ~/.pi/settings.json is never touched.
 // ---------------------------------------------------------------------------
 {
 	const realHome = process.env.HOME;
@@ -149,16 +149,20 @@ const neq = (a: string[], b: string[], label: string) => {
 		// A full-width rule line (borderLine) is all '─' chars; branch connectors '└' are not.
 		const hasFullWidthRule = (lines: string[]) =>
 			lines.some((l) => { const p = stripAnsi(l); return /^─+$/.test(p) && p.length > 5; });
+		const isBlank = (line: string | undefined) => stripAnsi(line ?? "").trim().length === 0;
 
-		// Start in outlines mode (default). Render subagent msg → has full-width border rules.
+		// Start in outlines mode. Banner-like messages keep spacing but no border rules.
 		ccTools.handler("outlines", ctx);
 		const message = { customType: "subagent-notification", content: "✓ Done\n⎿ transcript: foo" };
 		const c = new CustomMessageComponent(message as any, undefined as any);
 		const outlines = c.render(W);
 		const outlinesWarm = c.render(W);
 		eq(outlinesWarm, outlines, "custom: warm cache identical in outlines mode");
-		if (!hasFullWidthRule(outlines)) {
-			throw new Error("outlines mode did not produce full-width border rule lines");
+		if (hasFullWidthRule(outlines)) {
+			throw new Error("outlines mode added border rules to a banner-like message");
+		}
+		if (!isBlank(outlines[0]) || isBlank(outlines[1]) || isBlank(outlines.at(-1))) {
+			throw new Error("outlines mode did not preserve exactly one leading notification spacer");
 		}
 
 		// Switch to default mode (no borders). Cache must miss and reframe.
@@ -167,6 +171,9 @@ const neq = (a: string[], b: string[], label: string) => {
 		neq(def, outlines, "custom: switching toolBackgroundMode did NOT reframe (stale cache)");
 		if (hasFullWidthRule(def)) {
 			throw new Error("default mode still shows full-width border rule lines");
+		}
+		if (isBlank(def[0]) || isBlank(def.at(-1))) {
+			throw new Error("default mode retained an outer notification spacer");
 		}
 		const defWarm = c.render(W);
 		eq(defWarm, def, "custom: warm cache identical in default mode");

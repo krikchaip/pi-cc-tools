@@ -1334,11 +1334,15 @@ class ToolGroupComponent extends Container {
 			) {
 				const callRows = isToolTextComponent(tool.callRendererComponent)
 					? tool.callRendererComponent.getSemanticRows().filter((row: ToolTextSemanticRow) => row.action === "header").length
-					: 0;
-				const headerRows = childExpanded ? Math.max(1, callRows) : branched.length;
+					: isKnownSideQuestAgentTool(tool)
+						? tool.callRendererComponent?.render?.(childWidth)?.length ?? 0
+						: 0;
+				const headerRows = isSideQuestBinaryTool(tool)
+					? branched.length
+					: childExpanded ? Math.max(1, callRows) : branched.length;
 				for (let row = 0; row < Math.min(headerRows, branched.length); row++) {
-					const start = clickAnchorStart(branched[row]);
-					const end = visibleWidth(stripAnsi(branched[row]).trimEnd());
+					const start = isSideQuestBinaryTool(tool) ? 0 : clickAnchorStart(branched[row]);
+					const end = isSideQuestBinaryTool(tool) ? safeWidth : visibleWidth(stripAnsi(branched[row]).trimEnd());
 					if (end > start) this.clickAnchors.push({
 					line: lines.length + row,
 					start,
@@ -1843,7 +1847,9 @@ type BuiltinExpansionState = {
 };
 
 type BuiltinExpandableComponent = {
-	expanded: boolean;
+	expanded?: boolean;
+	_expanded?: boolean;
+	message?: { customType?: string };
 	setExpanded(expanded: boolean): void;
 	render(width: number): string[];
 	[BUILTIN_EXPANSION_STATE]?: BuiltinExpansionState;
@@ -1851,6 +1857,19 @@ type BuiltinExpandableComponent = {
 
 function builtinExpansionState(component: BuiltinExpandableComponent): BuiltinExpansionState {
 	return (component[BUILTIN_EXPANSION_STATE] ??= { version: 0 });
+}
+
+function builtinComponentExpanded(component: BuiltinExpandableComponent): boolean {
+	return component.expanded === true || component._expanded === true;
+}
+
+function isSideQuestEventMessage(component: BuiltinExpandableComponent): boolean {
+	const customType = component.message?.customType;
+	return customType === "side-quest-result" || customType === "side-quest-continuation";
+}
+
+function builtinClickComponentSupported(component: BuiltinExpandableComponent): boolean {
+	return !(component instanceof CustomMessageComponent) || isSideQuestEventMessage(component);
 }
 
 function isBuiltinExpandableComponent(value: unknown): value is BuiltinExpandableComponent {
@@ -1871,7 +1890,7 @@ function builtinExpansionChangesOutput(component: BuiltinExpandableComponent, wi
 		&& state.probeResult !== undefined
 	) return state.probeResult;
 
-	const expanded = component.expanded === true;
+	const expanded = builtinComponentExpanded(component);
 	const currentRows = state.width === width && state.rows ? state.rows : component.render(width);
 	let oppositeRows: string[] = [];
 	try {
@@ -1896,7 +1915,7 @@ function builtinClickActionAtPoint(
 	x: number,
 	y: number,
 ): ToolClickAction | undefined {
-	if (!builtinClickExpansionActive()) return undefined;
+	if (!builtinClickExpansionActive() || !builtinClickComponentSupported(component)) return undefined;
 	const state = builtinExpansionState(component);
 	if (
 		state.width === undefined
@@ -1912,21 +1931,21 @@ function builtinClickActionAtPoint(
 function builtinCollapseViewportAnchor(
 	component: BuiltinExpandableComponent,
 ): RequestedToolCollapseViewportAnchor {
-	return component.expanded === true ? "adaptive" : "top";
+	return builtinComponentExpanded(component) ? "adaptive" : "top";
 }
 
 function activateBuiltinClickAction(component: BuiltinExpandableComponent): boolean {
-	if (!builtinClickExpansionActive()) return false;
+	if (!builtinClickExpansionActive() || !builtinClickComponentSupported(component)) return false;
 	const state = builtinExpansionState(component);
 	if (state.width === undefined || !builtinExpansionChangesOutput(component, state.width)) return false;
 	const viewport = captureToolCollapseViewport(component, builtinCollapseViewportAnchor(component));
-	component.setExpanded(component.expanded !== true);
+	component.setExpanded(!builtinComponentExpanded(component));
 	if (viewport) stabilizeToolCollapseViewport(viewport);
 	return true;
 }
 
 function captureBuiltinClickRollback(component: BuiltinExpandableComponent): () => void {
-	const expanded = component.expanded === true;
+	const expanded = builtinComponentExpanded(component);
 	const viewport = captureToolCollapseViewport(component, builtinCollapseViewportAnchor(component));
 	return () => {
 		component.setExpanded(expanded);
@@ -2477,7 +2496,7 @@ function patchGlobalToolBorders(): void {
 			branchEpoch: _toolBranchVisualEpoch,
 			clickKey: toolClickStateKey(this),
 		};
-		if (toolBackgroundMode === "default") {
+		if (toolBackgroundMode === "default" || isSideQuestBinaryTool(this)) {
 			(this as any)[TOOL_RENDER_CACHE] = { width, mode: toolBackgroundMode, lines: rendered, ...branchCache };
 			return rendered;
 		}
@@ -2587,6 +2606,42 @@ function setToolLocalDetailLevel(tool: any, level: ToolClickDetailLevel): void {
 	else tool.rendererState[TOOL_CLICK_DETAIL_LEVEL] = level;
 }
 
+type SideQuestAgentPresentation = {
+	version: 1;
+	surface: "agent";
+	statuses: string[];
+};
+
+function sideQuestAgentPresentation(value: any): SideQuestAgentPresentation | undefined {
+	const presentation = value?.details?.sideQuestPresentation ?? value?.result?.details?.sideQuestPresentation;
+	if (
+		presentation?.version !== 1
+		|| presentation?.surface !== "agent"
+		|| !Array.isArray(presentation?.statuses)
+		|| !presentation.statuses.every((status: unknown) => typeof status === "string")
+	) return undefined;
+	return presentation as SideQuestAgentPresentation;
+}
+
+function isKnownSideQuestAgentTool(tool: any): boolean {
+	return String(tool?.toolName ?? "").toLowerCase() === "agent"
+		&& sideQuestAgentPresentation(tool) !== undefined;
+}
+
+function isSideQuestBinaryTool(tool: any): boolean {
+	const name = String(tool?.toolName ?? "").toLowerCase();
+	return name === "ask_parent" || name === "subagent_done";
+}
+
+function sideQuestBinaryHasHiddenContent(tool: any): boolean {
+	const name = String(tool?.toolName ?? "").toLowerCase();
+	const field = name === "ask_parent" ? "prompt" : name === "subagent_done" ? "result" : undefined;
+	if (field === undefined) return false;
+	const content = String(tool?.args?.[field] ?? "");
+	const renderedContent = name === "subagent_done" ? content.trim() : content;
+	return Array.from(renderedContent).length > 240;
+}
+
 function toolUsesTieredTextPreview(tool: any): boolean {
 	return tool?.toolName === "read" || tool?.toolName === "grep" || tool?.toolName === "bash";
 }
@@ -2594,6 +2649,7 @@ function toolUsesTieredTextPreview(tool: any): boolean {
 function toolSupportsProgressiveLocalDetail(tool: any): boolean {
 	const name = typeof tool?.toolName === "string" ? tool.toolName.toLowerCase() : "";
 	return toolUsesTieredTextPreview(tool)
+		|| isKnownSideQuestAgentTool(tool)
 		|| name === "write"
 		|| name === "edit"
 		|| name === "apply_patch"
@@ -2777,6 +2833,8 @@ const ASSISTANT_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant
 const ASSISTANT_RENDER_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-assistant-message-render");
 const ASSISTANT_UPDATE_BASE = Symbol.for("pi-claude-style-tools:assistant-message-update-base");
 const TOOL_EXECUTION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-tool-execution");
+const TOOL_RESULT_GETTER_SEEN = Symbol.for("pi-claude-style-tools:tool-result-getter-seen");
+const TOOL_RESULT_GETTER_ADAPTED = Symbol.for("pi-claude-style-tools:tool-result-getter-adapted");
 
 // Rendered-output cache for assistant/user/custom message components.
 // Keyed by (width, branch visual epoch, tool background mode). The epoch changes on
@@ -3440,6 +3498,13 @@ function frameToolLikeLines(lines: string[], width: number): string[] {
 	return [spacerLine, ...core];
 }
 
+function formatBannerLikeLines(lines: string[], width: number): string[] {
+	const safeWidth = Math.max(1, width);
+	// Side Quests owns this banner's Box. Preserve its painted vertical padding;
+	// cc-tools owns only interaction and must not replace producer chrome.
+	return lines.map((line) => clampLineWidth(line, safeWidth));
+}
+
 function formatSubagentNotification(lines: string[], width: number): string[] {
 	const core = trimRenderedBlankLines(lines).map(normalizeLeadingCheckGlyph);
 	if (core.length === 0) return lines;
@@ -3447,8 +3512,10 @@ function formatSubagentNotification(lines: string[], width: number): string[] {
 		const groupLines = formatSubagentNotificationGroup(group);
 		return index === 0 ? groupLines : ["", ...groupLines];
 	});
-	const indented = formatted.map((line) => (line ? ` ${line}` : line));
-	return frameToolLikeLines(indented, width);
+	const safeWidth = Math.max(1, width);
+	const indented = formatted.map((line) => clampLineWidth(line ? ` ${line}` : line, safeWidth));
+	syncToolBackgroundMode();
+	return toolBackgroundMode === "default" ? indented : [" ".repeat(safeWidth), ...indented];
 }
 
 function patchCustomMessageRender(): void {
@@ -3477,8 +3544,39 @@ function patchCustomMessageRender(): void {
 		if (!Array.isArray(lines)) return lines;
 		const result = isSubagentNotificationMessage(this?.message)
 			? formatSubagentNotification(lines, width)
-			: lines.map(normalizeLeadingCheckGlyph);
+			: isSideQuestEventMessage(this)
+				? formatBannerLikeLines(lines.map(normalizeLeadingCheckGlyph), width)
+				: lines.map(normalizeLeadingCheckGlyph);
+		if (isSideQuestEventMessage(this)) {
+			const state = builtinExpansionState(this);
+			state.width = width;
+			state.height = result.length;
+			state.rows = result;
+		}
 		return storeMessageRenderCache(this, width, result);
+	};
+	proto.clickActionAtPoint = function clickSideQuestEventActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+		return builtinClickActionAtPoint(this, x, y);
+	};
+	proto.activateClickAction = function activateSideQuestEventAction(action: ToolClickAction): boolean {
+		return action === "expand" && activateBuiltinClickAction(this);
+	};
+	proto.handleMouse = function handleSideQuestEventMouse(event: any): any {
+		if (
+			!hasNativeMouseDispatch()
+			|| event?.type !== "click"
+			|| event?.button !== "left"
+			|| event?.dragged === true
+			|| Boolean(event?.url)
+			|| this.clickActionAtPoint(event.x, event.y) !== "expand"
+		) return undefined;
+		const rollback = captureBuiltinClickRollback(this);
+		return scheduleNativeSingleClick(
+			this,
+			Number(event.clickCount ?? 1),
+			() => this.activateClickAction("expand"),
+			rollback,
+		);
 	};
 	// CustomMessageComponent rebuilds its children via rebuild() (called from
 	// invalidate() and setExpanded()); drop the cached render so the next render
@@ -3487,6 +3585,9 @@ function patchCustomMessageRender(): void {
 	if (typeof originalRebuild === "function") {
 		proto.rebuild = function patchedCustomMessageRebuild(...args: any[]) {
 			clearMessageRenderCache(this);
+			const state = builtinExpansionState(this);
+			state.version++;
+			state.probeResult = undefined;
 			return originalRebuild.apply(this, args);
 		};
 	}
@@ -3860,6 +3961,7 @@ function clickAnchorStart(line: string): number {
 
 function toolHasEffectiveClickAction(tool: any): boolean {
 	if (tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true) return true;
+	if (isSideQuestBinaryTool(tool)) return sideQuestBinaryHasHiddenContent(tool);
 	return [tool.callRendererComponent, tool.resultRendererComponent]
 		.filter(isToolTextComponent)
 		.some((component) => component.hasClickAction(tool));
@@ -3870,9 +3972,27 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 		tool[TOOL_CLICK_ANCHORS] = [];
 		return;
 	}
+	const anchors: ToolClickAnchor[] = [];
+	if (isSideQuestBinaryTool(tool)) {
+		if (sideQuestBinaryHasHiddenContent(tool)) {
+			const firstLine = rendered.length >= 2
+				&& !stripAnsi(rendered[0]).trim()
+				&& !rendered[0].includes("\x1b[48;") ? 1 : 0;
+			for (let line = firstLine; line < rendered.length; line++) {
+				anchors.push({
+					line,
+					start: 0,
+					end: Math.max(1, visibleWidth(stripAnsi(rendered[line]))),
+					action: "expand",
+					viewportAnchor: "top",
+				});
+			}
+		}
+		tool[TOOL_CLICK_ANCHORS] = anchors;
+		return;
+	}
 	const components = [tool.callRendererComponent, tool.resultRendererComponent]
 		.filter(isToolTextComponent);
-	const anchors: ToolClickAnchor[] = [];
 	for (const component of components) {
 		for (const semantic of component.getSemanticRows()) {
 			const needle = semantic.anchorText ?? stripAnsi(semantic.text).trim();
@@ -3890,6 +4010,17 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 				action: semantic.action,
 				viewportAnchor: semantic.viewportAnchor,
 			});
+		}
+	}
+	if (isKnownSideQuestAgentTool(tool)) {
+		const summaryRow = rendered.findIndex((line) => stripAnsi(line).includes("Spawned"));
+		const headerStart = rendered.findIndex((line, index) => index < summaryRow && /\bAgent\b/.test(stripAnsi(line)));
+		for (let line = headerStart; line >= 0 && line < summaryRow; line++) {
+			const plain = stripAnsi(rendered[line]);
+			if (!plain.trim() || /^─+$/.test(plain.trim())) continue;
+			const start = clickAnchorStart(rendered[line]);
+			const end = visibleWidth(plain.trimEnd());
+			if (end > start) anchors.push({ line, start, end, action: "header", viewportAnchor: "top" });
 		}
 	}
 	tool[TOOL_CLICK_ANCHORS] = anchors;
@@ -3956,11 +4087,50 @@ function frameStandaloneMcpLines(rendered: string[], width: number): string[] {
 	];
 }
 
+function hasStandaloneOutlineFrame(rendered: string[]): boolean {
+	const core = trimRenderedBlankLines(rendered);
+	return core.length >= 2
+		&& /^─+$/.test(stripAnsi(core[0]).trim())
+		&& /^─+$/.test(stripAnsi(core.at(-1) ?? "").trim());
+}
+
+function adaptedToolResultRenderer(tool: any, activeGetter: (...args: any[]) => any): any {
+	const toolName = typeof tool?.toolName === "string" ? tool.toolName : "";
+	let renderer: any;
+	if (toolName === "apply_patch") {
+		renderer = (result: any, options: any, theme: Theme, ctx: any) =>
+			renderApplyPatchResult({ content: result.content, details: result.details }, options.isPartial, theme, ctx);
+	} else if (isMcpToolName(toolName)) {
+		renderer = (result: any, options: any, theme: Theme, ctx: any) =>
+			renderMcpToolResult(result, !!options?.expanded, !!options?.isPartial, theme, ctx);
+	} else {
+		const delegatedRenderer = activeGetter.call(tool);
+		if (typeof delegatedRenderer === "function") {
+			renderer = delegatedRenderer;
+		} else if (shouldUseGenericToolRenderer(toolName)) {
+			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
+				renderGenericToolResult(toolName, result, options, theme, ctx);
+		}
+	}
+	if (typeof renderer !== "function") return renderer;
+	// Strip transient Magic Context tags from the text the renderer sees,
+	// without touching the stored result message.
+	return (result: any, options: any, theme: Theme, ctx: any) => {
+		const sanitized = sanitizeToolResultForDisplay(result);
+		if (toolName.toLowerCase() === "agent") {
+			const adapted = renderSideQuestAgentResult(sanitized, options, theme, ctx);
+			if (adapted) return adapted;
+		}
+		return renderer(sanitized, options, theme, ctx);
+	};
+}
+
 function patchToolExecutionRenderers(): void {
 	const proto = ToolExecutionComponent.prototype as any;
 	if (proto[TOOL_EXECUTION_PATCH_FLAG]) return;
 
 	const originalRender = proto.render;
+	const originalUpdateDisplay = proto.updateDisplay;
 	const originalHasRendererDefinition = proto.hasRendererDefinition;
 	const originalGetCallRenderer = proto.getCallRenderer;
 	const originalGetResultRenderer = proto.getResultRenderer;
@@ -3968,16 +4138,60 @@ function patchToolExecutionRenderers(): void {
 
 	if (typeof originalRender === "function") {
 		proto.render = function patchedToolExecutionRender(width: number): string[] {
+			const activeResultGetter = this.getResultRenderer;
+			if (this.result !== undefined && this[TOOL_RESULT_GETTER_SEEN] !== activeResultGetter) {
+				this.updateDisplay?.();
+			}
 			syncToolOutputPad(this, readPiOutputPad());
 			for (const component of [this.callRendererComponent, this.resultRendererComponent]) {
 				if (isToolTextComponent(component)) (component as any)[TOOL_CLICK_OWNER] = this;
 			}
 			const rendered = originalRender.call(this, width);
+			const toolName = String(this.toolName ?? "").toLowerCase();
 			const isMcp = isMcpToolName(this.toolName ?? "") || isMcpToolCandidate(this.toolDefinition);
-			const output = isMcp ? frameStandaloneMcpLines(rendered, width) : rendered;
+			const isStandaloneSideQuest = toolName === "agent";
+			const needsStandaloneFrame = (isMcp || isStandaloneSideQuest && toolBackgroundMode === "outlines")
+				&& !hasStandaloneOutlineFrame(rendered);
+			const output = needsStandaloneFrame ? frameStandaloneMcpLines(rendered, width) : rendered;
 			updateToolClickAnchors(this, output);
 			return output;
 		};
+	}
+
+	if (typeof originalUpdateDisplay === "function") {
+		proto.updateDisplay = function patchedToolExecutionUpdateDisplay(this: any, ...args: any[]): any {
+			const activeGetter = this.getResultRenderer;
+			if (typeof activeGetter !== "function") return originalUpdateDisplay.apply(this, args);
+			if (activeGetter[TOOL_RESULT_GETTER_ADAPTED] === true) {
+				const result = originalUpdateDisplay.apply(this, args);
+				this[TOOL_RESULT_GETTER_SEEN] = activeGetter;
+				return result;
+			}
+			const execution = this;
+			const shadow = Object.create(Object.getPrototypeOf(execution));
+			const adaptedExecution = new Proxy(shadow, {
+				get(_target, property) {
+					if (property === "getResultRenderer") {
+						return () => adaptedToolResultRenderer(execution, activeGetter);
+					}
+					return Reflect.get(execution, property, execution);
+				},
+				set(_target, property, value) {
+					return Reflect.set(execution, property, value, execution);
+				},
+			});
+			const result = originalUpdateDisplay.apply(adaptedExecution, args);
+			execution[TOOL_RESULT_GETTER_SEEN] = activeGetter;
+			return result;
+		};
+	}
+
+	if (typeof originalGetResultRenderer === "function") {
+		const initialResultGetter = function patchedInitialResultGetter(this: any): any {
+			return adaptedToolResultRenderer(this, originalGetResultRenderer);
+		};
+		initialResultGetter[TOOL_RESULT_GETTER_ADAPTED] = true;
+		proto.getResultRenderer = initialResultGetter;
 	}
 
 	proto.clickAnchorAtPoint = function clickAnchorAtPoint(x: number, y: number): ToolClickAnchor | undefined {
@@ -4045,30 +4259,6 @@ function patchToolExecutionRenderers(): void {
 			return (args: any, theme: Theme, ctx: any) => renderGenericToolCall(toolName, args, theme, ctx);
 		}
 		return undefined;
-	};
-
-	proto.getResultRenderer = function patchedGetResultRenderer() {
-		const toolName = typeof this?.toolName === "string" ? this.toolName : "";
-		let renderer: any;
-		if (toolName === "apply_patch") {
-			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
-				renderApplyPatchResult({ content: result.content, details: result.details }, options.isPartial, theme, ctx);
-		} else if (isMcpToolName(toolName)) {
-			renderer = (result: any, options: any, theme: Theme, ctx: any) =>
-				renderMcpToolResult(result, !!options?.expanded, !!options?.isPartial, theme, ctx);
-		} else {
-			const originalRenderer = typeof originalGetResultRenderer === "function" ? originalGetResultRenderer.call(this) : undefined;
-			if (typeof originalRenderer === "function") {
-				renderer = originalRenderer;
-			} else if (shouldUseGenericToolRenderer(toolName)) {
-				renderer = (result: any, options: any, theme: Theme, ctx: any) =>
-					renderGenericToolResult(toolName, result, options, theme, ctx);
-			}
-		}
-		if (typeof renderer !== "function") return renderer;
-		// Strip transient Magic Context tags from the text the renderer sees,
-		// without touching the stored result message.
-		return (result: any, options: any, theme: Theme, ctx: any) => renderer(sanitizeToolResultForDisplay(result), options, theme, ctx);
 	};
 
 	// Fallback path for tools without a renderer definition formats raw text.
@@ -5243,6 +5433,55 @@ function buildPreviewText(
 	}
 	if (finalCollapse) text += `${text ? "\n" : ""}${localCollapseActionHint(theme)}`;
 	return text;
+}
+
+function renderSideQuestAgentResult(
+	result: any,
+	options: { expanded?: boolean },
+	theme: Theme,
+	ctx: any,
+): InstanceType<typeof Text> | undefined {
+	const presentation = sideQuestAgentPresentation(result);
+	if (!presentation || !toolClickExpansionActive(toolRenderBridge.localDetailTool)) return undefined;
+
+	const statuses = presentation.statuses.length > 0
+		? ` ${theme.fg("muted", `[${presentation.statuses.join(" | ")}]`)}`
+		: "";
+	const summary = markResultSummary(`${theme.fg("success", "Spawned")}${statuses}`);
+	if (options.expanded !== true) {
+		return makeText(ctx.lastComponent, withBranch(`${summary}${toolOutputDetailHint(theme, false)}`, theme));
+	}
+
+	const promptLines = String(ctx.args?.prompt ?? "").replace(/\r\n/g, "\n").split("\n");
+	const level = progressiveLocalDetailLevelForRender(ctx.state);
+	const limit = progressivePreviewLimit(previewLimit(), ctx.state);
+	const localClickControls = progressiveLocalControlsEnabled();
+	const finalCollapse = localClickControls
+		&& promptLines.length > previewLimit()
+		&& (level >= 2 || promptLines.length <= limit);
+	const preview = buildPreviewText(
+		promptLines.slice(0, limit),
+		false,
+		theme,
+		limit,
+		promptLines.length,
+		(line) => theme.fg("dim", line || " "),
+		{
+			toolExpanded: true,
+			localDetailEnabled: level < 2,
+			progressiveLocalDetail: true,
+			localClickControls,
+			finalCollapse,
+		},
+	);
+	const sessionPath = String(result?.details?.sessionPath ?? "Unavailable");
+	const content = [
+		summary,
+		theme.fg("dim", `session path: ${sessionPath}`),
+		"",
+		preview,
+	].join("\n");
+	return makeText(ctx.lastComponent, withProgressivePreviewBranch(content, theme, finalCollapse));
 }
 
 // ===========================================================================

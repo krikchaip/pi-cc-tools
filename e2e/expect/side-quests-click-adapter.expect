@@ -1,0 +1,224 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen acceptance for the optional Side Quests click adapter.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set cc_extension [expr {[info exists env(CC_EXTENSION)] ? $env(CC_EXTENSION) : [file join $repo_dir "extensions" "index.ts"]}]
+set fixture_extension [file join $repo_dir "e2e" "fixtures" "side-quests-adapter-producer.ts"]
+set assert_path [file join $expect_dir "side-quests-click-adapter-assert.py"]
+set side_quests_renderer [expr {[info exists env(SIDE_QUESTS_RENDERER)] ? $env(SIDE_QUESTS_RENDERER) : "/Users/asol/.pi/agent/packages/side-quests/renderer/agent-renderer.ts"}]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-side-quests-adapter-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 120
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+if {![file exists $side_quests_renderer]} {
+  puts stderr "real Side Quests renderer not found: $side_quests_renderer"
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+set agent_settings {{"quietStartup":true,"theme":"dark","outputPad":0,"groupToolCalls":true}}
+set cc_settings {{"clickExpansion":true,"previewLines":3,"expandedPreviewMaxLines":5,"extraExpandedPreviewMaxLines":7,"groupToolCalls":true}}
+set keybindings {{"app.tools.expand":"ctrl+y"}}
+foreach pair [list \
+  [list [file join $agent "settings.json"] $agent_settings] \
+  [list [file join $home ".pi" "settings.json"] $cc_settings] \
+  [list [file join $agent "keybindings.json"] $keybindings]] {
+  set output [open [lindex $pair 0] "w"]
+  puts $output [lindex $pair 1]
+  close $output
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc stop_pi {} {
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+}
+
+proc fail_case {message scratch} {
+  puts stderr $message
+  puts stderr "ARTIFACTS $scratch"
+  stop_pi
+  exit 1
+}
+
+proc start_pi {log_path extensions {mode long}} {
+  global pi_bin home agent columns rows cwd side_quests_renderer spawn_id
+  cd $cwd
+  log_file -noappend $log_path
+  set command [list env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent SIDE_QUESTS_RENDERER=$side_quests_renderer SIDE_QUEST_E2E_MODE=$mode $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills]
+  foreach extension $extensions { lappend command -e $extension }
+  lappend command --tui-mode fullscreen
+  spawn {*}$command
+  stty columns $columns rows $rows
+}
+
+proc find_anchor_row {seconds anchor_text} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  # A rendered row starts with cursor positioning and clear-line sequences.
+  # Excluding "H" prevents this match from crossing into a later row.
+  set pattern [format {\x1b\[([0-9]+);1H\x1b\[2K[^H]*%s} $anchor_text]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      -re $pattern { return $expect_out(1,string) }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc click_fixture {row} {
+  # Keep successive actions outside Pi's double-click window.
+  after 650
+  send -- "\033\[<0;2;${row}M\033\[<0;2;${row}m"
+}
+
+proc require_anchor_row {label scratch anchor_text} {
+  set row [find_anchor_row 10 $anchor_text]
+  if {$row == 0} {
+    fail_case "$label did not expose its '$anchor_text' rendered row" $scratch
+  }
+  return $row
+}
+
+proc verify_regression_banners {label scratch} {
+  if {![wait_for 10 {FINAL_BANNER_SNAPSHOT_END}]} {
+    fail_case "$label immutable regression snapshot did not render" $scratch
+  }
+}
+
+proc verify_binary_padding_click {label scratch log_path extensions mode heading expanded_text} {
+  start_pi $log_path $extensions $mode
+  set heading_row [require_anchor_row $label $scratch $heading]
+  set padding_row [expr {$heading_row - 1}]
+  if {$padding_row < 1} {
+    fail_case "$label did not place painted padding above its heading" $scratch
+  }
+  click_fixture $padding_row
+  if {![wait_for 5 $expanded_text]} {
+    fail_case "$label native painted-padding click did not expand the real component" $scratch
+  }
+  stop_pi
+}
+
+proc verify_adapter {label scratch} {
+  set row [require_anchor_row $label $scratch "Spawned"]
+  if {![wait_for 5 {click.*to expand}]} {
+    fail_case "$label did not render the compact click anchor" $scratch
+  }
+  click_fixture $row
+  if {![wait_for 5 {SIDE_QUEST_PROMPT_3}]} {
+    fail_case "$label summary click did not open L0" $scratch
+  }
+  set row [require_anchor_row $label $scratch "for more detail"]
+  click_fixture $row
+  if {![wait_for 5 {SIDE_QUEST_PROMPT_5}]} {
+    fail_case "$label detail click did not open L1" $scratch
+  }
+  set row [require_anchor_row $label $scratch "for more detail"]
+  click_fixture $row
+  if {![wait_for 5 {SIDE_QUEST_PROMPT_7}]} {
+    fail_case "$label detail click did not open L2" $scratch
+  }
+  set row [require_anchor_row $label $scratch "Output ends here"]
+  if {![wait_for 5 {click.*to collapse}]} {
+    fail_case "$label L2 did not expose its final collapse row" $scratch
+  }
+  click_fixture $row
+  require_anchor_row $label $scratch "Spawned"
+  if {![wait_for 5 {click.*to expand}]} {
+    fail_case "$label final collapse row did not restore compact output" $scratch
+  }
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+
+# Baseline: real Side Quests remains keyboard-expandable without cc-tools.
+set baseline_log [file join $scratch "baseline.ansi"]
+start_pi $baseline_log [list $fixture_extension]
+set baseline_row [require_anchor_row "Side Quests baseline" $scratch "Spawned"]
+if {![wait_for 5 {ctrl.y.*for details}]} {
+  fail_case "Side Quests baseline did not render its configured dynamic keyboard hint" $scratch
+}
+click_fixture $baseline_row
+if {[wait_for 1 {SIDE_QUEST_PROMPT_3}]} {
+  fail_case "Side Quests baseline accepted mouse expansion without cc-tools" $scratch
+}
+send "\031"
+if {![wait_for 5 {SIDE_QUEST_PROMPT_7}]} {
+  fail_case "Side Quests baseline lost configured keyboard expansion" $scratch
+}
+stop_pi
+
+# Producer first: Side Quests installs before cc-tools.
+set producer_first_log [file join $scratch "producer-first.ansi"]
+start_pi $producer_first_log [list $fixture_extension $cc_extension]
+verify_adapter "Side Quests → cc-tools" $scratch
+stop_pi
+
+# Consumer first: Side Quests replaces cc-tools' getter after cc-tools loads.
+set consumer_first_log [file join $scratch "consumer-first.ansi"]
+start_pi $consumer_first_log [list $cc_extension $fixture_extension]
+verify_adapter "cc-tools → Side Quests" $scratch
+stop_pi
+
+# Banner and short-output regressions in both extension orders.
+set producer_first_regression_log [file join $scratch "producer-first-regressions.ansi"]
+start_pi $producer_first_regression_log [list $fixture_extension $cc_extension] regressions
+verify_regression_banners "Side Quests → cc-tools" $scratch
+stop_pi
+
+set consumer_first_regression_log [file join $scratch "consumer-first-regressions.ansi"]
+start_pi $consumer_first_regression_log [list $cc_extension $fixture_extension] regressions
+verify_regression_banners "cc-tools → Side Quests" $scratch
+stop_pi
+
+# Native clicks land on the real painted top-padding row of each binary banner.
+verify_binary_padding_click "ASK PARENT, Side Quests → cc-tools" $scratch \
+  [file join $scratch "ask-producer-first.ansi"] [list $fixture_extension $cc_extension] \
+  ask-click "ASK PARENT" "ASK_PARENT_PROMPT_30"
+verify_binary_padding_click "ASK PARENT, cc-tools → Side Quests" $scratch \
+  [file join $scratch "ask-consumer-first.ansi"] [list $cc_extension $fixture_extension] \
+  ask-click "ASK PARENT" "ASK_PARENT_PROMPT_30"
+verify_binary_padding_click "WRAP UP, Side Quests → cc-tools" $scratch \
+  [file join $scratch "wrap-producer-first.ansi"] [list $fixture_extension $cc_extension] \
+  wrap-click "WRAP UP" "WRAP_UP_RESULT_30"
+verify_binary_padding_click "WRAP UP, cc-tools → Side Quests" $scratch \
+  [file join $scratch "wrap-consumer-first.ansi"] [list $cc_extension $fixture_extension] \
+  wrap-click "WRAP UP" "WRAP_UP_RESULT_30"
+
+if {[catch {exec python3 $assert_path $baseline_log $producer_first_log $consumer_first_log $producer_first_regression_log $consumer_first_regression_log} assertion]} {
+  puts stderr $assertion
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+puts $assertion
+file delete -force $scratch
+puts "PASS Side Quests optional click adapter fullscreen E2E"
