@@ -84,6 +84,7 @@ const TOOL_GROUP_MODE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-
 const BUILTIN_EXPANSION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:builtin-expansion-patch");
 const BUILTIN_EXPANSION_STATE = Symbol.for("pi-claude-style-tools:builtin-expansion-state");
 const TOOL_CLICK_ANCHORS = Symbol.for("pi-claude-style-tools:tool-click-anchors");
+const TOOL_CLICK_RENDERED_FALLBACK = Symbol.for("pi-claude-style-tools:tool-click-rendered-fallback");
 const TOOL_CLICK_OWNER = Symbol.for("pi-claude-style-tools:tool-click-owner");
 const TOOL_CLICK_GLOBAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-global-expanded");
 const TOOL_CLICK_LOCAL_EXPANDED = Symbol.for("pi-claude-style-tools:tool-click-local-expanded");
@@ -1020,8 +1021,15 @@ const NON_GROUPABLE_TOOL_NAMES = new Set([
 // /reload keeps old group instances alive while commands run from the new module.
 const ACTIVE_TOOL_GROUPS = ((globalThis as any)[ACTIVE_TOOL_GROUPS_KEY] ??= new Set<any>()) as Set<any>;
 
+function isToolExecutionComponent(value: unknown): value is InstanceType<typeof ToolExecutionComponent> {
+	// jiti can load the host and extensions through separate module contexts.
+	// Constructor names stay stable when instanceof identities do not.
+	return value instanceof ToolExecutionComponent
+		|| (value as any)?.constructor?.name === "ToolExecutionComponent";
+}
+
 function isGroupableTool(value: unknown): value is InstanceType<typeof ToolExecutionComponent> {
-	return value instanceof ToolExecutionComponent && !NON_GROUPABLE_TOOL_NAMES.has(getToolName(value));
+	return isToolExecutionComponent(value) && !NON_GROUPABLE_TOOL_NAMES.has(getToolName(value));
 }
 
 type ToolGroupClickAnchor = {
@@ -1477,6 +1485,8 @@ type ToolGroupLayoutBox = {
 	rect: { x: number; y: number; width: number; height: number };
 	clip: { x: number; y: number; width: number; height: number };
 	children: ToolGroupLayoutBox[];
+	lines?: string[];
+	lineOffset?: number;
 	scrollView?: ToolGroupScrollView;
 };
 
@@ -1953,13 +1963,19 @@ function isSideQuestEventMessage(component: BuiltinExpandableComponent): boolean
 }
 
 function builtinClickComponentSupported(component: BuiltinExpandableComponent): boolean {
-	return !(component instanceof CustomMessageComponent) || isSideQuestEventMessage(component);
+	const isCustomMessage = component instanceof CustomMessageComponent
+		|| (component as any)?.constructor?.name === "CustomMessageComponent";
+	return !isCustomMessage || isSideQuestEventMessage(component);
 }
 
 function isBuiltinExpandableComponent(value: unknown): value is BuiltinExpandableComponent {
+	const name = (value as any)?.constructor?.name;
 	return value instanceof BashExecutionComponent
 		|| value instanceof CompactionSummaryMessageComponent
-		|| value instanceof BranchSummaryMessageComponent;
+		|| value instanceof BranchSummaryMessageComponent
+		|| name === "BashExecutionComponent"
+		|| name === "CompactionSummaryMessageComponent"
+		|| name === "BranchSummaryMessageComponent";
 }
 
 function builtinClickExpansionActive(): boolean {
@@ -2100,6 +2116,62 @@ function patchBuiltinTranscriptExpansion(): void {
 	}
 }
 
+function standaloneToolMouseTarget(tool: any, anchor: ToolClickAnchor): ToolGroupMouseTarget {
+	return {
+		component: tool,
+		action: anchor.action,
+		viewportAnchor: anchor.viewportAnchor,
+		activate: () => activateToolClickAction(tool, anchor.action, anchor.viewportAnchor),
+		captureRollback: () => {
+			const snapshot = captureToolClickState(tool, anchor.action, anchor.viewportAnchor);
+			return () => restoreToolClickState(tool, snapshot);
+		},
+	};
+}
+
+function frameMatchedStandaloneToolTarget(
+	mode: ToolGroupInteractiveMode,
+	documentBox: ToolGroupLayoutBox,
+	x: number,
+	y: number,
+): ToolGroupMouseTarget | undefined {
+	if (!documentBox.lines) return undefined;
+	const frameLineIndex = (documentBox.lineOffset ?? 0) + y - documentBox.rect.y;
+	const frameLine = documentBox.lines[frameLineIndex];
+	if (frameLine === undefined) return undefined;
+	const frameKeys = documentBox.lines.map((line) => stripAnsi(line).trimEnd());
+	const clickedKey = frameKeys[frameLineIndex];
+	const width = documentBox.rect.width;
+	const localX = x - documentBox.rect.x;
+	let approximateRow = documentBox.rect.y
+		+ mode.headerContainer.render(width).length
+		+ mode.loadedResourcesContainer.render(width).length;
+	let best: { tool: any; anchor: ToolClickAnchor; score: number; distance: number } | undefined;
+	for (const component of mode.chatContainer.children) {
+		const rendered = component.render(width);
+		if (isToolExecutionComponent(component)) {
+			updateToolClickAnchors(component, rendered);
+			for (const anchor of ((component as any)[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined) ?? []) {
+				if (localX < anchor.start || localX >= anchor.end) continue;
+				if (stripAnsi(rendered[anchor.line] ?? "").trimEnd() !== clickedKey) continue;
+				let score = 4;
+				for (let line = 0; line < rendered.length; line++) {
+					if (line === anchor.line) continue;
+					const candidateKey = stripAnsi(rendered[line]).trimEnd();
+					const comparedFrameLine = frameKeys[frameLineIndex + line - anchor.line];
+					if (candidateKey && candidateKey === comparedFrameLine) score++;
+				}
+				const distance = Math.abs(approximateRow + anchor.line - y);
+				if (!best || score > best.score || (score === best.score && distance < best.distance)) {
+					best = { tool: component, anchor, score, distance };
+				}
+			}
+		}
+		approximateRow += rendered.length;
+	}
+	return best ? standaloneToolMouseTarget(best.tool, best.anchor) : undefined;
+}
+
 function toolGroupAtScreenPoint(
 	renderer: ToolGroupFullscreenRenderer,
 	mode: ToolGroupInteractiveMode,
@@ -2112,11 +2184,14 @@ function toolGroupAtScreenPoint(
 	if (!documentBox || !toolGroupBoxContains(documentBox.clip, x, y)) return undefined;
 
 	const width = documentBox.rect.width;
+	const frameMatchedTarget = frameMatchedStandaloneToolTarget(mode, documentBox, x, y);
+	if (frameMatchedTarget) return frameMatchedTarget;
 	let row = documentBox.rect.y
 		+ mode.headerContainer.render(width).length
 		+ mode.loadedResourcesContainer.render(width).length;
 	for (const component of mode.chatContainer.children) {
-		const height = component.render(width).length;
+		const rendered = component.render(width);
+		const height = rendered.length;
 		const localX = x - documentBox.rect.x;
 		const localY = y - row;
 		if (isToolGroupComponent(component)) {
@@ -2133,20 +2208,13 @@ function toolGroupAtScreenPoint(
 					},
 				};
 			}
-		} else if (component instanceof ToolExecutionComponent) {
-			const anchor = (component as any).clickAnchorAtPoint?.(localX, localY) as ToolClickAnchor | undefined;
-			if (anchor) {
-				return {
-					component,
-					action: anchor.action,
-					viewportAnchor: anchor.viewportAnchor,
-					activate: () => (component as any).activateClickAction?.(anchor.action, anchor.viewportAnchor) === true,
-					captureRollback: () => {
-						const snapshot = captureToolClickState(component, anchor.action, anchor.viewportAnchor);
-						return () => restoreToolClickState(component, snapshot);
-					},
-				};
-			}
+		} else if (isToolExecutionComponent(component)) {
+			// Completed turns can replace the host wrapper with an instance from a
+			// different jiti context. Rebuild stable click metadata from the rows
+			// that are on screen instead of depending on extension-local methods.
+			updateToolClickAnchors(component, rendered);
+			const anchor = toolClickAnchorAtPoint(component, localX, localY);
+			if (anchor) return standaloneToolMouseTarget(component, anchor);
 		} else if (
 			isBuiltinExpandableComponent(component)
 			&& builtinClickActionAtPoint(component, localX, localY) === "expand"
@@ -2372,7 +2440,7 @@ function isMarkdownComponent(value: unknown): value is InstanceType<typeof Markd
 function forEachModeTool(mode: ToolGroupInteractiveMode | undefined, visitor: (tool: any) => void): void {
 	if (!mode) return;
 	for (const component of mode.chatContainer.children) {
-		if (component instanceof ToolExecutionComponent) visitor(component);
+		if (isToolExecutionComponent(component)) visitor(component);
 		else if (isToolGroupComponent(component)) component.forEachTool(visitor);
 	}
 }
@@ -4048,8 +4116,42 @@ function clickAnchorStart(line: string): number {
 	return start;
 }
 
+function renderedToolClickAnchors(tool: any, rendered: string[]): ToolClickAnchor[] {
+	const anchors: ToolClickAnchor[] = [];
+	for (let line = 0; line < rendered.length; line++) {
+		const plain = stripAnsi(rendered[line]);
+		const matches = [...plain.matchAll(/click (?:to expand|to collapse|for more detail|for less detail)/gi)];
+		for (const match of matches) {
+			const phrase = match[0].toLowerCase();
+			const action: ToolClickAction = phrase === "click to expand" || phrase === "click to collapse"
+				? "expand"
+				: phrase === "click for less detail" || !toolSupportsProgressiveLocalDetail(tool)
+					? "detail-extra"
+					: "detail";
+			const finalCollapse = phrase === "click to collapse" && /output ends here/i.test(plain);
+			const exactSpan = matches.length > 1 || finalCollapse;
+			const targetStart = finalCollapse ? plain.toLowerCase().indexOf("output ends here") : match.index ?? 0;
+			const start = exactSpan ? visibleWidth(plain.slice(0, targetStart)) : clickAnchorStart(rendered[line]);
+			const end = exactSpan
+				? finalCollapse
+					? visibleWidth(plain.trimEnd())
+					: visibleWidth(plain.slice(0, (match.index ?? 0) + match[0].length))
+				: visibleWidth(plain.trimEnd());
+			if (end > start) anchors.push({
+				line,
+				start,
+				end,
+				action,
+				viewportAnchor: finalCollapse ? "bottom" : "top",
+			});
+		}
+	}
+	return anchors;
+}
+
 function toolHasEffectiveClickAction(tool: any): boolean {
 	if (tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true) return true;
+	if (tool?.[TOOL_CLICK_RENDERED_FALLBACK] === true) return true;
 	if (isSideQuestBinaryTool(tool)) return sideQuestBinaryHasHiddenContent(tool);
 	return [tool.callRendererComponent, tool.resultRendererComponent]
 		.filter(isToolTextComponent)
@@ -4059,6 +4161,7 @@ function toolHasEffectiveClickAction(tool: any): boolean {
 function updateToolClickAnchors(tool: any, rendered: string[]): void {
 	if (!toolClickExpansionActive(tool)) {
 		tool[TOOL_CLICK_ANCHORS] = [];
+		tool[TOOL_CLICK_RENDERED_FALLBACK] = false;
 		return;
 	}
 	const anchors: ToolClickAnchor[] = [];
@@ -4078,6 +4181,7 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 			}
 		}
 		tool[TOOL_CLICK_ANCHORS] = anchors;
+		tool[TOOL_CLICK_RENDERED_FALLBACK] = false;
 		return;
 	}
 	const components = [tool.callRendererComponent, tool.resultRendererComponent]
@@ -4112,6 +4216,15 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 			if (end > start) anchors.push({ line, start, end, action: "header", viewportAnchor: "top" });
 		}
 	}
+	const renderedFallbacks = renderedToolClickAnchors(tool, rendered);
+	for (const fallback of renderedFallbacks) {
+		if (!anchors.some((anchor) => (
+			anchor.line === fallback.line
+			&& anchor.action === fallback.action
+			&& anchor.viewportAnchor === fallback.viewportAnchor
+		))) anchors.push(fallback);
+	}
+	tool[TOOL_CLICK_RENDERED_FALLBACK] = renderedFallbacks.length > 0;
 	tool[TOOL_CLICK_ANCHORS] = anchors;
 }
 
@@ -4217,16 +4330,20 @@ function adaptedToolResultRenderer(tool: any, activeGetter: (...args: any[]) => 
 	};
 }
 
+function toolClickAnchorAtPoint(tool: any, x: number, y: number): ToolClickAnchor | undefined {
+	if (!toolClickExpansionActive(tool)) return undefined;
+	return (tool?.[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined)?.find((anchor) => (
+		y === anchor.line && x >= anchor.start && x < anchor.end
+	));
+}
+
 function refreshToolExecutionClickHandlers(proto: any): void {
 	proto.clickAnchorAtPoint = function clickAnchorAtPoint(x: number, y: number): ToolClickAnchor | undefined {
-		if (!toolClickExpansionActive(this)) return undefined;
-		return (this[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined)?.find((anchor) => (
-			y === anchor.line && x >= anchor.start && x < anchor.end
-		));
+		return toolClickAnchorAtPoint(this, x, y);
 	};
 
 	proto.clickActionAtPoint = function clickActionAtPoint(x: number, y: number): ToolClickAction | undefined {
-		return this.clickAnchorAtPoint(x, y)?.action;
+		return toolClickAnchorAtPoint(this, x, y)?.action;
 	};
 
 	proto.activateClickAction = function activateClickAction(
@@ -4244,13 +4361,13 @@ function refreshToolExecutionClickHandlers(proto: any): void {
 			|| event?.dragged === true
 			|| Boolean(event?.url)
 		) return undefined;
-		const anchor = this.clickAnchorAtPoint(event.x, event.y) as ToolClickAnchor | undefined;
+		const anchor = toolClickAnchorAtPoint(this, event.x, event.y);
 		if (!anchor) return undefined;
 		const snapshot = captureToolClickState(this, anchor.action, anchor.viewportAnchor);
 		return scheduleNativeSingleClick(
 			this,
 			Number(event.clickCount ?? 1),
-			() => this.activateClickAction(anchor.action, anchor.viewportAnchor),
+			() => activateToolClickAction(this, anchor.action, anchor.viewportAnchor),
 			() => restoreToolClickState(this, snapshot),
 		);
 	};
@@ -5153,10 +5270,10 @@ type ToolTextSemanticRow = {
 };
 
 function findToolExecutionAncestor(value: any): any | undefined {
-	if (value?.[TOOL_CLICK_OWNER] instanceof ToolExecutionComponent) return value[TOOL_CLICK_OWNER];
+	if (isToolExecutionComponent(value?.[TOOL_CLICK_OWNER])) return value[TOOL_CLICK_OWNER];
 	let current = value;
 	for (let depth = 0; current && depth < 8; depth++) {
-		if (current instanceof ToolExecutionComponent) return current;
+		if (isToolExecutionComponent(current)) return current;
 		current = current[COMPONENT_PARENT];
 	}
 	return undefined;

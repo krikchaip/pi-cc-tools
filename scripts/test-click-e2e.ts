@@ -34,6 +34,7 @@ const expectFiles = [
   "e2e/expect/single-edit-gap.expect",
   "e2e/expect/reload-click-anchors.expect",
   "e2e/expect/reload-stale-tool-mouse.expect",
+  "e2e/expect/stale-builtin-bash-click.expect",
   "e2e/expect/reload-tool-background.expect",
   "e2e/expect/standalone-skill-anchor.expect",
   "e2e/expect/custom-renderer-preservation.expect",
