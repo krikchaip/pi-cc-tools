@@ -50,14 +50,14 @@ if not partial_path.is_file() or not final_path.is_file():
 parser = load_parser()
 partial = last_matching(parser, partial_path, "BASH_PRESERVED_03")
 partial_text = "\n".join(partial)
-if "Done (8 lines)" in partial_text:
+if "Done (24 lines)" in partial_text:
     fail("partial frame was captured after Bash completed", partial)
 if not any("Bash" in row and "for i in" in row for row in partial):
     fail("partial frame lacks the running Bash heading", partial)
 
 final = last_matching(parser, final_path, "Done")
 final_text = "\n".join(final)
-for token in ("Done", "(8 lines)", "… (5 earlier lines)", "BASH_PRESERVED_06", "BASH_PRESERVED_07", "BASH_PRESERVED_08"):
+for token in ("Done", "(24 lines)", "… (21 earlier lines)", "BASH_PRESERVED_22", "BASH_PRESERVED_23", "BASH_PRESERVED_24"):
     if token not in final_text:
         fail(f"finished preserved preview is missing {token!r}", final)
 

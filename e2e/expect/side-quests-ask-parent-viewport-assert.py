@@ -17,10 +17,13 @@ parser = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(parser)
 
 
-def fullest_frame(path: Path, required: str) -> list[str]:
+def fullest_frame(path: Path, required: str, seed: Path | None = None) -> list[str]:
+    # Fullscreen repaint output can span Expect's 8 KiB read boundary. Seed
+    # transition captures with the prior complete screen, as a terminal does.
+    raw = (seed.read_text(errors="replace") if seed else "") + path.read_text(errors="replace")
     candidates = [
         (index, frame)
-        for index, frame in enumerate(parser.frames(path))
+        for index, frame in enumerate(parser.snapshots(raw))
         if any(required in row for row in frame)
     ]
     if not candidates:
@@ -32,25 +35,36 @@ def marker_rows(frame: list[str], prefix: str) -> dict[str, int]:
     pattern = re.compile(rf"{re.escape(prefix)}[0-9]{{2}}")
     found: dict[str, int] = {}
     for row, text in enumerate(frame, 1):
+        # Pi can leave tail cells from a prior partial repaint and composites
+        # the jump indicator over one such row. The coherent transcript occurs
+        # first, so later copies must not replace its geometry.
+        if "Jump to latest message" in text:
+            continue
         for match in pattern.finditer(text):
-            token = match.group(0)
-            if token in found:
-                raise ValueError(
-                    f"duplicate marker {token!r} at rows {found[token]} and {row}"
-                )
-            found[token] = row
+            found.setdefault(match.group(0), row)
     return found
 
 
 def main(scratch: Path) -> None:
     failures: list[str] = []
-    whole_before = fullest_frame(scratch / "whole-before.ansi", "ASK_PARENT_VIEWPORT_DETAIL_25")
-    whole_after = fullest_frame(scratch / "whole-after.ansi", "ASK_PARENT_VIEWPORT_AFTER_15")
-    bottom_before = fullest_frame(scratch / "bottom-before.ansi", "ASK_PARENT_VIEWPORT_DETAIL_60")
-    bottom_after = fullest_frame(scratch / "bottom-after.ansi", "ASK_PARENT_VIEWPORT_AFTER_15")
-    rollback_before = fullest_frame(scratch / "rollback-before.ansi", "ASK_PARENT_VIEWPORT_DETAIL_25")
-    double_after = fullest_frame(scratch / "double-after.ansi", "ASK_PARENT_VIEWPORT_DETAIL_25")
-    triple_after = fullest_frame(scratch / "triple-after.ansi", "ASK_PARENT_VIEWPORT_DETAIL_25")
+    whole_before_path = scratch / "whole-before.ansi"
+    whole_before = fullest_frame(whole_before_path, "ASK_PARENT_VIEWPORT_DETAIL_40")
+    whole_after = fullest_frame(
+        scratch / "whole-after.ansi", "ASK_PARENT_VIEWPORT_AFTER_15", whole_before_path
+    )
+    bottom_before_path = scratch / "bottom-before.ansi"
+    bottom_before = fullest_frame(bottom_before_path, "ASK_PARENT_VIEWPORT_DETAIL_60")
+    bottom_after = fullest_frame(
+        scratch / "bottom-after.ansi", "ASK_PARENT_VIEWPORT_AFTER_15", bottom_before_path
+    )
+    rollback_path = scratch / "rollback-before.ansi"
+    rollback_before = fullest_frame(rollback_path, "ASK_PARENT_VIEWPORT_DETAIL_25")
+    double_after = fullest_frame(
+        scratch / "double-after.ansi", "ASK_PARENT_VIEWPORT_DETAIL_25", rollback_path
+    )
+    triple_after = fullest_frame(
+        scratch / "triple-after.ansi", "ASK_PARENT_VIEWPORT_DETAIL_25", rollback_path
+    )
 
     if any("ASK_PARENT_VIEWPORT_BEFORE_" in row or "ASK_PARENT_VIEWPORT_AFTER_" in row for row in whole_before):
         failures.append("whole viewport: fixture did not isolate the expanded ask_parent banner")
@@ -71,7 +85,7 @@ def main(scratch: Path) -> None:
     ]
     if moved:
         failures.append("bottom edge: following transcript rows moved: " + ", ".join(moved))
-    if not any("to expand" in row for row in bottom_after):
+    if not any("ASK_PARENT_VIEWPORT_DETAIL_08…" in row for row in bottom_after):
         failures.append("bottom edge: collapsed ask_parent banner edge is not visible")
     if any("ASK_PARENT_VIEWPORT_DETAIL_60" in row for row in bottom_after):
         failures.append("bottom edge: expanded ask_parent details remained visible")

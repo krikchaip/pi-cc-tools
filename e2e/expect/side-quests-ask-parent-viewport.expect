@@ -58,11 +58,12 @@ proc wait_for {seconds pattern} {
 }
 
 proc drain_repaint {} {
-  for {set read 0} {$read < 8} {incr read} {
-    after 50
+  set idle_reads 0
+  for {set read 0} {$read < 64 && $idle_reads < 8} {incr read} {
+    after 25
     expect -timeout 0 {
-      -re {.+} {}
-      timeout {}
+      -re {.+} { set idle_reads 0 }
+      timeout { incr idle_reads }
       eof { return }
     }
   }

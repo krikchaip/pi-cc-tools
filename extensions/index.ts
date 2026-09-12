@@ -1058,10 +1058,22 @@ type ReversibleNativeClick = {
 	wordEndX?: number;
 };
 
-let activeNativeMouseDispatch: {
+type ActiveNativeMouseDispatch = {
 	state: ToolGroupMousePatchState;
 	renderer: ToolGroupFullscreenRenderer;
-} | undefined;
+	handled: boolean;
+};
+
+const ACTIVE_NATIVE_MOUSE_DISPATCH_KEY = Symbol.for("pi-claude-style-tools:active-native-mouse-dispatch");
+
+function activeNativeMouseDispatch(): ActiveNativeMouseDispatch | undefined {
+	return (globalThis as any)[ACTIVE_NATIVE_MOUSE_DISPATCH_KEY];
+}
+
+function setActiveNativeMouseDispatch(dispatch: ActiveNativeMouseDispatch | undefined): void {
+	if (dispatch) (globalThis as any)[ACTIVE_NATIVE_MOUSE_DISPATCH_KEY] = dispatch;
+	else delete (globalThis as any)[ACTIVE_NATIVE_MOUSE_DISPATCH_KEY];
+}
 
 function requestedToolClickViewportAnchor(
 	tool: any,
@@ -1122,14 +1134,16 @@ function scheduleNativeSingleClick(
 	activate: () => boolean,
 	rollback: () => void,
 ): any {
+	const dispatch = activeNativeMouseDispatch();
+	if (dispatch) dispatch.handled = true;
+	const effectiveClickCount = Math.max(clickCount, dispatch?.state.press?.clickCount ?? 1);
 	const pending = NATIVE_CLICK_TIMERS.get(owner);
 	if (pending) {
 		clearReversibleNativeClick(pending);
-		if (clickCount > 1) pending.rollback();
+		if (effectiveClickCount > 1) pending.rollback();
 	}
-	if (clickCount > 1) return undefined;
+	if (effectiveClickCount > 1) return undefined;
 	if (!activate()) return undefined;
-	const dispatch = activeNativeMouseDispatch;
 	const press = dispatch?.state.press;
 	const entry: ReversibleNativeClick = {
 		timer: undefined as unknown as ReturnType<typeof setTimeout>,
@@ -1425,6 +1439,17 @@ class ToolGroupComponent extends Container {
 	}
 }
 
+function refreshRetainedToolGroupClickHandlers(): void {
+	const current = ToolGroupComponent.prototype as any;
+	for (const group of ACTIVE_TOOL_GROUPS) {
+		const retained = Object.getPrototypeOf(group);
+		if (!retained) continue;
+		for (const method of ["clickAnchorsEnabled", "clickAnchorAtPoint", "toggleToolAtPoint", "handleMouse"]) {
+			retained[method] = current[method];
+		}
+	}
+}
+
 type SgrMouseEvent = {
 	button: number;
 	x: number;
@@ -1500,11 +1525,21 @@ type ToolGroupMousePatchState = {
 	press?: {
 		x: number;
 		y: number;
+		clickCount: number;
 		wordStartX?: number;
 		wordEndX?: number;
 		target?: ToolGroupMouseTarget;
 		moved: boolean;
 		blocked: boolean;
+	};
+	lastPress?: {
+		renderer: ToolGroupFullscreenRenderer;
+		x: number;
+		y: number;
+		at: number;
+		clickCount: number;
+		wordStartX?: number;
+		wordEndX?: number;
 	};
 	pendingClick?: {
 		timer: ReturnType<typeof setTimeout>;
@@ -1674,11 +1709,35 @@ function captureToolCollapseViewport(
 	}
 }
 
+const MIN_EXPANSION_VISIBLE_ROWS = 8;
+
+function growingTopViewportTarget(
+	snapshot: ToolCollapseViewportSnapshot,
+	baselineScrollTop: number,
+	componentHeight: number,
+): number {
+	const componentTop = snapshot.componentTop;
+	const viewportHeight = snapshot.scrollView.viewportHeight;
+	if (
+		componentTop === undefined
+		|| !Number.isFinite(viewportHeight)
+		|| viewportHeight! <= 0
+	) return baselineScrollTop;
+	const wantedVisibleRows = Math.min(MIN_EXPANSION_VISIBLE_ROWS, componentHeight, viewportHeight!);
+	return Math.max(baselineScrollTop, componentTop + wantedVisibleRows - viewportHeight!);
+}
+
 function collapseViewportTarget(snapshot: ToolCollapseViewportSnapshot): number | undefined {
-	if (snapshot.viewportAnchor === "top") return snapshot.scrollTop;
 	if (snapshot.viewportAnchor === "component-top") return snapshot.componentTop;
 	const nextContent = snapshot.mode.documentContainer.render(snapshot.contentWidth);
 	if (!Array.isArray(nextContent)) return undefined;
+	if (snapshot.viewportAnchor === "top") {
+		if (nextContent.length <= snapshot.contentHeight) return snapshot.scrollTop;
+		const componentRows = snapshot.anchorComponent.render(snapshot.contentWidth);
+		return Array.isArray(componentRows)
+			? growingTopViewportTarget(snapshot, snapshot.scrollTop, componentRows.length)
+			: snapshot.scrollTop;
+	}
 	// Pi also clamps scrollTo(), but make the top-boundary fallback explicit:
 	// if removed rows exceed available scrollback, preserve as much of the
 	// transcript below the bottom anchor as the document boundary permits.
@@ -1809,7 +1868,9 @@ function settlePendingToolCollapseViewport(state: any, pending: PendingToolColla
 		if (heightDelta === 0) return;
 		const target = snapshot.viewportAnchor === "bottom"
 			? postCollapse.scrollTop + heightDelta
-			: postCollapse.scrollTop;
+			: snapshot.viewportAnchor === "top" && heightDelta > 0
+				? growingTopViewportTarget(snapshot, postCollapse.scrollTop, lines.length)
+				: postCollapse.scrollTop;
 		// A shrinking bottom-anchored component has a valid target in the old layout.
 		// Move there before the first settled paint so rows below the anchor stay fixed.
 		// A growing bottom-anchored component must first commit its larger scroll range.
@@ -1977,6 +2038,32 @@ function captureBuiltinClickRollback(component: BuiltinExpandableComponent): () 
 	};
 }
 
+function refreshBuiltinClickHandlers(proto: any): void {
+	proto.clickActionAtPoint = function clickBuiltinActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+		return builtinClickActionAtPoint(this, x, y);
+	};
+	proto.activateClickAction = function activateBuiltinAction(action: ToolClickAction): boolean {
+		return action === "expand" && activateBuiltinClickAction(this);
+	};
+	proto.handleMouse = function handleBuiltinExpandableMouse(event: any): any {
+		if (
+			!hasNativeMouseDispatch()
+			|| event?.type !== "click"
+			|| event?.button !== "left"
+			|| event?.dragged === true
+			|| Boolean(event?.url)
+			|| this.clickActionAtPoint(event.x, event.y) !== "expand"
+		) return undefined;
+		const rollback = captureBuiltinClickRollback(this);
+		return scheduleNativeSingleClick(
+			this,
+			Number(event.clickCount ?? 1),
+			() => this.activateClickAction("expand"),
+			rollback,
+		);
+	};
+}
+
 function patchBuiltinTranscriptExpansion(): void {
 	for (const ComponentClass of [
 		BashExecutionComponent,
@@ -1984,6 +2071,7 @@ function patchBuiltinTranscriptExpansion(): void {
 		BranchSummaryMessageComponent,
 	]) {
 		const proto = ComponentClass.prototype as any;
+		refreshBuiltinClickHandlers(proto);
 		if (proto[BUILTIN_EXPANSION_PATCH_FLAG]) continue;
 		const originalRender = proto.render;
 		proto.render = function patchedBuiltinExpandableRender(width: number): string[] {
@@ -1993,29 +2081,6 @@ function patchBuiltinTranscriptExpansion(): void {
 			state.height = rows.length;
 			state.rows = rows;
 			return rows;
-		};
-		proto.clickActionAtPoint = function clickBuiltinActionAtPoint(x: number, y: number): ToolClickAction | undefined {
-			return builtinClickActionAtPoint(this, x, y);
-		};
-		proto.activateClickAction = function activateBuiltinAction(action: ToolClickAction): boolean {
-			return action === "expand" && activateBuiltinClickAction(this);
-		};
-		proto.handleMouse = function handleBuiltinExpandableMouse(event: any): any {
-			if (
-				!hasNativeMouseDispatch()
-				|| event?.type !== "click"
-				|| event?.button !== "left"
-				|| event?.dragged === true
-				|| Boolean(event?.url)
-				|| this.clickActionAtPoint(event.x, event.y) !== "expand"
-			) return undefined;
-			const rollback = captureBuiltinClickRollback(this);
-			return scheduleNativeSingleClick(
-				this,
-				Number(event.clickCount ?? 1),
-				() => this.activateClickAction("expand"),
-				rollback,
-			);
 		};
 		proto[BUILTIN_EXPANSION_PATCH_FLAG] = true;
 	}
@@ -2124,9 +2189,23 @@ function installToolGroupMouseAdapter(): void {
 		const originalHandleViewportInput = fullscreenPrototype.handleViewportInput;
 		fullscreenPrototype.handleViewportInput = function (this: ToolGroupFullscreenRenderer, data: string) {
 			const event = parseToolGroupSgrMouseEvent(data);
-			const mode = state!.modes.get(this);
+			const registeredMode = state!.modes.get(this);
+			const activeMode = clickRuntime.activeInteractiveMode;
+			const mode = registeredMode ?? (activeMode?.renderer === this ? activeMode : undefined);
+			if (!registeredMode && mode) state!.modes.set(this, mode);
 			const isLeftButton = event !== undefined && (event.button & 3) === 0;
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0) {
+				const now = Date.now();
+				const lastPress = state!.lastPress;
+				const repeatedPress = lastPress
+					&& lastPress.renderer === this
+					&& now - lastPress.at <= 510
+					&& lastPress.y === event.y
+					&& (lastPress.wordStartX === undefined || lastPress.wordEndX === undefined
+						? lastPress.x === event.x
+						: event.x >= lastPress.wordStartX && event.x < lastPress.wordEndX);
+				const clickCount = repeatedPress ? lastPress.clickCount + 1 : 1;
+				state!.lastPress = { renderer: this, x: event.x, y: event.y, at: now, clickCount };
 				const pending = nativeMouseDispatch ? state!.nativePendingClick : state!.pendingClick;
 				const sameWord = pending
 					&& pending.renderer === this
@@ -2149,6 +2228,7 @@ function installToolGroupMouseAdapter(): void {
 				state!.press = {
 					x: event.x,
 					y: event.y,
+					clickCount,
 					target: mode ? state!.targetAt?.(this, mode, event.x, event.y) : undefined,
 					moved: false,
 					blocked: false,
@@ -2157,13 +2237,16 @@ function installToolGroupMouseAdapter(): void {
 				if (event.x !== state!.press.x || event.y !== state!.press.y) state!.press.moved = true;
 			}
 
-			const previousNativeDispatch = activeNativeMouseDispatch;
-			if (nativeMouseDispatch) activeNativeMouseDispatch = { state: state!, renderer: this };
+			const previousNativeDispatch = activeNativeMouseDispatch();
+			const nativeDispatch = nativeMouseDispatch
+				? { state: state!, renderer: this, handled: false }
+				: undefined;
+			if (nativeDispatch) setActiveNativeMouseDispatch(nativeDispatch);
 			let result: unknown;
 			try {
 				result = originalHandleViewportInput.call(this, data);
 			} finally {
-				activeNativeMouseDispatch = previousNativeDispatch;
+				setActiveNativeMouseDispatch(previousNativeDispatch);
 			}
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0 && state!.press) {
 				state!.press.blocked = this.selectionGranularity !== "character" || Boolean(this.pressedUrl);
@@ -2179,6 +2262,10 @@ function installToolGroupMouseAdapter(): void {
 				) {
 					state!.press.wordStartX = event.x - (anchor.col - click.wordStart);
 					state!.press.wordEndX = event.x + (click.wordEnd - anchor.col);
+					if (state!.lastPress?.renderer === this && state!.lastPress.at + 510 >= Date.now()) {
+						state!.lastPress.wordStartX = state!.press.wordStartX;
+						state!.lastPress.wordEndX = state!.press.wordEndX;
+					}
 				}
 			}
 			if (event?.release) {
@@ -2186,9 +2273,10 @@ function installToolGroupMouseAdapter(): void {
 				state!.press = undefined;
 				const target = mode ? state!.targetAt?.(this, mode, event.x, event.y) : undefined;
 				if (
-					!nativeMouseDispatch
+					(!nativeMouseDispatch || nativeDispatch?.handled !== true)
 					&& isLeftButton
 					&& press
+					&& press.clickCount === 1
 					&& !press.moved
 					&& !press.blocked
 					&& this.selectionGranularity === "character"
@@ -2778,6 +2866,27 @@ function finalCollapseHintText(): string {
 	const afterClick = " to collapse";
 	if (!theme) return `${beforeClick}${click}${afterClick}`;
 	return `${theme.fg("muted", beforeClick)}${theme.fg("dim", click)}${theme.fg("muted", afterClick)}`;
+}
+
+function addSideQuestBinaryClickActionRow(tool: any, rendered: string[], width: number): string[] {
+	if (!toolClickExpansionActive(tool) || !isSideQuestBinaryTool(tool) || !sideQuestBinaryHasHiddenContent(tool)) {
+		return rendered;
+	}
+	const plain = rendered.map(stripAnsi);
+	if (plain.some((line) => /click to (?:expand|collapse)/.test(line))) return rendered;
+
+	const theme = getGlobalPiTheme() as Theme | undefined;
+	const hint = tool?.expanded === true ? finalCollapseHintText() : clickHintText("expand", tool);
+	const content = padToWidth(`  ${hint}`, Math.max(1, width));
+	const actionRow = theme ? theme.bg("customMessageBg", content) : content;
+	let insertAt = rendered.length;
+	for (let line = rendered.length - 1; line >= 0; line--) {
+		if (!plain[line].trim() && rendered[line].includes("\x1b[48;")) {
+			insertAt = line;
+			break;
+		}
+	}
+	return [...rendered.slice(0, insertAt), actionRow, ...rendered.slice(insertAt)];
 }
 
 type ResolvedClickAnchor = {
@@ -3543,6 +3652,7 @@ function formatSubagentNotification(lines: string[], width: number): string[] {
 
 function patchCustomMessageRender(): void {
 	const proto = CustomMessageComponent.prototype as any;
+	refreshBuiltinClickHandlers(proto);
 	if (proto[CUSTOM_MESSAGE_PATCH_FLAG]) return;
 	const originalRender = proto.render;
 	if (typeof originalRender !== "function") return;
@@ -3577,29 +3687,6 @@ function patchCustomMessageRender(): void {
 			state.rows = result;
 		}
 		return storeMessageRenderCache(this, width, result);
-	};
-	proto.clickActionAtPoint = function clickSideQuestEventActionAtPoint(x: number, y: number): ToolClickAction | undefined {
-		return builtinClickActionAtPoint(this, x, y);
-	};
-	proto.activateClickAction = function activateSideQuestEventAction(action: ToolClickAction): boolean {
-		return action === "expand" && activateBuiltinClickAction(this);
-	};
-	proto.handleMouse = function handleSideQuestEventMouse(event: any): any {
-		if (
-			!hasNativeMouseDispatch()
-			|| event?.type !== "click"
-			|| event?.button !== "left"
-			|| event?.dragged === true
-			|| Boolean(event?.url)
-			|| this.clickActionAtPoint(event.x, event.y) !== "expand"
-		) return undefined;
-		const rollback = captureBuiltinClickRollback(this);
-		return scheduleNativeSingleClick(
-			this,
-			Number(event.clickCount ?? 1),
-			() => this.activateClickAction("expand"),
-			rollback,
-		);
 	};
 	// CustomMessageComponent rebuilds its children via rebuild() (called from
 	// invalidate() and setExpanded()); drop the cached render so the next render
@@ -4151,8 +4238,48 @@ function adaptedToolResultRenderer(tool: any, activeGetter: (...args: any[]) => 
 	};
 }
 
+function refreshToolExecutionClickHandlers(proto: any): void {
+	proto.clickAnchorAtPoint = function clickAnchorAtPoint(x: number, y: number): ToolClickAnchor | undefined {
+		if (!toolClickExpansionActive(this)) return undefined;
+		return (this[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined)?.find((anchor) => (
+			y === anchor.line && x >= anchor.start && x < anchor.end
+		));
+	};
+
+	proto.clickActionAtPoint = function clickActionAtPoint(x: number, y: number): ToolClickAction | undefined {
+		return this.clickAnchorAtPoint(x, y)?.action;
+	};
+
+	proto.activateClickAction = function activateClickAction(
+		action: ToolClickAction,
+		viewportAnchor: ToolViewportAnchor = "top",
+	): boolean {
+		return activateToolClickAction(this, action, viewportAnchor);
+	};
+
+	proto.handleMouse = function handleToolMouse(event: any): any {
+		if (
+			!hasNativeMouseDispatch()
+			|| event?.type !== "click"
+			|| event?.button !== "left"
+			|| event?.dragged === true
+			|| Boolean(event?.url)
+		) return undefined;
+		const anchor = this.clickAnchorAtPoint(event.x, event.y) as ToolClickAnchor | undefined;
+		if (!anchor) return undefined;
+		const snapshot = captureToolClickState(this, anchor.action, anchor.viewportAnchor);
+		return scheduleNativeSingleClick(
+			this,
+			Number(event.clickCount ?? 1),
+			() => this.activateClickAction(anchor.action, anchor.viewportAnchor),
+			() => restoreToolClickState(this, snapshot),
+		);
+	};
+}
+
 function patchToolExecutionRenderers(): void {
 	const proto = ToolExecutionComponent.prototype as any;
+	refreshToolExecutionClickHandlers(proto);
 	if (proto[TOOL_EXECUTION_PATCH_FLAG]) return;
 
 	const originalRender = proto.render;
@@ -4178,7 +4305,8 @@ function patchToolExecutionRenderers(): void {
 			const isStandaloneSideQuest = toolName === "agent";
 			const needsStandaloneFrame = (isMcp || isStandaloneSideQuest && toolBackgroundMode === "outlines")
 				&& !hasStandaloneOutlineFrame(rendered);
-			const output = needsStandaloneFrame ? frameStandaloneMcpLines(rendered, width) : rendered;
+			const framed = needsStandaloneFrame ? frameStandaloneMcpLines(rendered, width) : rendered;
+			const output = addSideQuestBinaryClickActionRow(this, framed, width);
 			updateToolClickAnchors(this, output);
 			return output;
 		};
@@ -4219,43 +4347,6 @@ function patchToolExecutionRenderers(): void {
 		initialResultGetter[TOOL_RESULT_GETTER_ADAPTED] = true;
 		proto.getResultRenderer = initialResultGetter;
 	}
-
-	proto.clickAnchorAtPoint = function clickAnchorAtPoint(x: number, y: number): ToolClickAnchor | undefined {
-		if (!toolClickExpansionActive(this)) return undefined;
-		return (this[TOOL_CLICK_ANCHORS] as ToolClickAnchor[] | undefined)?.find((anchor) => (
-			y === anchor.line && x >= anchor.start && x < anchor.end
-		));
-	};
-
-	proto.clickActionAtPoint = function clickActionAtPoint(x: number, y: number): ToolClickAction | undefined {
-		return this.clickAnchorAtPoint(x, y)?.action;
-	};
-
-	proto.activateClickAction = function activateClickAction(
-		action: ToolClickAction,
-		viewportAnchor: ToolViewportAnchor = "top",
-	): boolean {
-		return activateToolClickAction(this, action, viewportAnchor);
-	};
-
-	proto.handleMouse = function handleToolMouse(event: any): any {
-		if (
-			!hasNativeMouseDispatch()
-			|| event?.type !== "click"
-			|| event?.button !== "left"
-			|| event?.dragged === true
-			|| Boolean(event?.url)
-		) return undefined;
-		const anchor = this.clickAnchorAtPoint(event.x, event.y) as ToolClickAnchor | undefined;
-		if (!anchor) return undefined;
-		const snapshot = captureToolClickState(this, anchor.action, anchor.viewportAnchor);
-		return scheduleNativeSingleClick(
-			this,
-			Number(event.clickCount ?? 1),
-			() => this.activateClickAction(anchor.action, anchor.viewportAnchor),
-			() => restoreToolClickState(this, snapshot),
-		);
-	};
 
 	if (typeof originalHasRendererDefinition === "function") {
 		proto.hasRendererDefinition = function patchedHasRendererDefinition() {
@@ -8820,6 +8911,7 @@ export default function (pi: ExtensionAPI) {
 	patchUserMessageRender();
 	patchAssistantMessages();
 	patchToolExecutionRenderers();
+	refreshRetainedToolGroupClickHandlers();
 	applyDiffPalette();
 	registerThinkingLabels(pi);
 	syncExtraToolDetailMode();

@@ -158,6 +158,20 @@ def locate(path: Path, pattern: str) -> None:
     raise ValueError(f"{path.name}: could not locate {pattern!r}")
 
 
+def locate_in_row(path: Path, row_pattern: str, target_pattern: str) -> None:
+    frame = matching_frame(path, row_pattern)
+    for row_index, text in enumerate(frame, 1):
+        if row_pattern not in text:
+            continue
+        column = text.find(target_pattern)
+        if column >= 0:
+            print(column + 1, row_index)
+            return
+    raise ValueError(
+        f"{path.name}: no row containing {row_pattern!r} also contains {target_pattern!r}"
+    )
+
+
 def main_assert(scratch: Path) -> None:
     failures: list[str] = []
 
@@ -250,6 +264,8 @@ def main_assert(scratch: Path) -> None:
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "locate":
         locate(Path(sys.argv[2]), sys.argv[3])
+    elif len(sys.argv) == 5 and sys.argv[1] == "locate-in-row":
+        locate_in_row(Path(sys.argv[2]), sys.argv[3], sys.argv[4])
     elif len(sys.argv) == 4 and sys.argv[1] == "final-contains":
         frame = frames(Path(sys.argv[2]))[-1]
         raise SystemExit(0 if any(sys.argv[3] in row for row in frame) else 1)
@@ -263,5 +279,5 @@ if __name__ == "__main__":
         raise SystemExit(
             "usage: async-diff-click-assert.py <scratch> | "
             "locate|final-contains <capture> <pattern> | "
-            "matching-row-contains <capture> <anchor> <pattern>"
+            "locate-in-row|matching-row-contains <capture> <anchor> <pattern>"
         )

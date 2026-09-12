@@ -459,6 +459,9 @@ await withRendererHarness(
       if (!hasExactPaintedVerticalPadding(bannerRendered)) {
         reportedDefects.push(`${name} did not preserve exactly one painted top/bottom padding row`);
       }
+      if (!bannerRows.some((line: string) => line.includes("click to expand"))) {
+        throw new Error(`${name} compact banner omitted its visible click-to-expand row: ${JSON.stringify(bannerRows)}`);
+      }
       const firstPaintedRow = bannerRendered.findIndex((line: string) => line.includes("\x1b[48;"));
       const deadRow = bannerRows.findIndex((_: string, y: number) => y >= firstPaintedRow && (
         banner.clickActionAtPoint?.(0, y) !== "expand" || banner.clickActionAtPoint?.(71, y) !== "expand"
@@ -472,6 +475,9 @@ await withRendererHarness(
       const expandedBannerRendered = banner.render(72);
       if (!expandedBannerRendered.some((line: string) => plain(line).includes(expandedNeedle))) {
         throw new Error(`${name} banner did not reveal its full content`);
+      }
+      if (!expandedBannerRendered.some((line: string) => plain(line).includes("Output ends here • click to collapse"))) {
+        throw new Error(`${name} expanded banner omitted its final click-to-collapse row`);
       }
       if (!hasExactPaintedVerticalPadding(expandedBannerRendered)) {
         reportedDefects.push(`${name} expanded output did not preserve exactly one painted top/bottom padding row`);
@@ -873,6 +879,73 @@ await withRendererHarness(
       || !skillReadExecution.render(120).some((line: string) => plain(line).includes("skill anchor payload 3"))
     ) {
       throw new Error(`standalone skill header did not expand its Read result: ${JSON.stringify({ skillReadRows, skillHeaderRow, skillHeaderX })}`);
+    }
+
+    {
+      const viewportRead = new ToolExecutionComponent(
+        "read",
+        "read_viewport_reveal_fixture",
+        { path: "viewport.ts" },
+        {},
+        readDefinition,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      viewportRead.markExecutionStarted();
+      viewportRead.setArgsComplete();
+      viewportRead.updateResult({ content: [{ type: "text", text: cappedOutput }], isError: false }, false);
+      viewportRead.render(120);
+
+      const history = { render: () => Array.from({ length: 104 }, () => "history") };
+      const documentContainer = {
+        render: (width: number) => [...history.render(), ...viewportRead.render(width)],
+      };
+      const scrollView = {
+        scrollTop: 73,
+        viewportHeight: 34,
+        isFollowingEnd: false,
+        scrollTo(target: number, options?: { disableFollow?: boolean }) {
+          this.scrollTop = Math.max(0, target);
+          if (options?.disableFollow !== undefined) this.isFollowingEnd = !options.disableFollow;
+        },
+      };
+      const renderer = {
+        currentLayout: {
+          root: {
+            component: documentContainer,
+            rect: { x: 0, y: 0, width: 120, height: 34 },
+            clip: { x: 0, y: 0, width: 120, height: 34 },
+            children: [],
+          },
+          primaryScrollView: scrollView,
+        },
+        requestRender() {},
+        renderNow() {},
+      };
+      const mode = {
+        renderer,
+        ui: {},
+        documentContainer,
+        headerContainer: { render: () => [] },
+        loadedResourcesContainer: { render: () => [] },
+        chatContainer: { children: [history, viewportRead] },
+      };
+      const runtimeKey = Symbol.for("pi-claude-style-tools:click-runtime");
+      const runtime = (globalThis as any)[runtimeKey];
+      const previousMode = runtime?.activeInteractiveMode;
+      runtime.activeInteractiveMode = mode;
+      try {
+        if (!viewportRead.activateClickAction("expand", "top")) {
+          throw new Error("viewport reveal fixture did not activate its summary expansion");
+        }
+        const componentTop = history.render().length;
+        const visibleComponentRows = scrollView.viewportHeight - (componentTop - scrollView.scrollTop);
+        if (visibleComponentRows < 8) {
+          throw new Error(`top-anchored expansion left its new detail outside the viewport: ${JSON.stringify({ scrollTop: scrollView.scrollTop, componentTop, visibleComponentRows })}`);
+        }
+      } finally {
+        runtime.activeInteractiveMode = previousMode;
+      }
     }
 
     const readExecution = new ToolExecutionComponent(

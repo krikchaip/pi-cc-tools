@@ -80,7 +80,7 @@ if {![wait_for 12 {BASH_PRESERVED_03}]} {
 }
 log_file
 
-if {![wait_for 12 {Done.*8 lines}]} {
+if {![wait_for 12 {Done.*24 lines}]} {
   log_user 1
   puts stderr "Bash fixture did not reach its preserved completed state"
   stop_pi

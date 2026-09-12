@@ -1,0 +1,113 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for clicking a completed Bash result while the agent is still working.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set provider_path [file join $repo_dir "e2e" "fixtures" "preserved-bash-completion-provider.ts"]
+set extra_extension [expr {[info exists env(ACTIVE_BASH_EXTRA_EXTENSION)] ? $env(ACTIVE_BASH_EXTRA_EXTENSION) : ""}]
+set skip_scroll [expr {[info exists env(ACTIVE_BASH_SKIP_SCROLL)] && $env(ACTIVE_BASH_SKIP_SCROLL) eq "1"}]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-active-bash-click-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns [expr {[info exists env(ACTIVE_BASH_COLUMNS)] ? $env(ACTIVE_BASH_COLUMNS) : 100}]
+set rows [expr {[info exists env(ACTIVE_BASH_ROWS)] ? $env(ACTIVE_BASH_ROWS) : 40}]
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json [format {{"quietStartup":true,"theme":"dark","outputPad":1,"clickExpansion":true,"groupToolCalls":true,"liveToolPreview":true,"liveToolPreviewLines":3,"thinkingMode":"full","packages":["%s"]}} $repo_dir]
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      "install missing project packages" { puts stderr "unexpected package prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+set collapsed_path [file join $scratch "collapsed-active.ansi"]
+log_user 0
+log_file -a -noappend $collapsed_path
+set command [list env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent ACTIVE_BASH_THINKING_STREAM=1 ACTIVE_BASH_LONG_TRANSCRIPT=1 \
+  $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-skills --approve]
+if {$extra_extension ne ""} {
+  set extra_extensions [expr {[file isdirectory $extra_extension]
+    ? [lsort [glob -nocomplain -directory $extra_extension *.ts]]
+    : [list $extra_extension]}]
+  foreach path $extra_extensions { lappend command -e $path }
+}
+lappend command -e $provider_path --provider preserved-bash-completion-e2e --model deterministic-bash --api-key e2e-local \
+  --tui-mode fullscreen "Run the deterministic Bash fixture."
+spawn {*}$command
+stty columns $columns rows $rows
+
+if {![wait_for 12 {Done.*24 lines.*click.*to expand}]} {
+  log_user 1
+  fail "active-turn Bash fixture did not expose its completed click anchor" $scratch
+}
+if {![wait_for 3 {ACTIVE_BASH_THINKING_STREAM}]} {
+  log_user 1
+  fail "active-turn Bash fixture did not start continuous thinking repaints" $scratch
+}
+if {!$skip_scroll} {
+  send -- "\033\[<64;1;20M"
+  if {![wait_for 2 {Jump to latest message}]} {
+    log_user 1
+    fail "active-turn Bash fixture did not enter a scrolled viewport" $scratch
+  }
+}
+log_file
+if {[catch {exec python3 $locator_path locate-in-row $collapsed_path "Done" "click"} location]} {
+  log_user 1
+  fail "could not locate the active-turn Bash click anchor: $location" $scratch
+}
+lassign $location target_column target_row
+
+set expanded_path [file join $scratch "expanded-active.ansi"]
+log_file -a -noappend $expanded_path
+send -- "\033\[<0;${target_column};${target_row}M\033\[<0;${target_column};${target_row}m"
+if {![wait_for 3 {BASH_PRESERVED_01}]} {
+  log_user 1
+  fail "completed Bash summary ignored its click while the agent was still working" $scratch
+}
+if {[wait_for 1 {E2E_BASH_PRESERVED_COMPLETE}]} {
+  log_user 1
+  fail "Bash expanded only after the active provider turn ended" $scratch
+}
+
+catch {send "\003\003"}
+catch {close}
+catch {wait}
+catch {log_file}
+file delete -force $scratch
+puts "PASS completed Bash summary remains clickable during an active agent turn"

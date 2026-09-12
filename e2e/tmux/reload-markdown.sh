@@ -2,7 +2,14 @@
 set -euo pipefail
 
 REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
-PI_BIN=${PI_BIN:-$(command -v pi)}
+if [[ -z "${PI_BIN:-}" ]]; then
+  while IFS= read -r candidate; do
+    [[ "$candidate" == "$REPO_DIR/node_modules/.bin/pi" ]] && continue
+    PI_BIN=$candidate
+    break
+  done < <(type -a -p pi)
+fi
+: "${PI_BIN:?Pi executable not found; set PI_BIN explicitly}"
 SCRATCH="/tmp/pi-cc-reload-markdown-e2e-$$"
 SOCKET="pi-cc-reload-markdown-$$"
 SESSION_NAME="reload-markdown"
@@ -188,4 +195,8 @@ then
   exit 1
 fi
 
-rm -rf "$SCRATCH"
+if [[ "${KEEP_E2E_ARTIFACTS:-0}" == "1" ]]; then
+  echo "ARTIFACTS $SCRATCH"
+else
+  rm -rf "$SCRATCH"
+fi

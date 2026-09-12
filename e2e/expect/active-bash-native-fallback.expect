@@ -1,0 +1,8 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression: raw SGR recovers when retained native mouse code rejects a click.
+
+set wrapper_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $wrapper_dir]]
+set env(E2E_POISON_TOOL_MOUSE_ON_TURN_START) 1
+set env(ACTIVE_BASH_EXTRA_EXTENSION) [file join $repo_dir "e2e" "fixtures" "stale-tool-mouse-handler.ts"]
+source [file join $wrapper_dir "active-bash-click.expect"]

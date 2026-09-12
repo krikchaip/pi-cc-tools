@@ -1,0 +1,7 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression: native component dispatch owns the click without raw-SGR fallback.
+
+set wrapper_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $wrapper_dir]]
+set env(ACTIVE_BASH_EXTRA_EXTENSION) [file join $repo_dir "e2e" "fixtures" "disable-raw-click-fallback.ts"]
+source [file join $wrapper_dir "active-bash-click.expect"]

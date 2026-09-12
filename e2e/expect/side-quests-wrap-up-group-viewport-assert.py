@@ -45,7 +45,7 @@ def marker_rows(frame: list[str], prefix: str) -> dict[str, int]:
 def main(scratch: Path) -> None:
     failures: list[str] = []
     collapsed = fullest_frame(scratch / "collapsed.ansi", "WRAP_UP_VIEWPORT_AFTER_01")
-    whole_before = fullest_frame(scratch / "whole-before.ansi", "WRAP_UP_VIEWPORT_DETAIL_26")
+    whole_before = fullest_frame(scratch / "whole-before.ansi", "WRAP_UP_VIEWPORT_DETAIL_40")
     whole_after = fullest_frame(scratch / "whole-after.ansi", "WRAP_UP_VIEWPORT_AFTER_15")
     bottom_before = fullest_frame(scratch / "bottom-before.ansi", "WRAP_UP_VIEWPORT_DETAIL_60")
     bottom_after = fullest_frame(scratch / "bottom-after.ansi", "WRAP_UP_VIEWPORT_AFTER_15")
