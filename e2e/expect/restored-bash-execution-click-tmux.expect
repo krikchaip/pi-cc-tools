@@ -1,0 +1,167 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression: a restored standalone Bash execution summary
+# gets an adapter anchor before any native result-summary click initializes it.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set cross_context_path [file join $repo_dir "e2e" "fixtures" "cross-context-bash-component.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "bash-command-click-standalone-session.jsonl"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-restored-bash-execution-tmux-[pid]"
+set socket "pi-cc-tools-restored-bash-execution-[pid]"
+set session_name "restored-bash-execution"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set capture_path [file join $scratch "tmux-client.ansi"]
+set target_path [file join $scratch "press-target.txt"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set fixture [open $fixture_path "r"]
+set content [read $fixture]
+close $fixture
+set session_path [file join $scratch "session.jsonl"]
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-bash-command-click" $cwd] $content]
+close $session
+
+set settings_json [format {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"groupToolCalls":false,"extensions":["%s","%s"]}} $extension_path $cross_context_path]
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc tmux_command {socket args} {
+  return [exec env -u TMUX -u TMUX_PANE tmux -L $socket {*}$args]
+}
+
+proc shell_quote {value} {
+  return "'[string map [list ' '\\''] $value]'"
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc stop_tmux {socket} {
+  catch {exec env -u TMUX -u TMUX_PANE tmux -L $socket kill-server}
+}
+
+proc fail {message scratch socket} {
+  puts stderr $message
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+  stop_tmux $socket
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+proc locate_row {socket pane required target} {
+  set screen [tmux_command $socket capture-pane -p -t $pane]
+  set row 0
+  foreach line [split $screen "\n"] {
+    incr row
+    if {[string first $required $line] < 0} continue
+    set column [string first $target $line]
+    if {$column >= 0} { return [list [expr {$column + 1}] $row] }
+  }
+  error "no visible row containing $required"
+}
+
+proc physical_click {socket pane required target} {
+  lassign [locate_row $socket $pane $required $target] local_column local_row
+  set pane_left [tmux_command $socket display-message -p -t $pane "#{pane_left}"]
+  set pane_top [tmux_command $socket display-message -p -t $pane "#{pane_top}"]
+  set target_column [expr {$pane_left + $local_column}]
+  set target_row [expr {1 + $pane_top + $local_row}]
+  puts "TMUX_TARGET label=$required pane=$pane local=${local_column},${local_row} screen=${target_column},${target_row}"
+  send -- "\033\[<0;${target_column};${target_row}M\033\[<0;${target_column};${target_row}m"
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+set pi_command [list env HOME=$home COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent E2E_RESTORED_TARGET_PATH=$target_path \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-skills --tui-mode fullscreen]
+set quoted_command {}
+foreach value $pi_command { lappend quoted_command [shell_quote $value] }
+set shell_command [join $quoted_command " "]
+
+stop_tmux $socket
+tmux_command $socket -f /dev/null new-session -d -s $session_name -c $cwd -x $columns -y $rows /bin/bash
+tmux_command $socket set-option -g mouse on
+tmux_command $socket set-option -g status on
+tmux_command $socket set-option -g status-position top
+tmux_command $socket set-option -g default-shell /bin/bash
+tmux_command $socket set-option -g default-terminal tmux-256color
+tmux_command $socket set-window-option -t $session_name window-size manual
+set pi_pane [tmux_command $socket display-message -p -t $session_name "#{pane_id}"]
+
+log_user 0
+log_file -a -noappend $capture_path
+spawn env -u TMUX -u TMUX_PANE TERM=xterm-kitty COLORTERM=truecolor COLUMNS=$columns LINES=$rows \
+  /bin/bash -c "stty columns $columns rows $rows; exec tmux -L $socket attach-session -t $session_name"
+after 300
+tmux_command $socket resize-window -t $session_name -x $columns -y $rows
+after 300
+tmux_command $socket send-keys -t $pi_pane -l $shell_command
+tmux_command $socket send-keys -t $pi_pane Enter
+
+if {![wait_for 10 {Done.*10 lines.*click.*to expand}]} {
+  log_user 1
+  fail "standalone Bash fixture did not expose its click anchor" $scratch $socket
+}
+tmux_command $socket send-keys -t $pi_pane -l "/e2e-hide-restored-tool-semantics"
+tmux_command $socket send-keys -t $pi_pane Enter
+if {![wait_for 5 {E2E_RESTORED_BASH_SEMANTICS_ARMED}]} {
+  log_user 1
+  fail "fixture did not arm the restored Bash context" $scratch $socket
+}
+
+if {[catch {physical_click $socket $pi_pane "● Bash" "Bash"} click_error]} {
+  log_user 1
+  fail "could not locate the restored Bash execution summary: $click_error" $scratch $socket
+}
+after 700
+if {![file exists $target_path]} {
+  log_user 1
+  fail "restored Bash click did not reach the cc-tools target resolver" $scratch $socket
+}
+set target_file [open $target_path "r"]
+set press_target [string trim [read $target_file]]
+close $target_file
+if {$press_target ne "header"} {
+  log_user 1
+  fail "restored Bash execution summary resolved '$press_target' instead of a header anchor" $scratch $socket
+}
+set expanded_screen [tmux_command $socket capture-pane -p -t $pi_pane]
+if {[string first "STANDALONE_RESULT_01" $expanded_screen] < 0} {
+  log_user 1
+  fail "restored Bash execution summary ignored its first physical tmux click" $scratch $socket
+}
+
+catch {send "\003\003"}
+catch {close}
+catch {wait}
+catch {log_file}
+stop_tmux $socket
+puts "ARTIFACTS $scratch"
+puts "PASS restored standalone Bash execution summary is clickable before result initialization"

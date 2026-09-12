@@ -6,7 +6,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 const TOOL_CALL_ID = "preserved-bash-completion-call";
 const OUTPUT_LINE_COUNT = 24;
 const COMMAND_VALUES = Array.from({ length: OUTPUT_LINE_COUNT }, (_, index) => index + 1).join(" ");
-const COMMAND = `for i in ${COMMAND_VALUES}; do printf 'BASH_PRESERVED_%02d\\n' "$i"; sleep 0.1; done`;
+const OUTPUT_COMMAND = `for i in ${COMMAND_VALUES}; do printf 'BASH_PRESERVED_%02d\\n' "$i"; sleep 0.1; done`;
+const COMMAND = process.env.ACTIVE_BASH_EMPTY_OUTPUT === "1" ? "sleep 0.3" : OUTPUT_COMMAND;
 
 function assistantMessage(model: Model<any>): AssistantMessage {
   return {

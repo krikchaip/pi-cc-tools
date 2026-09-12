@@ -2872,14 +2872,13 @@ function sideQuestAgentPresentation(value: any): SideQuestAgentPresentation | un
 		&& reportedStatus !== "answered"
 		&& reportedStatus !== "steered"
 	) return undefined;
-	const resultStatus: SideQuestAgentResultStatus = reportedStatus
-		?? (details?.continuationKind === "answer"
-			? "answered"
-			: details?.operation === "continued"
-				? "steered"
-				: details?.operation === "reopened"
-					? "resumed"
-					: "spawned");
+	let resultStatus: SideQuestAgentResultStatus;
+	if (reportedStatus !== undefined) resultStatus = reportedStatus;
+	else if (details?.continuationKind === "answer") resultStatus = "answered";
+	else if (details?.operation === "continued") resultStatus = "steered";
+	else if (details?.operation === "reopened") resultStatus = "resumed";
+	else if (details?.operation === "launched") resultStatus = "spawned";
+	else return undefined;
 
 	return { ...presentation, resultStatus } as SideQuestAgentPresentation;
 }
@@ -4238,6 +4237,32 @@ function renderedToolClickAnchors(tool: any, rendered: string[]): ToolClickAncho
 	return anchors;
 }
 
+function renderedToolHeaderFallbackAnchor(
+	tool: any,
+	rendered: string[],
+	fallbacks: ToolClickAnchor[],
+): ToolClickAnchor | undefined {
+	if (String(tool?.toolName ?? "").toLowerCase() !== "bash") return undefined;
+	const collapsedResult = fallbacks.find((anchor) => (
+		/click to expand/i.test(stripAnsi(rendered[anchor.line] ?? ""))
+	));
+	if (!collapsedResult) return undefined;
+	for (let line = collapsedResult.line - 1; line >= 0; line--) {
+		const plain = stripAnsi(rendered[line]);
+		let rest = plain.trimStart();
+		let branch = /^(?:├|└|│)(?:─{1,2})?\s+/.exec(rest);
+		while (branch) {
+			rest = rest.slice(branch[0].length);
+			branch = /^(?:├|└|│)(?:─{1,2})?\s+/.exec(rest);
+		}
+		if (!/^[●⬤•·✓✗○◐]\s+Bash(?:\s|$)/i.test(rest)) continue;
+		const start = clickAnchorStart(rendered[line]);
+		const end = visibleWidth(plain.trimEnd());
+		if (end > start) return { line, start, end, action: "header", viewportAnchor: "top" };
+	}
+	return undefined;
+}
+
 function toolHasEffectiveClickAction(tool: any): boolean {
 	if (tool?.[TOOL_CLICK_LOCAL_EXPANDED] === true) return true;
 	if (tool?.[TOOL_CLICK_RENDERED_FALLBACK] === true) return true;
@@ -4275,12 +4300,18 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 	}
 	const components = [tool.callRendererComponent, tool.resultRendererComponent]
 		.filter(isToolTextComponent);
+	let declaredResultSummaryRow = -1;
 	for (const component of components) {
 		for (const semantic of component.getSemanticRows()) {
 			const needle = semantic.anchorText ?? stripAnsi(semantic.text).trim();
 			if (!needle) continue;
 			const matched = rendered.findIndex((line) => stripAnsi(line).includes(needle));
 			if (matched < 0) continue;
+			if (
+				declaredResultSummaryRow < 0
+				&& component === tool.resultRendererComponent
+				&& semantic.action === "expand"
+			) declaredResultSummaryRow = matched;
 			const plain = stripAnsi(rendered[matched]);
 			const targetIndex = semantic.anchorText ? plain.indexOf(semantic.anchorText) : -1;
 			const start = targetIndex >= 0 ? visibleWidth(plain.slice(0, targetIndex)) : clickAnchorStart(rendered[matched]);
@@ -4296,8 +4327,7 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 	}
 	const agentPresentation = sideQuestAgentPresentation(tool);
 	if (String(tool?.toolName ?? "").toLowerCase() === "agent" && agentPresentation) {
-		const resultLabel = sideQuestAgentResultLabel(agentPresentation);
-		const summaryRow = rendered.findIndex((line) => stripAnsi(line).includes(resultLabel));
+		const summaryRow = declaredResultSummaryRow;
 		const headerStart = rendered.findIndex((line, index) => index < summaryRow && /\bAgent\b/.test(stripAnsi(line)));
 		for (let line = headerStart; line >= 0 && line < summaryRow; line++) {
 			const plain = stripAnsi(rendered[line]);
@@ -4314,6 +4344,10 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 			&& anchor.action === fallback.action
 			&& anchor.viewportAnchor === fallback.viewportAnchor
 		))) anchors.push(fallback);
+	}
+	if (!anchors.some((anchor) => anchor.action === "header")) {
+		const headerFallback = renderedToolHeaderFallbackAnchor(tool, rendered, renderedFallbacks);
+		if (headerFallback) anchors.push(headerFallback);
 	}
 	tool[TOOL_CLICK_RENDERED_FALLBACK] = renderedFallbacks.length > 0;
 	tool[TOOL_CLICK_ANCHORS] = anchors;

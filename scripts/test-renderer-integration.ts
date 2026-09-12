@@ -168,7 +168,7 @@ await withRendererHarness(
       if (!hasExactPaintedVerticalPadding(customRendered)) {
         reportedDefects.push(`${customType} did not preserve exactly one painted top/bottom padding row`);
       }
-      assertWholeComponentToggle(
+      assertPaintedComponentToggle(
         customMessage,
         "SIDE_QUEST_EVENT_12",
         `${customType} custom message`,
