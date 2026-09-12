@@ -82,6 +82,8 @@ const UI_NOTIFY_PATCH_FLAG = Symbol.for("pi-claude-style-tools:patched-ui-notifi
 const TOOL_GROUP_MOUSE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-mouse-patch");
 const TOOL_GROUP_MODE_PATCH_FLAG = Symbol.for("pi-claude-style-tools:tool-group-mode-patch");
 const BUILTIN_EXPANSION_PATCH_FLAG = Symbol.for("pi-claude-style-tools:builtin-expansion-patch");
+const BUILTIN_EXPANSION_RENDER_PATCH_FLAG = Symbol.for("pi-claude-style-tools:builtin-expansion-render-patch-v2");
+const BUILTIN_EXPANSION_RENDER_TRANSFORM = Symbol.for("pi-claude-style-tools:builtin-expansion-render-transform");
 const BUILTIN_EXPANSION_STATE = Symbol.for("pi-claude-style-tools:builtin-expansion-state");
 const TOOL_CLICK_ANCHORS = Symbol.for("pi-claude-style-tools:tool-click-anchors");
 const TOOL_CLICK_RENDERED_FALLBACK = Symbol.for("pi-claude-style-tools:tool-click-rendered-fallback");
@@ -1987,6 +1989,14 @@ function isBuiltinExpandableComponent(value: unknown): value is BuiltinExpandabl
 		|| name === "BranchSummaryMessageComponent";
 }
 
+function isBuiltinSummaryComponent(value: unknown): boolean {
+	const name = (value as any)?.constructor?.name;
+	return value instanceof CompactionSummaryMessageComponent
+		|| value instanceof BranchSummaryMessageComponent
+		|| name === "CompactionSummaryMessageComponent"
+		|| name === "BranchSummaryMessageComponent";
+}
+
 function builtinClickExpansionActive(): boolean {
 	return clickExpansionEnabled() && clickRuntime.activeInteractiveMode?.toolOutputExpanded !== true;
 }
@@ -2113,10 +2123,24 @@ function patchBuiltinTranscriptExpansion(): void {
 	]) {
 		const proto = ComponentClass.prototype as any;
 		refreshBuiltinClickHandlers(proto);
-		if (proto[BUILTIN_EXPANSION_PATCH_FLAG]) continue;
+		proto[BUILTIN_EXPANSION_RENDER_TRANSFORM] = (
+			component: BuiltinExpandableComponent,
+			rows: string[],
+		): string[] => {
+			if (
+				!builtinClickExpansionActive()
+				|| builtinComponentExpanded(component)
+				|| !isBuiltinSummaryComponent(component)
+			) return rows;
+			const keyboardHint = keyText("app.tools.expand");
+			return rows.map((row) => row.replace(keyboardHint, "click"));
+		};
+		if (proto[BUILTIN_EXPANSION_RENDER_PATCH_FLAG]) continue;
 		const originalRender = proto.render;
 		proto.render = function patchedBuiltinExpandableRender(width: number): string[] {
-			const rows = originalRender.call(this, width);
+			const rendered = originalRender.call(this, width);
+			const transform = this[BUILTIN_EXPANSION_RENDER_TRANSFORM];
+			const rows = typeof transform === "function" ? transform(this, rendered) : rendered;
 			const state = builtinExpansionState(this);
 			state.width = width;
 			state.height = rows.length;
@@ -2124,6 +2148,7 @@ function patchBuiltinTranscriptExpansion(): void {
 			return rows;
 		};
 		proto[BUILTIN_EXPANSION_PATCH_FLAG] = true;
+		proto[BUILTIN_EXPANSION_RENDER_PATCH_FLAG] = true;
 	}
 
 	const bashProto = BashExecutionComponent.prototype as any;

@@ -22,6 +22,9 @@ foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "se
   puts $settings $settings_json
   close $settings
 }
+set keybindings [open [file join $agent "keybindings.json"] "w"]
+puts $keybindings {{"app.tools.expand":["alt+j"]}}
+close $keybindings
 
 proc wait_for {seconds pattern} {
   set deadline [expr {[clock milliseconds] + $seconds * 1000}]
@@ -38,7 +41,7 @@ proc wait_for {seconds pattern} {
   return 0
 }
 
-proc spawn_case {name fixture extension_path pi_bin cwd home agent columns rows scratch} {
+proc spawn_case {name fixture preload_extension extension_path pi_bin cwd home agent columns rows scratch} {
   global spawn_id
   set session_path [file join $scratch "$name-session.jsonl"]
   set input [open $fixture "r"]
@@ -48,11 +51,14 @@ proc spawn_case {name fixture extension_path pi_bin cwd home agent columns rows 
   puts -nonewline $output [string map [list "/tmp/pi-cc-tools-builtin-click-e2e" $cwd] $content]
   close $output
 
+  set extension_args {}
+  if {$preload_extension ne ""} { lappend extension_args -e $preload_extension }
+  lappend extension_args -e $extension_path
   cd $cwd
   log_file -noappend [file join $scratch "$name-collapsed.ansi"]
   spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
     $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
-    -e $extension_path --tui-mode fullscreen
+    {*}$extension_args --tui-mode fullscreen
   stty columns $columns rows $rows
 }
 
@@ -63,13 +69,29 @@ proc stop_case {} {
   log_file
 }
 
-proc run_summary_case {name fixture collapsed_marker expanded_marker collapsed_y expanded_y extension_path pi_bin cwd home agent columns rows scratch} {
-  spawn_case $name $fixture $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+proc run_summary_case {name fixture collapsed_marker keyboard_marker expanded_marker collapsed_y expanded_y extension_path pi_bin cwd home agent columns rows scratch} {
+  spawn_case $name $fixture "" $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
   if {![wait_for 10 $collapsed_marker]} {
-    puts stderr "$name did not render its collapsed state"
+    puts stderr "$name did not render its collapsed click hint"
     stop_case
     puts "ARTIFACTS $scratch"
     exit 1
+  }
+  if {$keyboard_marker ne ""} {
+    send -- "/cc-tools click off\r"
+    if {![wait_for 5 $keyboard_marker]} {
+      puts stderr "$name did not restore its configured keyboard hint when click expansion was disabled"
+      stop_case
+      puts "ARTIFACTS $scratch"
+      exit 1
+    }
+    send -- "/cc-tools click on\r"
+    if {![wait_for 5 $collapsed_marker]} {
+      puts stderr "$name did not restore its click hint when click expansion was enabled"
+      stop_case
+      puts "ARTIFACTS $scratch"
+      exit 1
+    }
   }
 
   # Use the far-right padded cell to prove the full component width is anchored.
@@ -99,26 +121,58 @@ proc run_summary_case {name fixture collapsed_marker expanded_marker collapsed_y
   stop_case
 }
 
+proc run_stale_summary_hint_case {name fixture collapsed_marker stale_extension_path extension_path pi_bin cwd home agent columns rows scratch} {
+  spawn_case $name $fixture $stale_extension_path $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+  if {![wait_for 10 $collapsed_marker]} {
+    puts stderr "$name did not replace the inherited keyboard hint"
+    stop_case
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+  send -- "/reload\r"
+  if {![wait_for 5 $collapsed_marker]} {
+    puts stderr "$name lost its click hint after reload"
+    stop_case
+    puts "ARTIFACTS $scratch"
+    exit 1
+  }
+  stop_case
+}
+
 puts "PI_VERSION [exec $pi_bin --version]"
 set fixture_dir [file join $repo_dir "e2e" "fixtures"]
+set stale_extension_path [file join $fixture_dir "stale-builtin-summary-wrapper.ts"]
 run_summary_case \
   "compaction" \
   [file join $fixture_dir "builtin-compaction-click-session.jsonl"] \
-  {Compacted from 1,234 tokens} \
+  {Compacted from 1,234 tokens .*click.*to expand} \
+  {Compacted from 1,234 tokens .*option\+j.*to expand} \
   {COMPACTION_EXPANDED_DETAIL} \
   6 7 \
   $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
 run_summary_case \
   "branch" \
   [file join $fixture_dir "builtin-branch-click-session.jsonl"] \
-  {Branch summary} \
+  {Branch summary .*click.*to expand} \
+  {Branch summary .*option\+j.*to expand} \
   {BRANCH_EXPANDED_DETAIL} \
   6 7 \
   $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+run_stale_summary_hint_case \
+  "stale-compaction" \
+  [file join $fixture_dir "builtin-compaction-click-session.jsonl"] \
+  {Compacted from 1,234 tokens .*click.*to expand} \
+  $stale_extension_path $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
+run_stale_summary_hint_case \
+  "stale-branch" \
+  [file join $fixture_dir "builtin-branch-click-session.jsonl"] \
+  {Branch summary .*click.*to expand} \
+  $stale_extension_path $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
 run_summary_case \
   "shell" \
   [file join $fixture_dir "builtin-shell-click-session.jsonl"] \
   {\.\.\. 4 more lines} \
+  {} \
   {SHELL_EXPANDED_DETAIL_01} \
   2 30 \
   $extension_path $pi_bin $cwd $home $agent $columns $rows $scratch
