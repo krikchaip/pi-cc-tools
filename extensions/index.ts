@@ -2869,14 +2869,19 @@ function finalCollapseHintText(): string {
 }
 
 function addSideQuestBinaryClickActionRow(tool: any, rendered: string[], width: number): string[] {
-	if (!toolClickExpansionActive(tool) || !isSideQuestBinaryTool(tool) || !sideQuestBinaryHasHiddenContent(tool)) {
+	if (
+		!toolClickExpansionActive(tool)
+		|| !isSideQuestBinaryTool(tool)
+		|| !sideQuestBinaryHasHiddenContent(tool)
+		|| tool?.expanded !== true
+	) {
 		return rendered;
 	}
 	const plain = rendered.map(stripAnsi);
-	if (plain.some((line) => /click to (?:expand|collapse)/.test(line))) return rendered;
+	if (plain.some((line) => /click to collapse/.test(line))) return rendered;
 
 	const theme = getGlobalPiTheme() as Theme | undefined;
-	const hint = tool?.expanded === true ? finalCollapseHintText() : clickHintText("expand", tool);
+	const hint = finalCollapseHintText();
 	const content = padToWidth(`  ${hint}`, Math.max(1, width));
 	const actionRow = theme ? theme.bg("customMessageBg", content) : content;
 	let insertAt = rendered.length;

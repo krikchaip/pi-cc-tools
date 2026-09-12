@@ -71,8 +71,8 @@ def main(scratch: Path) -> None:
     ]
     if moved:
         failures.append("bottom edge: following transcript rows moved: " + ", ".join(moved))
-    if not any("to expand" in row for row in bottom_after):
-        failures.append("bottom edge: collapsed WRAP UP banner edge is not visible")
+    if not any("WRAP_UP_VIEWPORT_DETAIL_…" in row for row in bottom_after):
+        failures.append("bottom edge: collapsed WRAP UP fade edge is not visible")
     if any("WRAP_UP_VIEWPORT_DETAIL_60" in row for row in bottom_after):
         failures.append("bottom edge: expanded WRAP UP details remained visible")
 

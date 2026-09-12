@@ -181,7 +181,7 @@ set rollback_point [find_visible_up $rollback_collapsed "ASK PARENT" 8 $columns 
 if {[llength $rollback_point] != 2} { fail "ask_parent rollback fixture was not found" $scratch }
 lassign $rollback_point _rollback_x rollback_y
 click 50 $rollback_y
-if {![wait_for 3 {ASK_PARENT_VIEWPORT_DETAIL_08}]} { fail "ask_parent rollback fixture did not expand" $scratch }
+if {![wait_for 3 {ASK_PARENT_VIEWPORT_DETAIL_07}]} { fail "ask_parent rollback fixture did not expand" $scratch }
 send -- "\033\[6~"
 drain_repaint
 if {![capture [file join $scratch "rollback-before.ansi"] $columns $rows]} { fail "rollback-before capture failed" $scratch }

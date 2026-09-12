@@ -459,8 +459,8 @@ await withRendererHarness(
       if (!hasExactPaintedVerticalPadding(bannerRendered)) {
         reportedDefects.push(`${name} did not preserve exactly one painted top/bottom padding row`);
       }
-      if (!bannerRows.some((line: string) => line.includes("click to expand"))) {
-        throw new Error(`${name} compact banner omitted its visible click-to-expand row: ${JSON.stringify(bannerRows)}`);
+      if (bannerRows.some((line: string) => line.includes("click to expand"))) {
+        throw new Error(`${name} compact banner duplicated its fade affordance with a click-to-expand row: ${JSON.stringify(bannerRows)}`);
       }
       const firstPaintedRow = bannerRendered.findIndex((line: string) => line.includes("\x1b[48;"));
       const deadRow = bannerRows.findIndex((_: string, y: number) => y >= firstPaintedRow && (
