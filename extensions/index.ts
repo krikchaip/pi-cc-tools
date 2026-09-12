@@ -1944,6 +1944,7 @@ type BuiltinExpandableComponent = {
 	expanded?: boolean;
 	_expanded?: boolean;
 	message?: { customType?: string };
+	customComponent?: { render(width: number): string[] };
 	setExpanded(expanded: boolean): void;
 	render(width: number): string[];
 	[BUILTIN_EXPANSION_STATE]?: BuiltinExpansionState;
@@ -2010,6 +2011,16 @@ function builtinExpansionChangesOutput(component: BuiltinExpandableComponent, wi
 	return changed;
 }
 
+function sideQuestPaintedBounds(
+	component: BuiltinExpandableComponent,
+	width: number,
+	height: number,
+): { first: number; last: number } | undefined {
+	const paintedRows = component.customComponent?.render(width);
+	if (!paintedRows?.length || paintedRows.length > height) return undefined;
+	return { first: height - paintedRows.length, last: height - 1 };
+}
+
 function builtinClickActionAtPoint(
 	component: BuiltinExpandableComponent,
 	x: number,
@@ -2025,6 +2036,12 @@ function builtinClickActionAtPoint(
 		|| y < 0
 		|| y >= state.height
 	) return undefined;
+	if (isSideQuestEventMessage(component)) {
+		// The custom renderer owns the painted suffix after Pi's outer Spacer.
+		// Use its full geometry so blank Markdown rows remain inside the banner.
+		const bounds = sideQuestPaintedBounds(component, state.width, state.height);
+		if (!bounds || y < bounds.first || y > bounds.last) return undefined;
+	}
 	return builtinExpansionChangesOutput(component, state.width) ? "expand" : undefined;
 }
 
@@ -2141,9 +2158,13 @@ function frameMatchedStandaloneToolTarget(
 	if (frameLine === undefined) return undefined;
 	const frameKeys = documentBox.lines.map((line) => stripAnsi(line).trimEnd());
 	const clickedKey = frameKeys[frameLineIndex];
+	// Empty transcript rows are not unique. Matching one against an internal tool
+	// spacer can leak the click across the tool's actual rendered boundary.
+	if (!clickedKey.trim()) return undefined;
 	const width = documentBox.rect.width;
 	const localX = x - documentBox.rect.x;
 	let approximateRow = documentBox.rect.y
+		- (documentBox.lineOffset ?? 0)
 		+ mode.headerContainer.render(width).length
 		+ mode.loadedResourcesContainer.render(width).length;
 	let best: { tool: any; anchor: ToolClickAnchor; score: number; distance: number } | undefined;
@@ -2186,7 +2207,10 @@ function toolGroupAtScreenPoint(
 	const width = documentBox.rect.width;
 	const frameMatchedTarget = frameMatchedStandaloneToolTarget(mode, documentBox, x, y);
 	if (frameMatchedTarget) return frameMatchedTarget;
+	// Component rows are document coordinates. Project them through the same
+	// scroll offset used by the captured fullscreen frame before hit testing.
 	let row = documentBox.rect.y
+		- (documentBox.lineOffset ?? 0)
 		+ mode.headerContainer.render(width).length
 		+ mode.loadedResourcesContainer.render(width).length;
 	for (const component of mode.chatContainer.children) {

@@ -1,0 +1,212 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for Side Quests click-region boundaries.
+
+set timeout 1
+match_max -d 1000000
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [expr {[info exists env(EXTENSION_PATH)] ? $env(EXTENSION_PATH) : [file join $repo_dir "extensions" "index.ts"]}]
+set fixture_extension [file join $repo_dir "e2e" "fixtures" "side-quests-click-boundary-session-extension.ts"]
+set fixture_dir [file join $repo_dir "e2e" "fixtures"]
+set side_quests_renderer [expr {[info exists env(SIDE_QUESTS_RENDERER)] ? $env(SIDE_QUESTS_RENDERER) : "/Users/asol/.pi/agent/packages/side-quests/renderer/agent-renderer.ts"}]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set scratch "/tmp/pi-cc-tools-side-quests-click-boundaries-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 100
+set rows 40
+set failures {}
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+if {![file exists $side_quests_renderer]} {
+  puts stderr "real Side Quests renderer not found: $side_quests_renderer"
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_repaint {} {
+  set idle_reads 0
+  for {set read 0} {$read < 64 && $idle_reads < 8} {incr read} {
+    after 25
+    expect -timeout 0 {
+      -re {.+} { set idle_reads 0 }
+      timeout { incr idle_reads }
+      eof { return }
+    }
+  }
+}
+
+proc capture {path columns rows} {
+  global spawn_id
+  log_file
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns - 20}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  log_file -noappend $path
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} {
+    log_file
+    return 0
+  }
+  catch {exec kill -WINCH $pi_pid}
+  drain_repaint
+  log_file
+  return 1
+}
+
+proc locate {locator_path path pattern} {
+  if {[catch {exec python3 $locator_path locate $path $pattern} result]} { return {} }
+  return $result
+}
+
+proc final_contains {locator_path path pattern} {
+  return [expr {![catch {exec python3 $locator_path final-contains $path $pattern}]}]
+}
+
+proc click {x y} {
+  send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+}
+
+proc start_pi {fixture grouping log_path} {
+  global pi_bin home agent columns rows cwd side_quests_renderer fixture_extension extension_path spawn_id
+  set settings_json [format {{"quietStartup":true,"theme":"dark","outputPad":0,"clickExpansion":true,"groupToolCalls":%s}} $grouping]
+  foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+    set settings [open $path "w"]
+    puts $settings $settings_json
+    close $settings
+  }
+  set source [open $fixture "r"]
+  set content [read $source]
+  close $source
+  set session_path [file join [file dirname $log_path] "session.jsonl"]
+  set session [open $session_path "w"]
+  puts -nonewline $session [string map [list "/tmp/pi-cc-tools-side-quests-click-boundary" $cwd] $content]
+  close $session
+
+  cd $cwd
+  log_file -noappend $log_path
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent SIDE_QUESTS_RENDERER=$side_quests_renderer \
+    $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+    -e $fixture_extension -e $extension_path --provider side-quests-boundary-e2e --model historical-session --tui-mode fullscreen
+  stty columns $columns rows $rows
+}
+
+proc stop_pi {} {
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+}
+
+proc verify_boundary {case heading sentinel unrelated_sentinel ready grouping} {
+  global scratch fixture_dir locator_path columns rows failures
+  set case_dir [file join $scratch $case]
+  file mkdir $case_dir
+  set fixture [file join $fixture_dir "side-quests-click-boundary-${case}.jsonl"]
+  start_pi $fixture $grouping [file join $case_dir "startup.ansi"]
+  if {![wait_for 10 $ready]} {
+    lappend failures "$case fixture did not become ready"
+    stop_pi
+    return
+  }
+
+  set before [file join $case_dir "before.ansi"]
+  if {![capture $before $columns $rows]} {
+    lappend failures "$case initial capture failed"
+    stop_pi
+    return
+  }
+  if {$case eq "wrap" && [final_contains $locator_path $before "SCROLL_PREFILL_01"]} {
+    lappend failures "$case fixture did not create a scrolled transcript"
+    stop_pi
+    return
+  }
+  set point [locate $locator_path $before $heading]
+  if {[llength $point] != 2} {
+    lappend failures "$case heading was not visible"
+    stop_pi
+    return
+  }
+  lassign $point heading_x heading_y
+  set boundary_y [expr {$heading_y - 2}]
+  if {$boundary_y < 1} {
+    lappend failures "$case did not expose the separator above its painted banner"
+    stop_pi
+    return
+  }
+
+  click 50 $boundary_y
+  drain_repaint
+  set boundary_after [file join $case_dir "boundary-after.ansi"]
+  if {![capture $boundary_after $columns $rows]} {
+    lappend failures "$case boundary capture failed"
+    stop_pi
+    return
+  }
+  if {[final_contains $locator_path $boundary_after $sentinel]} {
+    lappend failures "$case expanded from the unpainted separator row $boundary_y above heading row $heading_y"
+    stop_pi
+    return
+  }
+  if {$unrelated_sentinel ne "" && [final_contains $locator_path $boundary_after $unrelated_sentinel]} {
+    lappend failures "$case separator click expanded the unrelated surface containing $unrelated_sentinel"
+    stop_pi
+    return
+  }
+
+  after 650
+  set painted_padding_y [expr {$heading_y - 1}]
+  click 50 $painted_padding_y
+  drain_repaint
+  set anchor_after [file join $case_dir "anchor-after.ansi"]
+  if {![capture $anchor_after $columns $rows]} {
+    lappend failures "$case anchor capture failed"
+  } elseif {![final_contains $locator_path $anchor_after $sentinel]} {
+    lappend failures "$case producer-painted padding row $painted_padding_y did not remain clickable"
+  }
+  stop_pi
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+verify_boundary result "SUBAGENT ASKS" "SUBAGENT_ASKS_EXPANDED_END" "" "RESULT_BOUNDARY_AFTER" false
+verify_boundary ask "ASK PARENT" "ASK_PARENT_EXPANDED_END" "" "ASK_BOUNDARY_AFTER" false
+verify_boundary continuation "FROM PARENT" "FROM_PARENT_EXPANDED_END" "" "CONTINUATION_BOUNDARY_AFTER" false
+verify_boundary wrap "WRAP UP" "WRAP_UP_EXPANDED_END" "GROUPED_BOUNDARY_READ" "WRAP_BOUNDARY_AFTER" true
+
+if {[llength $failures] > 0} {
+  puts stderr "SIDE_QUEST_CLICK_BOUNDARIES_FAIL"
+  set index 1
+  foreach failure $failures {
+    puts stderr "$index. $failure"
+    incr index
+  }
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "SIDE_QUEST_CLICK_BOUNDARIES_PASS"
+if {![info exists env(KEEP_E2E_ARTIFACTS)] || $env(KEEP_E2E_ARTIFACTS) ne "1"} {
+  file delete -force $scratch
+} else {
+  puts "ARTIFACTS $scratch"
+}
+exit 0

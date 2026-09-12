@@ -38,7 +38,8 @@ await withRendererHarness(
       CompactionSummaryMessageComponent,
       CustomMessageComponent,
     } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/components/index.js");
-    const { Box, Text } = await import("../node_modules/@earendil-works/pi-tui/dist/index.js");
+    const { Box, Markdown, Text } = await import("../node_modules/@earendil-works/pi-tui/dist/index.js");
+    const { getMarkdownTheme } = await import("../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js");
     const reportedDefects: string[] = [];
     const builtinWidth = 72;
     const hasExactPaintedVerticalPadding = (rows: string[]): boolean => {
@@ -81,6 +82,31 @@ await withRendererHarness(
         throw new Error(`${label} did not collapse from its whole-component action`);
       }
     };
+    const assertPaintedComponentToggle = (component: any, expandedNeedle: string, label: string): void => {
+      for (const expanded of [false, true]) {
+        const rows = component.render(builtinWidth).map((line: string) => plain(line));
+        if (component.clickActionAtPoint?.(0, 0) !== undefined) {
+          throw new Error(`${label} ${expanded ? "expanded" : "collapsed"} outer spacer was clickable`);
+        }
+        for (let y = 1; y < rows.length; y++) {
+          if (
+            component.clickActionAtPoint?.(0, y) !== "expand"
+            || component.clickActionAtPoint?.(builtinWidth - 1, y) !== "expand"
+          ) {
+            throw new Error(`${label} ${expanded ? "expanded" : "collapsed"} painted row ${y} was not clickable`);
+          }
+        }
+        if (expanded && !rows.some((line: string) => line.includes(expandedNeedle))) {
+          throw new Error(`${label} expanded content did not render: ${JSON.stringify(rows)}`);
+        }
+        if (!component.activateClickAction?.("expand")) {
+          throw new Error(`${label} did not ${expanded ? "collapse" : "expand"}`);
+        }
+      }
+      if ((component.expanded ?? component._expanded) !== false) {
+        throw new Error(`${label} did not return to its collapsed state`);
+      }
+    };
 
     assertWholeComponentToggle(
       new CompactionSummaryMessageComponent({
@@ -120,11 +146,13 @@ await withRendererHarness(
       throw new Error("fully visible ! shell output accepted a no-op expansion action");
     }
 
-    const customMessageText = Array.from({ length: 12 }, (_, index) => `SIDE_QUEST_EVENT_${index + 1}`).join("\n");
+    const customMessageText = `${Array.from({ length: 12 }, (_, index) => `SIDE_QUEST_EVENT_${index + 1}`).join("\n")}\n\n`;
     const sideQuestMessageRenderer = (message: any, options: any, messageTheme: any) => {
       const text = typeof message.content === "string" ? message.content : "";
       const box = new Box(2, 1, (line: string) => messageTheme.bg("customMessageBg", line));
-      box.addChild(new Text(options.expanded ? text : `${text.slice(0, 24)}… dynamic-key for details`, 0, 0));
+      box.addChild(options.expanded
+        ? new Markdown(text, 0, 0, getMarkdownTheme())
+        : new Text(`${text.slice(0, 24)}… dynamic-key for details`, 0, 0));
       return box;
     };
     for (const customType of ["side-quest-result", "side-quest-continuation"]) {
