@@ -213,9 +213,12 @@ await withRendererHarness(
     const agentDefinition = fakePi.tools.get("Agent");
     agentDefinition.renderCall = (args: any) => new Text(`● Agent general-purpose :: ${args.description}`, 0, 0);
     agentDefinition.renderResult = (result: any, options: any, renderTheme: any, ctx: any) => {
-      const statuses = result.details?.sideQuestPresentation?.statuses ?? [];
+      const presentation = result.details?.sideQuestPresentation;
+      const statuses = presentation?.statuses ?? [];
       const payload = statuses.length ? ` [${statuses.join(" | ")}]` : "";
-      const summary = `${renderTheme.fg("success", "Spawned")}${renderTheme.fg("muted", payload)}`;
+      const resultStatus = presentation?.resultStatus ?? "spawned";
+      const resultLabel = resultStatus[0].toUpperCase() + resultStatus.slice(1);
+      const summary = `${renderTheme.fg("success", resultLabel)}${renderTheme.fg("muted", payload)}`;
       if (!options.expanded) return new Text(`└ ${summary} • dynamic-key for details`, 0, 0);
       const sessionPath = result.details?.sessionPath ?? "Unavailable";
       return new Text(
@@ -224,7 +227,13 @@ await withRendererHarness(
         0,
       );
     };
-    const createAgentExecution = (id: string, version = 1, promptLineCount = 7): any => {
+    const createAgentExecution = (
+      id: string,
+      version = 1,
+      promptLineCount = 7,
+      resultStatus: "spawned" | "resumed" | "answered" | "steered" = "spawned",
+    ): any => {
+      const sessionPath = `/tmp/${id}/session.jsonl`;
       const execution = new ToolExecutionComponent(
         "Agent",
         id,
@@ -233,6 +242,7 @@ await withRendererHarness(
           inherit_context: true,
           interactive: true,
           prompt: Array.from({ length: promptLineCount }, (_, index) => `AGENT_${id}_PROMPT_${index + 1}`).join("\n"),
+          ...(resultStatus === "spawned" ? {} : { resume: sessionPath }),
         },
         {},
         agentDefinition,
@@ -242,10 +252,21 @@ await withRendererHarness(
       execution.markExecutionStarted();
       execution.setArgsComplete();
       execution.updateResult({
-        content: [{ type: "text", text: "Subagent launched." }],
+        content: [{ type: "text", text: `Subagent ${resultStatus}.` }],
         details: {
-          sessionPath: `/tmp/${id}/session.jsonl`,
-          sideQuestPresentation: { version, surface: "agent", statuses: ["inherited", "interactive"] },
+          operation: resultStatus === "spawned"
+            ? "launched"
+            : resultStatus === "resumed"
+              ? "reopened"
+              : "continued",
+          continuationKind: resultStatus === "answered" ? "answer" : "steer",
+          sessionPath,
+          sideQuestPresentation: {
+            version,
+            surface: "agent",
+            resultStatus,
+            statuses: resultStatus === "spawned" ? ["inherited", "interactive"] : [],
+          },
         },
         isError: false,
       }, false);
@@ -265,17 +286,32 @@ await withRendererHarness(
       return sideQuestsGetter;
     };
     const assertAgentOrderAdapter = (execution: any, label: string): void => {
+      const resultStatus = execution.result?.details?.sideQuestPresentation?.resultStatus ?? "spawned";
+      const resultLabel = resultStatus[0].toUpperCase() + resultStatus.slice(1);
+      const statuses = resultStatus === "spawned" ? " [inherited | interactive]" : "";
       const rows = execution.render(100).map((line: string) => plain(line));
-      const summaryRow = rows.findIndex((line: string) => line.includes("Spawned [inherited | interactive]"));
-      const summaryX = rows[summaryRow]?.indexOf("Spawned") ?? -1;
+      const summaryRow = rows.findIndex((line: string) => line.includes(`${resultLabel}${statuses}`));
+      const summaryX = rows[summaryRow]?.indexOf(resultLabel) ?? -1;
       if (summaryRow < 0 || execution.clickActionAtPoint?.(summaryX, summaryRow) !== "expand") {
-        throw new Error(`${label} did not retain the Agent summary adapter: ${JSON.stringify(rows)}`);
+        throw new Error(`${label} did not retain the Agent ${resultLabel} summary adapter: ${JSON.stringify(rows)}`);
       }
     };
 
     const producerFirstGetter = (globalThis as any)[PRELOADED_AGENT_GETTER];
     const initialCcToolsGetter = toolPrototype.getResultRenderer;
     assertAgentOrderAdapter(createAgentExecution("producer_first"), "Side Quests → cc-tools");
+    assertAgentOrderAdapter(
+      createAgentExecution("producer_first_resumed", 1, 7, "resumed"),
+      "Side Quests → cc-tools resumed",
+    );
+    assertAgentOrderAdapter(
+      createAgentExecution("producer_first_steered", 1, 7, "steered"),
+      "Side Quests → cc-tools steered",
+    );
+    assertAgentOrderAdapter(
+      createAgentExecution("producer_first_answered", 1, 7, "answered"),
+      "Side Quests → cc-tools answered",
+    );
     if (initialCcToolsGetter === producerFirstGetter || toolPrototype.getResultRenderer !== initialCcToolsGetter) {
       throw new Error("Side Quests → cc-tools did not install one stable outer adapter");
     }
@@ -284,6 +320,18 @@ await withRendererHarness(
     cachedBeforeLateProducer.render(100);
     const producerLateGetter = installSimulatedSideQuestsOuterGetter();
     assertAgentOrderAdapter(cachedBeforeLateProducer, "cc-tools → Side Quests cached execution");
+    assertAgentOrderAdapter(
+      createAgentExecution("consumer_first_resumed", 1, 7, "resumed"),
+      "cc-tools → Side Quests resumed",
+    );
+    assertAgentOrderAdapter(
+      createAgentExecution("consumer_first_steered", 1, 7, "steered"),
+      "cc-tools → Side Quests steered",
+    );
+    assertAgentOrderAdapter(
+      createAgentExecution("consumer_first_answered", 1, 7, "answered"),
+      "cc-tools → Side Quests answered",
+    );
     if (toolPrototype.getResultRenderer !== producerLateGetter) {
       throw new Error("cc-tools → Side Quests replaced the late producer getter");
     }

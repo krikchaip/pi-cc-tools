@@ -26,12 +26,16 @@ const agentDefinition = {
   },
 } as any;
 
+type AgentResultStatus = "spawned" | "resumed" | "answered" | "steered";
+
 function settledAgent(
   id: string,
   prompt: string,
   requestRender: () => void,
   cwd: string,
+  resultStatus: AgentResultStatus = "spawned",
 ): any {
+  const sessionPath = `/tmp/side-quests-e2e/${id}/session.jsonl`;
   const tool = new ToolExecutionComponent(
     "Agent",
     id,
@@ -40,6 +44,7 @@ function settledAgent(
       inherit_context: true,
       interactive: true,
       prompt,
+      ...(resultStatus === "spawned" ? {} : { resume: sessionPath }),
     },
     {},
     agentDefinition,
@@ -50,14 +55,20 @@ function settledAgent(
   tool.markExecutionStarted();
   tool.setArgsComplete();
   tool.updateResult({
-    content: [{ type: "text", text: "Subagent launched." }],
+    content: [{ type: "text", text: `Subagent ${resultStatus}.` }],
     details: {
-      operation: "launched",
-      sessionPath: `/tmp/side-quests-e2e/${id}/session.jsonl`,
+      operation: resultStatus === "spawned"
+        ? "launched"
+        : resultStatus === "resumed"
+          ? "reopened"
+          : "continued",
+      continuationKind: resultStatus === "answered" ? "answer" : "steer",
+      sessionPath,
       sideQuestPresentation: {
         version: 1,
         surface: "agent",
-        statuses: ["inherited", "interactive"],
+        resultStatus,
+        statuses: resultStatus === "spawned" ? ["inherited", "interactive"] : [],
       },
     },
     isError: false,
@@ -124,11 +135,19 @@ export default async function sideQuestsAdapterProducer(
       void ctx.ui.custom<void>((tui, theme, keybindings, done) => {
         let width = 100;
         const requestRender = () => tui.requestRender();
+        const resultStatus: AgentResultStatus = mode === "resumed-status"
+          ? "resumed"
+          : mode === "answered-status"
+            ? "answered"
+            : mode === "steered-status"
+              ? "steered"
+              : "spawned";
         const longTool = settledAgent(
           "click-adapter",
           LONG_PROMPT,
           requestRender,
           ctx.cwd,
+          resultStatus,
         );
         const shortStandalone = settledAgent(
           "short-standalone",
@@ -284,6 +303,25 @@ export default async function sideQuestsAdapterProducer(
         return {
           render: (nextWidth: number) => {
             width = nextWidth;
+            if (
+              mode === "resumed-status"
+              || mode === "answered-status"
+              || mode === "steered-status"
+            ) {
+              const rows = longTool.render(nextWidth);
+              const plainRows = rows.map((line: string) =>
+                line.replace(/\x1b\[[0-9;]*m/g, "")
+              );
+              return [
+                "SIDE_QUEST_STATUS_E2E_READY",
+                plainRows.some((line: string) =>
+                  /\((?:answered|resumed|steered)\)/u.test(line)
+                )
+                  ? "AGENT_HEADER_STATUS_LEAKED"
+                  : "AGENT_HEADER_STATUS_CLEAR",
+                ...rows,
+              ];
+            }
             if (mode === "regressions") {
               const eventRows = resultMessage.render(nextWidth);
               const continuationRows = continuationMessage.render(nextWidth);

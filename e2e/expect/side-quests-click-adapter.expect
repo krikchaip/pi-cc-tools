@@ -158,6 +158,15 @@ proc verify_adapter {label scratch} {
   }
 }
 
+proc verify_agent_status {label scratch log_path extensions mode expected_status} {
+  start_pi $log_path $extensions $mode
+  if {![wait_for 10 {AGENT_HEADER_STATUS_CLEAR}]} {
+    fail_case "$label retained its old parenthesized execution status" $scratch
+  }
+  require_anchor_row $label $scratch $expected_status
+  stop_pi
+}
+
 puts "PI_VERSION [exec $pi_bin --version]"
 
 # Baseline: real Side Quests remains keyboard-expandable without cc-tools.
@@ -188,6 +197,21 @@ set consumer_first_log [file join $scratch "consumer-first.ansi"]
 start_pi $consumer_first_log [list $cc_extension $fixture_extension]
 verify_adapter "cc-tools → Side Quests" $scratch
 stop_pi
+
+# Operation states stay out of the execution header and appear in the result summary.
+foreach status {resumed answered steered} {
+  set title_status [string totitle $status]
+  set mode "${status}-status"
+  verify_agent_status "Side Quests baseline $status" $scratch \
+    [file join $scratch "baseline-${status}.ansi"] [list $fixture_extension] \
+    $mode $title_status
+  verify_agent_status "Side Quests → cc-tools $status" $scratch \
+    [file join $scratch "producer-first-${status}.ansi"] [list $fixture_extension $cc_extension] \
+    $mode $title_status
+  verify_agent_status "cc-tools → Side Quests $status" $scratch \
+    [file join $scratch "consumer-first-${status}.ansi"] [list $cc_extension $fixture_extension] \
+    $mode $title_status
+}
 
 # Banner and short-output regressions in both extension orders.
 set producer_first_regression_log [file join $scratch "producer-first-regressions.ansi"]

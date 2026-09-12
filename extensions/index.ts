@@ -2809,21 +2809,50 @@ function setToolLocalDetailLevel(tool: any, level: ToolClickDetailLevel): void {
 	else tool.rendererState[TOOL_CLICK_DETAIL_LEVEL] = level;
 }
 
+type SideQuestAgentResultStatus = "spawned" | "resumed" | "answered" | "steered";
+
 type SideQuestAgentPresentation = {
 	version: 1;
 	surface: "agent";
+	resultStatus: SideQuestAgentResultStatus;
 	statuses: string[];
 };
 
 function sideQuestAgentPresentation(value: any): SideQuestAgentPresentation | undefined {
-	const presentation = value?.details?.sideQuestPresentation ?? value?.result?.details?.sideQuestPresentation;
+	const details = value?.details ?? value?.result?.details;
+	const presentation = details?.sideQuestPresentation;
 	if (
 		presentation?.version !== 1
 		|| presentation?.surface !== "agent"
 		|| !Array.isArray(presentation?.statuses)
 		|| !presentation.statuses.every((status: unknown) => typeof status === "string")
 	) return undefined;
-	return presentation as SideQuestAgentPresentation;
+
+	const reportedStatus = presentation.resultStatus;
+	if (
+		reportedStatus !== undefined
+		&& reportedStatus !== "spawned"
+		&& reportedStatus !== "resumed"
+		&& reportedStatus !== "answered"
+		&& reportedStatus !== "steered"
+	) return undefined;
+	const resultStatus: SideQuestAgentResultStatus = reportedStatus
+		?? (details?.continuationKind === "answer"
+			? "answered"
+			: details?.operation === "continued"
+				? "steered"
+				: details?.operation === "reopened"
+					? "resumed"
+					: "spawned");
+
+	return { ...presentation, resultStatus } as SideQuestAgentPresentation;
+}
+
+function sideQuestAgentResultLabel(presentation: SideQuestAgentPresentation): "Spawned" | "Resumed" | "Answered" | "Steered" {
+	if (presentation.resultStatus === "answered") return "Answered";
+	if (presentation.resultStatus === "resumed") return "Resumed";
+	if (presentation.resultStatus === "steered") return "Steered";
+	return "Spawned";
 }
 
 function isKnownSideQuestAgentTool(tool: any): boolean {
@@ -4229,8 +4258,10 @@ function updateToolClickAnchors(tool: any, rendered: string[]): void {
 			});
 		}
 	}
-	if (isKnownSideQuestAgentTool(tool)) {
-		const summaryRow = rendered.findIndex((line) => stripAnsi(line).includes("Spawned"));
+	const agentPresentation = sideQuestAgentPresentation(tool);
+	if (String(tool?.toolName ?? "").toLowerCase() === "agent" && agentPresentation) {
+		const resultLabel = sideQuestAgentResultLabel(agentPresentation);
+		const summaryRow = rendered.findIndex((line) => stripAnsi(line).includes(resultLabel));
 		const headerStart = rendered.findIndex((line, index) => index < summaryRow && /\bAgent\b/.test(stripAnsi(line)));
 		for (let line = headerStart; line >= 0 && line < summaryRow; line++) {
 			const plain = stripAnsi(rendered[line]);
@@ -4412,9 +4443,15 @@ function patchToolExecutionRenderers(): void {
 	if (typeof originalRender === "function") {
 		proto.render = function patchedToolExecutionRender(width: number): string[] {
 			const activeResultGetter = this.getResultRenderer;
-			if (this.result !== undefined && this[TOOL_RESULT_GETTER_SEEN] !== activeResultGetter) {
-				this.updateDisplay?.();
-			}
+			const staleAgentAdapter = String(this.toolName ?? "").toLowerCase() === "agent"
+				&& this.result !== undefined
+				&& sideQuestAgentPresentation(this) === undefined
+				&& isToolTextComponent(this.resultRendererComponent)
+				&& String(this.resultRendererComponent.value ?? "").includes(RESULT_SUMMARY_WRAP_MARK);
+			if (
+				staleAgentAdapter
+				|| this.result !== undefined && this[TOOL_RESULT_GETTER_SEEN] !== activeResultGetter
+			) this.updateDisplay?.();
 			syncToolOutputPad(this, readPiOutputPad());
 			for (const component of [this.callRendererComponent, this.resultRendererComponent]) {
 				if (isToolTextComponent(component)) (component as any)[TOOL_CLICK_OWNER] = this;
@@ -5683,7 +5720,8 @@ function renderSideQuestAgentResult(
 	const statuses = presentation.statuses.length > 0
 		? ` ${theme.fg("muted", `[${presentation.statuses.join(" | ")}]`)}`
 		: "";
-	const summary = markResultSummary(`${theme.fg("success", "Spawned")}${statuses}`);
+	const resultLabel = sideQuestAgentResultLabel(presentation);
+	const summary = markResultSummary(`${theme.fg("success", resultLabel)}${statuses}`);
 	if (options.expanded !== true) {
 		return makeText(ctx.lastComponent, withBranch(`${summary}${toolOutputDetailHint(theme, false)}`, theme));
 	}
