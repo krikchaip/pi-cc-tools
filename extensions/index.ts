@@ -2293,7 +2293,10 @@ function installToolGroupMouseAdapter(): void {
 			const activeMode = clickRuntime.activeInteractiveMode;
 			const mode = registeredMode ?? (activeMode?.renderer === this ? activeMode : undefined);
 			if (!registeredMode && mode) state!.modes.set(this, mode);
-			const isLeftButton = event !== undefined && (event.button & 3) === 0;
+			// SGR wheel-up is button 64, whose low two bits otherwise look like left button 0.
+			const isLeftButton = event !== undefined
+				&& (event.button & 64) === 0
+				&& (event.button & 3) === 0;
 			if (event && isLeftButton && !event.release && (event.button & 32) === 0) {
 				const now = Date.now();
 				const lastPress = state!.lastPress;
