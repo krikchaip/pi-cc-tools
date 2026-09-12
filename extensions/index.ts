@@ -2868,32 +2868,6 @@ function finalCollapseHintText(): string {
 	return `${theme.fg("muted", beforeClick)}${theme.fg("dim", click)}${theme.fg("muted", afterClick)}`;
 }
 
-function addSideQuestBinaryClickActionRow(tool: any, rendered: string[], width: number): string[] {
-	if (
-		!toolClickExpansionActive(tool)
-		|| !isSideQuestBinaryTool(tool)
-		|| !sideQuestBinaryHasHiddenContent(tool)
-		|| tool?.expanded !== true
-	) {
-		return rendered;
-	}
-	const plain = rendered.map(stripAnsi);
-	if (plain.some((line) => /click to collapse/.test(line))) return rendered;
-
-	const theme = getGlobalPiTheme() as Theme | undefined;
-	const hint = finalCollapseHintText();
-	const content = padToWidth(`  ${hint}`, Math.max(1, width));
-	const actionRow = theme ? theme.bg("customMessageBg", content) : content;
-	let insertAt = rendered.length;
-	for (let line = rendered.length - 1; line >= 0; line--) {
-		if (!plain[line].trim() && rendered[line].includes("\x1b[48;")) {
-			insertAt = line;
-			break;
-		}
-	}
-	return [...rendered.slice(0, insertAt), actionRow, ...rendered.slice(insertAt)];
-}
-
 type ResolvedClickAnchor = {
 	action: "expand" | "detail" | "detail-extra";
 	text: string;
@@ -4310,8 +4284,7 @@ function patchToolExecutionRenderers(): void {
 			const isStandaloneSideQuest = toolName === "agent";
 			const needsStandaloneFrame = (isMcp || isStandaloneSideQuest && toolBackgroundMode === "outlines")
 				&& !hasStandaloneOutlineFrame(rendered);
-			const framed = needsStandaloneFrame ? frameStandaloneMcpLines(rendered, width) : rendered;
-			const output = addSideQuestBinaryClickActionRow(this, framed, width);
+			const output = needsStandaloneFrame ? frameStandaloneMcpLines(rendered, width) : rendered;
 			updateToolClickAnchors(this, output);
 			return output;
 		};

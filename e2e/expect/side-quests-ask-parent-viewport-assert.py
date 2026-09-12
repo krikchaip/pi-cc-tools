@@ -85,6 +85,8 @@ def main(scratch: Path) -> None:
     ]
     if moved:
         failures.append("bottom edge: following transcript rows moved: " + ", ".join(moved))
+    if any("Output ends here • click to collapse" in row for row in bottom_before):
+        failures.append("bottom edge: expanded ask_parent retained its terminal collapse row")
     if not any("ASK_PARENT_VIEWPORT_DETAIL_08…" in row for row in bottom_after):
         failures.append("bottom edge: collapsed ask_parent banner edge is not visible")
     if any("ASK_PARENT_VIEWPORT_DETAIL_60" in row for row in bottom_after):

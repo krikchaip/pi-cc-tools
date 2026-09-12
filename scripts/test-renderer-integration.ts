@@ -476,8 +476,8 @@ await withRendererHarness(
       if (!expandedBannerRendered.some((line: string) => plain(line).includes(expandedNeedle))) {
         throw new Error(`${name} banner did not reveal its full content`);
       }
-      if (!expandedBannerRendered.some((line: string) => plain(line).includes("Output ends here • click to collapse"))) {
-        throw new Error(`${name} expanded banner omitted its final click-to-collapse row`);
+      if (expandedBannerRendered.some((line: string) => plain(line).includes("Output ends here • click to collapse"))) {
+        throw new Error(`${name} expanded banner retained its terminal collapse row`);
       }
       if (!hasExactPaintedVerticalPadding(expandedBannerRendered)) {
         reportedDefects.push(`${name} expanded output did not preserve exactly one painted top/bottom padding row`);
