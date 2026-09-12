@@ -1,0 +1,218 @@
+#!/usr/bin/expect -f
+# Real-Pi fullscreen regression for grouped Agent calls inherited before results settle.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set cc_extension [file join $repo_dir "extensions" "index.ts"]
+set fixture_extension [file join $repo_dir "e2e" "fixtures" "inherited-agent-group-extension.ts"]
+set fixture_path [file join $repo_dir "e2e" "fixtures" "inherited-agent-group-session.jsonl"]
+set assert_path [file join $expect_dir "inherited-agent-group-hint-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-inherited-agent-group-[pid]"
+set cwd [file join $scratch "cwd"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set session_dir [file join $scratch "session"]
+set session_path [file join $session_dir "session.jsonl"]
+set columns 100
+set rows 40
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+file mkdir $session_dir
+
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-inherited-agent-group" $cwd] $content]
+close $session
+
+set manifest [open [file join $session_dir "manifest.json"] "w"]
+puts $manifest [format {{"version":1,"childId":"inherited-agent-group-child","parentId":"inherited-agent-group-parent","ownerId":"inherited-agent-group-owner","sessionPath":"%s","cwd":"%s","agentName":"general-purpose","displayName":"general-purpose","description":"Inherited Agent group fixture","lifecycle":"interactive","inheritContext":true,"tools":[],"createdAt":1789171200000}} $session_path $cwd]
+close $manifest
+
+set agent_settings {{"quietStartup":true,"theme":"dark","outputPad":0,"groupToolCalls":true}}
+set cc_settings {{"clickExpansion":true,"groupToolCalls":true,"toolBackground":"outlines"}}
+set keybindings {{"app.tools.expand":"ctrl+y"}}
+foreach pair [list \
+  [list [file join $agent "settings.json"] $agent_settings] \
+  [list [file join $home ".pi" "settings.json"] $cc_settings] \
+  [list [file join $agent "keybindings.json"] $keybindings]] {
+  set output [open [lindex $pair 0] "w"]
+  puts $output [lindex $pair 1]
+  close $output
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "Trust project folder?" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  wait_for 1 {__PI_CC_TOOLS_REPAINT_DRAIN_SENTINEL__}
+  return 1
+}
+
+proc stop_pi {} {
+  catch {send "\003\003"}
+  catch {close}
+  catch {wait}
+  catch {log_file}
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+log_file -noappend [file join $scratch "startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  TMUX=/tmp/pi-cc-tools-inherited-agent-group-tmux,0,0 TMUX_PANE=%e2e \
+  PI_SIDE_QUESTS_PARENT_ID=inherited-agent-group-parent \
+  PI_SIDE_QUESTS_CHILD_ID=inherited-agent-group-child \
+  PI_SIDE_QUESTS_OWNER_ID=inherited-agent-group-owner \
+  PI_SIDE_QUESTS_SESSION=$session_path \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $cc_extension -e $fixture_extension --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {Grouped agent 5}]} {
+  puts stderr "inherited Agent group fixture did not become ready"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+log_file
+set compact_frame_path [file join $scratch "compact-frame.ansi"]
+log_file -noappend $compact_frame_path
+if {![force_fullscreen_repaint $columns $rows]} {
+  puts stderr "could not capture inherited Agent group frame"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+
+if {[catch {exec python3 $assert_path $compact_frame_path compact} assertion]} {
+  puts stderr $assertion
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+puts $assertion
+if {![regexp {CONTROL_ROW ([0-9]+)} $assertion _ control_row]} {
+  puts stderr "compact assertion did not return the control Agent row"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+after 650
+# Grouped tool anchors start after the status dot at terminal column 6.
+send -- "\033\[<0;6;${control_row}M\033\[<0;6;${control_row}m"
+if {![wait_for 5 {CONTROL_AGENT_PROMPT_7}]} {
+  puts stderr "resultful Agent control did not expand after click"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+set expanded_frame_path [file join $scratch "expanded-frame.ansi"]
+log_file -noappend $expanded_frame_path
+if {![force_fullscreen_repaint $columns $rows]} {
+  puts stderr "could not capture expanded Agent control frame"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+
+if {[catch {exec python3 $assert_path $expanded_frame_path expanded} assertion]} {
+  puts stderr $assertion
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+puts $assertion
+
+stop_pi
+
+set output [open [file join $home ".pi" "settings.json"] "w"]
+puts $output {{"clickExpansion":false,"groupToolCalls":true,"toolBackground":"outlines"}}
+close $output
+set source [open $fixture_path "r"]
+set content [read $source]
+close $source
+set session [open $session_path "w"]
+puts -nonewline $session [string map [list "/tmp/pi-cc-tools-inherited-agent-group" $cwd] $content]
+close $session
+
+log_file -noappend [file join $scratch "keyboard-startup.ansi"]
+spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+  TMUX=/tmp/pi-cc-tools-inherited-agent-group-tmux,0,0 TMUX_PANE=%e2e \
+  PI_SIDE_QUESTS_PARENT_ID=inherited-agent-group-parent \
+  PI_SIDE_QUESTS_CHILD_ID=inherited-agent-group-child \
+  PI_SIDE_QUESTS_OWNER_ID=inherited-agent-group-owner \
+  PI_SIDE_QUESTS_SESSION=$session_path \
+  $pi_bin --session $session_path --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills \
+  -e $cc_extension -e $fixture_extension --tui-mode fullscreen
+stty columns $columns rows $rows
+
+if {![wait_for 10 {Grouped agent 5}]} {
+  puts stderr "keyboard fallback fixture did not become ready"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+
+log_file
+set keyboard_frame_path [file join $scratch "keyboard-frame.ansi"]
+log_file -noappend $keyboard_frame_path
+if {![force_fullscreen_repaint $columns $rows]} {
+  puts stderr "could not capture keyboard fallback frame"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+log_file
+
+if {[catch {exec python3 $assert_path $keyboard_frame_path keyboard} assertion]} {
+  puts stderr $assertion
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+puts $assertion
+send -- "\031"
+if {![wait_for 5 {CONTROL_AGENT_PROMPT_7}]} {
+  puts stderr "resultful Agent control did not expand from ctrl+y"
+  stop_pi
+  puts stderr "ARTIFACTS $scratch"
+  exit 1
+}
+puts "PASS resultful Agent control expands from keyboard fallback"
+stop_pi
+
+if {![info exists env(KEEP_E2E_ARTIFACTS)] || $env(KEEP_E2E_ARTIFACTS) ne "1"} {
+  file delete -force $scratch
+} else {
+  puts "ARTIFACTS $scratch"
+}
+puts "PASS inherited Agent group guidance fullscreen E2E"

@@ -40,6 +40,7 @@ const expectFiles = [
   "e2e/expect/standalone-skill-anchor.expect",
   "e2e/expect/custom-renderer-preservation.expect",
   "e2e/expect/side-quests-click-adapter.expect",
+  "e2e/expect/inherited-agent-group-hint.expect",
   "e2e/expect/side-quests-click-boundaries.expect",
   "e2e/expect/side-quests-ask-parent-viewport.expect",
   "e2e/expect/side-quests-wrap-up-group-viewport.expect",

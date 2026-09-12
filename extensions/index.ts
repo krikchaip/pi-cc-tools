@@ -1348,9 +1348,17 @@ class ToolGroupComponent extends Container {
 		if (status.error) countParts.push(statusText("error", status.error));
 		const countsText = countParts.join(`${TRANSPARENT_RESET} • `);
 		const clicksEnabled = this.clickAnchorsEnabled();
+		const resultlessHistoricalAgents = this.tools.every((tool) => (
+			getToolName(tool).toLowerCase() === "agent"
+			&& tool?.isPartial === true
+			&& tool?.executionStarted !== true
+			&& tool?.result === undefined
+		));
 		const detailHint = clicksEnabled
 			? toolGroupClickGuidance()
-			: baselineToolOutputDetailHint(undefined, this.expanded, true);
+			: resultlessHistoricalAgents
+				? ""
+				: baselineToolOutputDetailHint(undefined, this.expanded, true);
 		const summary = ` ${light} ${summaryLabel} ${countsText}${names ? ` ${TRANSPARENT_RESET}• ${names}` : ""}${detailHint}`;
 		const lines = [" ".repeat(safeWidth), clampLineWidth(summary, safeWidth)];
 		const childWidth = Math.max(1, safeWidth - 6);
