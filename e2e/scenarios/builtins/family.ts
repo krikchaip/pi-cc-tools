@@ -34,6 +34,7 @@ export async function exerciseTranscriptSummary(
     expanded: FramePattern;
     keyboard?: FramePattern;
     collapseAnchor?: FramePattern;
+    paintedBackground?: boolean;
   },
 ): Promise<void> {
   let collapsed = await terminal.expect("collapsed-summary", {
@@ -48,6 +49,13 @@ export async function exerciseTranscriptSummary(
   }
 
   const collapsedRow = collapsed.find(options.collapsed).row;
+  if (options.paintedBackground) {
+    const paintedBackground = collapsed.cellAt({ column: 1, row: collapsedRow }).background;
+    const edgeBackground = collapsed.cellAt({ column: 72, row: collapsedRow }).background;
+    if (paintedBackground === "default" || edgeBackground !== paintedBackground) {
+      throw new Error(`collapsed summary right edge lost painted background: ${JSON.stringify({ paintedBackground, edgeBackground })}`);
+    }
+  }
   await terminal.perform({ type: "click", at: { column: 71, row: collapsedRow } });
   const expanded = await terminal.expect("expanded-summary", { visible: [options.expanded] });
   const expandedRow = expanded.find(options.collapseAnchor ?? options.expanded).row;

@@ -38,6 +38,11 @@ export interface TerminalPoint {
   row: number;
 }
 
+export interface TerminalCellEvidence {
+  readonly text: string;
+  readonly background: "default" | `palette:${number}` | `rgb:${string}`;
+}
+
 export type TerminalAction =
   | { type: "write"; data: string }
   | { type: "key"; key: "escape" | "enter" | "ctrl-c" | "page-up" | "page-down" }
@@ -51,6 +56,7 @@ export interface FrameEvidence {
   readonly text: string;
   readonly raw: string;
   find(pattern: FramePattern, occurrence?: number): TerminalPoint;
+  cellAt(point: TerminalPoint): TerminalCellEvidence;
 }
 
 export interface TerminalSession {
@@ -149,6 +155,7 @@ export interface ScenarioResult {
 interface Snapshot {
   lines: string[];
   columnsByOffset: number[][];
+  cells: TerminalCellEvidence[][];
   text: string;
 }
 
@@ -567,17 +574,24 @@ class LiveTerminalSession implements TerminalSession {
     const buffer = this.#terminal.buffer.active;
     const lines: string[] = [];
     const columnsByOffset: number[][] = [];
+    const cells: TerminalCellEvidence[][] = [];
     for (let row = 0; row < this.#viewport.rows; row += 1) {
       const line = buffer.getLine(buffer.viewportY + row);
       if (!line) {
         lines.push("");
         columnsByOffset.push([]);
+        cells.push([]);
         continue;
       }
       let text = "";
       const columns: number[] = [];
+      const rowCells: TerminalCellEvidence[] = [];
       for (let column = 0; column < this.#viewport.columns; column += 1) {
         const cell = line.getCell(column);
+        rowCells.push(Object.freeze({
+          text: cell?.getChars() || " ",
+          background: terminalCellBackground(cell),
+        }));
         if (!cell || cell.getWidth() === 0) continue;
         const chars = cell.getChars() || " ";
         for (let offset = 0; offset < chars.length; offset += 1) columns[text.length + offset] = column + 1;
@@ -585,8 +599,9 @@ class LiveTerminalSession implements TerminalSession {
       }
       lines.push(text.trimEnd());
       columnsByOffset.push(columns);
+      cells.push(rowCells);
     }
-    return { lines, columnsByOffset, text: lines.join("\n") };
+    return { lines, columnsByOffset, cells, text: lines.join("\n") };
   }
 
   async #recordEvidence(name: string, snapshot: Snapshot): Promise<FrameEvidence> {
@@ -616,6 +631,7 @@ class RecordedFrameEvidence implements FrameEvidence {
   readonly text: string;
   readonly raw: string;
   readonly #columnsByOffset: readonly number[][];
+  readonly #cells: readonly (readonly TerminalCellEvidence[])[];
 
   constructor(name: string, snapshot: Snapshot, raw: string) {
     this.name = name;
@@ -623,6 +639,7 @@ class RecordedFrameEvidence implements FrameEvidence {
     this.text = snapshot.text;
     this.raw = raw;
     this.#columnsByOffset = snapshot.columnsByOffset;
+    this.#cells = Object.freeze(snapshot.cells.map((row) => Object.freeze([...row])));
   }
 
   find(pattern: FramePattern, occurrence = 1): TerminalPoint {
@@ -638,6 +655,21 @@ class RecordedFrameEvidence implements FrameEvidence {
     }
     throw new Error(`frame ${this.name} does not contain occurrence ${occurrence} of ${String(pattern)}`);
   }
+
+  cellAt(point: TerminalPoint): TerminalCellEvidence {
+    if (!Number.isInteger(point.column) || point.column <= 0 || !Number.isInteger(point.row) || point.row <= 0) {
+      throw new TypeError("terminal cell coordinates must be positive integers");
+    }
+    const cell = this.#cells[point.row - 1]?.[point.column - 1];
+    if (!cell) throw new RangeError(`terminal cell is outside frame ${this.name}: ${point.column},${point.row}`);
+    return cell;
+  }
+}
+
+function terminalCellBackground(cell: Xterm.IBufferCell | undefined): TerminalCellEvidence["background"] {
+  if (!cell || cell.isBgDefault()) return "default";
+  if (cell.isBgPalette()) return `palette:${cell.getBgColor()}`;
+  return `rgb:${cell.getBgColor().toString(16).padStart(6, "0")}`;
 }
 
 interface OwnedResources {

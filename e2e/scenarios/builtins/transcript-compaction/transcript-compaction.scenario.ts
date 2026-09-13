@@ -16,6 +16,7 @@ export default transcriptFamily.scenario({
       collapsed: /Compacted from 1,234 tokens .*click.*to expand/,
       keyboard: /Compacted from 1,234 tokens .*option\+j.*to expand/,
       expanded: "COMPACTION_EXPANDED_DETAIL",
+      paintedBackground: true,
     });
   },
 });

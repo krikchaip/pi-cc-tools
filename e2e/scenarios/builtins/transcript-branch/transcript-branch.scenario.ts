@@ -16,6 +16,7 @@ export default transcriptFamily.scenario({
       collapsed: /Branch summary .*click.*to expand/,
       keyboard: /Branch summary .*option\+j.*to expand/,
       expanded: "BRANCH_EXPANDED_DETAIL",
+      paintedBackground: true,
     });
   },
 });

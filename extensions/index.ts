@@ -2115,6 +2115,14 @@ function refreshBuiltinClickHandlers(proto: any): void {
 	};
 }
 
+function padPaintedLineToWidth(line: string, width: number): string {
+	const gap = width - visibleWidth(line);
+	if (gap <= 0) return line;
+	const trailingSgr = /(?:\x1b\[[0-9;]*m)+$/.exec(line);
+	const insertionIndex = trailingSgr?.index ?? line.length;
+	return `${line.slice(0, insertionIndex)}${" ".repeat(gap)}${line.slice(insertionIndex)}`;
+}
+
 function patchBuiltinTranscriptExpansion(): void {
 	for (const ComponentClass of [
 		BashExecutionComponent,
@@ -2133,7 +2141,12 @@ function patchBuiltinTranscriptExpansion(): void {
 				|| !isBuiltinSummaryComponent(component)
 			) return rows;
 			const keyboardHint = keyText("app.tools.expand");
-			return rows.map((row) => row.replace(keyboardHint, "click"));
+			if (!keyboardHint) return rows;
+			return rows.map((row) => {
+				if (!row.includes(keyboardHint)) return row;
+				const originalWidth = visibleWidth(row);
+				return padPaintedLineToWidth(row.replace(keyboardHint, "click"), originalWidth);
+			});
 		};
 		if (proto[BUILTIN_EXPANSION_RENDER_PATCH_FLAG]) continue;
 		const originalRender = proto.render;
