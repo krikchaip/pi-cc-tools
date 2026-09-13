@@ -3,13 +3,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 import sys
 import unicodedata
 from pathlib import Path
 
-WIDTH = 100
-HEIGHT = 40
+WIDTH = int(os.environ.get("ASYNC_DIFF_WIDTH", "100"))
+HEIGHT = int(os.environ.get("ASYNC_DIFF_HEIGHT", "40"))
 CSI = re.compile(r"\x1b\[[?0-9;:>]*[ -/]*[@-~]")
 OSC = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
 

@@ -3088,6 +3088,12 @@ function unrefTimer(timer: ReturnType<typeof setTimeout> | null | undefined): vo
 
 function safeInvalidate(ctx: any, pendingViewport?: PendingToolCollapseViewport): void {
 	try {
+		// The host and an extension can load ToolExecutionComponent through
+		// different module contexts. In that case our prototype mutation hooks
+		// do not clear the host component's outer rendered-line cache. Resolve
+		// the stable owner attached to the reused ToolText and clear it here,
+		// before ctx.invalidate() requests the next frame.
+		clearToolRenderCache(findToolExecutionAncestor(ctx?.lastComponent));
 		if (typeof ctx?.invalidate === "function") ctx.invalidate();
 	} catch {
 		// Tool render contexts may outlive their row during reload/session switches.

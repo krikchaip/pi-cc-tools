@@ -31,6 +31,7 @@ const expectFiles = [
   "e2e/expect/preserved-bash-completion.expect",
   "e2e/expect/read-skill-output-shape.expect",
   "e2e/expect/async-diff-click.expect",
+  "e2e/expect/long-create-bottom-click.expect",
   "e2e/expect/edit-line-numbers.expect",
   "e2e/expect/edit-error-prefix.expect",
   "e2e/expect/single-edit-gap.expect",

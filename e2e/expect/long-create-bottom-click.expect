@@ -1,0 +1,128 @@
+#!/usr/bin/expect -f
+# Live long Write/Create result: the bottom L0 anchor must reveal more diff content.
+
+set timeout 1
+set expect_dir [file dirname [file normalize [info script]]]
+set repo_dir [file dirname [file dirname $expect_dir]]
+set extension_path [file join $repo_dir "extensions" "index.ts"]
+set provider_path [file join $repo_dir "e2e" "fixtures" "long-diff-click-provider.ts"]
+set locator_path [file join $expect_dir "async-diff-click-assert.py"]
+set pi_bin [expr {[info exists env(PI_BIN)] ? $env(PI_BIN) : "pi"}]
+set scratch "/tmp/pi-cc-tools-long-create-bottom-click-[pid]"
+set cwd [file join $scratch "cwd"]
+set transcript [file join $scratch "transcript.ansi"]
+set home [file join $scratch "home"]
+set agent [file join $scratch "agent"]
+set columns 140
+set rows 25
+set env(ASYNC_DIFF_WIDTH) $columns
+set env(ASYNC_DIFF_HEIGHT) $rows
+file mkdir $cwd
+file mkdir [file join $home ".pi"]
+file mkdir $agent
+
+set settings_json {{"quietStartup":true,"theme":"dark","outputPad":1,"toolBackground":"outlines","clickExpansion":true,"extraToolOutputExpanded":false}}
+foreach path [list [file join $agent "settings.json"] [file join $home ".pi" "settings.json"]] {
+  set settings [open $path "w"]
+  puts $settings $settings_json
+  close $settings
+}
+
+proc wait_for {seconds pattern} {
+  set deadline [expr {[clock milliseconds] + $seconds * 1000}]
+  while {[clock milliseconds] < $deadline} {
+    expect {
+      "\033\[c" { send "\033\[?1;2c"; exp_continue -continue_timer }
+      "\033\[?u" { send "\033\[?0u"; exp_continue -continue_timer }
+      "install missing project packages" { puts stderr "unexpected project trust prompt"; return 0 }
+      -re $pattern { return 1 }
+      timeout {}
+      eof { return 0 }
+    }
+  }
+  return 0
+}
+
+proc drain_for {seconds} {
+  wait_for $seconds {__PI_CC_TOOLS_LONG_CREATE_DRAIN__}
+}
+
+proc force_fullscreen_repaint {columns rows} {
+  global spawn_id
+  set pi_pid [exp_pid]
+  if {[catch {exec stty columns [expr {$columns + 1}] rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_for 1
+  if {[catch {exec stty columns $columns rows $rows <@ $spawn_id}]} { return 0 }
+  catch {exec kill -WINCH $pi_pid}
+  drain_for 1
+  return 1
+}
+
+proc locate {locator_path path pattern} {
+  if {[catch {exec python3 $locator_path locate $path $pattern} result]} { return {} }
+  return $result
+}
+
+proc final_contains {locator_path path pattern} {
+  return [expr {![catch {exec python3 $locator_path final-contains $path $pattern}]}]
+}
+
+proc click {x y} {
+  send -- "\033\[<0;${x};${y}M\033\[<0;${x};${y}m"
+}
+
+proc fail {message scratch} {
+  puts stderr $message
+  send "\003\003"
+  catch {close}
+  catch {wait}
+  log_file
+  puts "ARTIFACTS $scratch"
+  exit 1
+}
+
+puts "PI_VERSION [exec $pi_bin --version]"
+cd $cwd
+log_file -noappend $transcript
+if {[info exists env(LONG_DIFF_REAL_CONFIG)] && $env(LONG_DIFF_REAL_CONFIG) eq "1"} {
+  spawn env TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 \
+    $pi_bin --no-session --approve -e $provider_path \
+    --provider long-diff-click-e2e --model deterministic-long-create --api-key e2e-local \
+    --tui-mode fullscreen "Create the deterministic long file."
+} else {
+  spawn env HOME=$home TERM=xterm-256color COLORTERM=truecolor COLUMNS=$columns LINES=$rows PI_OFFLINE=1 PI_CODING_AGENT_DIR=$agent \
+    $pi_bin --no-session --no-context-files --no-prompt-templates --no-themes --no-extensions --no-skills --approve \
+    -e $extension_path -e $provider_path --provider long-diff-click-e2e --model deterministic-long-create --api-key e2e-local \
+    --tui-mode fullscreen "Create the deterministic long file."
+}
+stty columns $columns rows $rows
+
+if {![wait_for 15 {E2E_LONG_CREATE_COMPLETE}]} { fail "live long Create did not complete" $scratch }
+drain_for 4
+if {![force_fullscreen_repaint $columns $rows]} { fail "could not settle live long Create preview" $scratch }
+
+set point [locate $locator_path $transcript "156 more diff lines"]
+if {[llength $point] != 2} { fail "could not locate live long Create L0 bottom anchor" $scratch }
+lassign $point anchor_x anchor_y
+
+click $anchor_x $anchor_y
+drain_for 6
+log_file
+if {
+  [final_contains $locator_path $transcript "156 more diff lines"]
+  || (
+    ![final_contains $locator_path $transcript "LONG_CREATE_030"]
+    && ![final_contains $locator_path $transcript "LONG_CREATE_100"]
+    && ![final_contains $locator_path $transcript "LONG_CREATE_150"]
+  )
+} {
+  fail "live long Create bottom anchor changed state without revealing more diff content" $scratch
+}
+
+send "\003\003"
+catch {close}
+catch {wait}
+puts "LONG_CREATE_BOTTOM_CLICK_PASS"
+puts "ARTIFACTS $scratch"
+exit 0
