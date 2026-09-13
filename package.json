@@ -35,19 +35,17 @@
     "README.md",
     "CHANGELOG.md"
   ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
   "scripts": {
-    "typecheck": "npm run typecheck:source && npm run typecheck:renderers",
-    "typecheck:source": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/index.ts extensions/spinner.ts scripts/test-generic-errors.ts",
-    "typecheck:renderers": "tsc --noEmit --target ES2022 --module ESNext --moduleResolution Bundler --allowImportingTsExtensions --skipLibCheck scripts/renderer-test-harness.ts scripts/test-click-e2e.ts scripts/test-mcp-renderer.ts scripts/test-render-cache.ts scripts/test-renderer-integration.ts",
-    "test": "node --experimental-strip-types --test scripts/bash-command.test.ts && npm run test:generic-errors && npm run test:renderers",
-    "test:generic-errors": "bun scripts/test-generic-errors.ts",
-    "test:mcp-renderer": "bun scripts/test-mcp-renderer.ts",
-    "test:render-cache": "bun scripts/test-render-cache.ts",
-    "test:renderer-integration": "bun scripts/test-renderer-integration.ts",
-    "test:renderers": "npm run test:mcp-renderer && npm run test:render-cache && npm run test:renderer-integration",
-    "test:e2e": "npm run test:e2e:click && bash e2e/tmux/reload-markdown.sh && bash e2e/tmux/markdown-layout-delegation.sh",
-    "test:e2e:click": "bun scripts/test-click-e2e.ts",
-    "test:shell-settings": "bun scripts/test-shell-settings.ts",
+    "typecheck": "npm run typecheck:source && npm run typecheck:tests && npm run typecheck:e2e",
+    "typecheck:source": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --allowImportingTsExtensions --skipLibCheck extensions/index.ts extensions/spinner.ts",
+    "typecheck:tests": "tsc -p test/tsconfig.json",
+    "typecheck:e2e": "tsc -p e2e/tsconfig.json",
+    "test": "node --experimental-strip-types scripts/run-tests.mts",
+    "test:e2e": "node --experimental-strip-types scripts/run-e2e.mts",
+    "test:release": "npm run typecheck && npm test && npm run test:e2e && npm run pack:dry-run",
     "pack:dry-run": "npm pack --dry-run",
     "publish:dry-run": "npm publish --dry-run",
     "bench:tools": "bun scripts/benchmark-tools.ts"
@@ -72,6 +70,8 @@
     "@earendil-works/pi-tui": "^0.79.1",
     "@sinclair/typebox": "^0.34.49",
     "@types/node": "^25.7.0",
+    "@xterm/headless": "6.0.0",
+    "node-pty": "1.2.0-beta.15",
     "typescript": "^6.0.3"
   }
 }
