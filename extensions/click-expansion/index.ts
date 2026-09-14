@@ -317,7 +317,6 @@ function createImplementation(root: RuntimeRoot): RuntimeImplementation {
             )) === true;
             if (!published) return false;
             const value = identity as Record<PropertyKey, any>;
-            if (value.rendererState?._ptAsyncRenderPending === true) return false;
             const current = root.targetStates.get(identity) ?? retainedTargetState(target);
             if (behavior === "next-detail" && current.localDetail === 2) return false;
 

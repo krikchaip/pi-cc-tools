@@ -1,6 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, mkdirSync } from "node:fs";
-import { readFile as readFileAsync } from "node:fs/promises";
-import { basename, dirname, extname, relative, resolve } from "node:path";
+import { basename, dirname, relative, resolve } from "node:path";
 
 import type {
 	BashToolDetails,
@@ -44,9 +43,6 @@ import {
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 
-import * as Diff from "diff";
-import type { BundledLanguage, BundledTheme } from "shiki";
-
 import {
 	buildBashCommandPresentation,
 	buildBashPreview,
@@ -58,6 +54,7 @@ import {
 	installClickExpansion,
 	type ClickExpansionRuntime,
 } from "./click-expansion/index";
+import { createDiffPresentationModule, type DiffEvidence, type DiffPresentationSurface, type DiffSource, type DiffTheme } from "./diff-presentation/index";
 import {
 	registerMouseHostAdapter,
 	type MouseTarget,
@@ -2095,15 +2092,6 @@ function summarizeText(text: string, max = 60): string {
 	return `${oneLine.slice(0, Math.max(0, max - 3))}...`;
 }
 
-function hashText(text: string): string {
-	let hash = 2166136261;
-	for (let i = 0; i < text.length; i++) {
-		hash ^= text.charCodeAt(i);
-		hash = Math.imul(hash, 16777619);
-	}
-	return (hash >>> 0).toString(36);
-}
-
 let extraToolOutputExpanded = false;
 type ToolRenderBridge = { localDetailTool?: any };
 // Pi keeps host method patches across /reload, while renderer functions come
@@ -3807,6 +3795,7 @@ function beginToolClickActivation(
 	compatibilityAction?: ToolClickAction,
 ): false | { complete(): void; rollback(): void } {
 	if (!toolHasEffectiveClickAction(tool)) return false;
+	if (diffPresentationModule.isPending(tool.rendererState ?? tool)) return false;
 	const action = compatibilityAction
 		?? (behavior === "next-detail" ? "detail" : behavior === "toggle-max-detail" ? "detail-extra" : "header");
 	const requested = viewport === "adaptive"
@@ -4018,8 +4007,7 @@ function patchToolExecutionRenderers(): void {
 	proto.getCallRenderer = function patchedGetCallRenderer() {
 		const toolName = typeof this?.toolName === "string" ? this.toolName : "";
 		if (toolName === "apply_patch") {
-			return (args: any, theme: Theme, ctx: any) =>
-				renderApplyPatchCall(args, theme, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
+			return (args: any, theme: Theme, ctx: any) => renderApplyPatchCall(args, theme, ctx);
 		}
 		if (isMcpToolName(toolName)) {
 			return (args: any, theme: Theme, ctx: any) => renderGenericToolCall(toolName, args, theme, ctx);
@@ -4437,10 +4425,6 @@ function withFinalBranchBlock(content: string, theme: Theme): string {
 	return [branchLead(first, true, theme), ...middle, branchLead(last, false, theme)].join("\n");
 }
 
-function appendLocalCollapseAction(content: string, theme: Theme, enabled: boolean): string {
-	return enabled ? `${content}\n${localCollapseActionHint(theme)}` : content;
-}
-
 function withProgressivePreviewBranch(content: string, theme: Theme, finalCollapse: boolean): string {
 	const trailingLine = content.split("\n").at(-1) ?? "";
 	const hasTrailingAction = finalCollapse
@@ -4449,19 +4433,9 @@ function withProgressivePreviewBranch(content: string, theme: Theme, finalCollap
 	return hasTrailingAction ? withFinalBranchBlock(content, theme) : withBranch(content, theme);
 }
 
-function withContinuedProgressiveBranch(content: string, theme: Theme, finalCollapse: boolean): string {
-	return finalCollapse ? withFinalBranchBlock(content, theme) : withBranch(content, theme, false, true);
-}
-
 interface DiffOutputTreeBlock {
 	heading?: string;
 	content: string;
-}
-
-interface DiffOutputTree {
-	summary: string;
-	blocks: DiffOutputTreeBlock[];
-	terminalAction?: string;
 }
 
 function renderDiffOutputTree(
@@ -5067,12 +5041,6 @@ function expandedPreviewLimit(state?: Record<PropertyKey, unknown>): number {
 	return configuredExpandedPreviewLimit(extraToolOutputExpanded);
 }
 
-function progressiveExpandedBudget(normalBudget: number, state?: Record<PropertyKey, unknown>): number {
-	const level = progressiveLocalDetailLevelForRender(state);
-	if (level === 0) return normalBudget;
-	return Math.max(normalBudget, configuredExpandedPreviewLimit(level >= 2));
-}
-
 function progressivePreviewLimit(normalLimit: number, state?: Record<PropertyKey, unknown>): number {
 	const level = progressiveLocalDetailLevelForRender(state);
 	return level === 0 ? normalLimit : configuredExpandedPreviewLimit(level >= 2);
@@ -5118,11 +5086,6 @@ function liveToolPreviewEnabled(): boolean {
 function liveToolPreviewLimit(): number {
 	const value = readSettings().liveToolPreviewLines;
 	return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.floor(value) : 5;
-}
-
-function diffCollapsedLimit(): number {
-	const value = readSettings().diffCollapsedLines;
-	return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 24;
 }
 
 function collapsedPreviewCount(detailExpanded: boolean, fallback: number): number {
@@ -5256,91 +5219,7 @@ function renderSideQuestAgentResult(
 	return makeText(ctx.lastComponent, withProgressivePreviewBranch(content, theme, finalCollapse));
 }
 
-// ===========================================================================
-// Diff rendering — adapted from /tmp/pi-diff
-// ===========================================================================
-
-interface DiffPreset {
-	name: string;
-	description: string;
-	shikiTheme?: string;
-	bgAdd?: string;
-	bgDel?: string;
-	bgAddHighlight?: string;
-	bgDelHighlight?: string;
-	bgGutterAdd?: string;
-	bgGutterDel?: string;
-	bgEmpty?: string;
-	fgAdd?: string;
-	fgDel?: string;
-	fgDim?: string;
-	fgLnum?: string;
-	fgRule?: string;
-	fgStripe?: string;
-	fgSafeMuted?: string;
-}
-
-interface DiffUserConfig {
-	diffTheme?: string;
-	diffColors?: Record<string, string>;
-}
-
-const DIFF_PRESETS: Record<string, DiffPreset> = {
-	default: {
-		name: "default",
-		description: "Original pi-diff colors",
-		bgAdd: "#162620",
-		bgDel: "#2d1919",
-		bgAddHighlight: "#234b32",
-		bgDelHighlight: "#502323",
-		bgGutterAdd: "#12201a",
-		bgGutterDel: "#261616",
-		bgEmpty: "#121212",
-		fgDim: "#505050",
-		fgLnum: "#646464",
-		fgRule: "#323232",
-		fgStripe: "#282828",
-		fgSafeMuted: "#8b949e",
-	},
-	midnight: {
-		name: "midnight",
-		description: "Subtle tints for black backgrounds",
-		bgAdd: "#0d1a12",
-		bgDel: "#1a0d0d",
-		bgAddHighlight: "#1a3825",
-		bgDelHighlight: "#381a1a",
-		bgGutterAdd: "#091208",
-		bgGutterDel: "#120908",
-		bgEmpty: "#080808",
-		fgDim: "#404040",
-		fgLnum: "#505050",
-		fgRule: "#282828",
-		fgStripe: "#1e1e1e",
-		fgSafeMuted: "#8b949e",
-	},
-	neon: {
-		name: "neon",
-		description: "Higher contrast backgrounds",
-		bgAdd: "#1a3320",
-		bgDel: "#331a16",
-		bgAddHighlight: "#2d5c3a",
-		bgDelHighlight: "#5c2d2d",
-		bgGutterAdd: "#142818",
-		bgGutterDel: "#28120e",
-		bgEmpty: "#141414",
-		fgDim: "#606060",
-		fgLnum: "#787878",
-		fgRule: "#404040",
-		fgStripe: "#303030",
-		fgSafeMuted: "#9da5ae",
-	},
-};
-
-function loadDiffConfig(): DiffUserConfig {
-	const settings = readSettings();
-	return { diffTheme: settings.diffTheme, diffColors: settings.diffColors };
-}
-
+// Shared theme and tool-branch color helpers.
 // 6x6x6 color cube channel values used by pi's 256color fallback.
 const CUBE_VALUES = [0, 95, 135, 175, 215, 255];
 
@@ -5379,22 +5258,6 @@ function parseAnsiRgb(ansi: string): { r: number; g: number; b: number } | null 
 	const idx = ansi.match(new RegExp(`${esc}\\[(?:38|48);5;(\\d+)m`));
 	if (idx) return xterm256ToRgb(+idx[1]);
 	return null;
-}
-
-function hexToBgAnsi(hex: string): string {
-	if (!hex || !/^#[0-9a-fA-F]{6}$/.test(hex)) return "";
-	const r = Number.parseInt(hex.slice(1, 3), 16);
-	const g = Number.parseInt(hex.slice(3, 5), 16);
-	const b = Number.parseInt(hex.slice(5, 7), 16);
-	return `\x1b[48;2;${r};${g};${b}m`;
-}
-
-function hexToFgAnsi(hex: string): string {
-	if (!hex || !/^#[0-9a-fA-F]{6}$/.test(hex)) return "";
-	const r = Number.parseInt(hex.slice(1, 3), 16);
-	const g = Number.parseInt(hex.slice(3, 5), 16);
-	const b = Number.parseInt(hex.slice(5, 7), 16);
-	return `\x1b[38;2;${r};${g};${b}m`;
 }
 
 // ---------------------------------------------------------------------------
@@ -5436,6 +5299,23 @@ function themeBgRgb(theme: any, key: string): Rgb | null {
 	return ansi ? parseAnsiRgb(ansi) : null;
 }
 
+function isLightThemeBackground(theme: any): boolean {
+	const bg = themeBgRgb(theme, "toolSuccessBg") || themeBgRgb(theme, "userMessageBg") || themeBgRgb(theme, "selectedBg");
+	if (bg) {
+		const lum = 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b;
+		return lum > 155;
+	}
+	const fg = themeFgRgb(theme, "text") || themeFgRgb(theme, "fg");
+	if (fg) {
+		const lum = 0.2126 * fg.r + 0.7152 * fg.g + 0.0722 * fg.b;
+		return lum < 125;
+	}
+	return false;
+}
+
+// Cache theme identity so we only recompute on theme change. The Theme
+// object is reused across renders within a single session unless the user
+// switches themes via the picker.
 // Cache theme identity so we only recompute on theme change. The Theme
 // object is reused across renders within a single session unless the user
 // switches themes via the picker.
@@ -5460,47 +5340,51 @@ function themeAdaptiveEnabled(): boolean {
 	return settings.themeAdaptive !== false;
 }
 
-let DIFF_THEME: BundledTheme = (process.env.DIFF_THEME as BundledTheme | undefined) ?? "github-dark";
-/** True when the active pi theme has a light panel background (edit/write diff chrome). */
-let _diffOnLightBg = false;
-let codeToAnsiLoader: Promise<any> | null = null;
+const CHROME_STYLE_DEFAULTS = {
+	border: "\x1b[38;5;238m",
+	workedLine: "\x1b[38;2;140;140;140m",
+	codeBlockLanguage: "\x1b[38;2;95;95;95m",
+	statusSuccess: "\x1b[32m",
+	statusError: "\x1b[31m",
+	statusPending: "\x1b[90m",
+} as const;
 
-const SPLIT_MIN_WIDTH = 150;
-const SPLIT_MIN_CODE_WIDTH = 60;
-const SPLIT_MAX_WRAP_RATIO = 0.2;
-const SPLIT_MAX_WRAP_LINES = 8;
-const MAX_TERM_WIDTH = 210;
-const DEFAULT_TERM_WIDTH = 200;
-const MAX_PREVIEW_LINES = 60;
-const MAX_RENDER_LINES = 150;
+function resetThemePalette(): void {
+	BORDER_COLOR = CHROME_STYLE_DEFAULTS.border;
+	WORKED_LINE_FG = CHROME_STYLE_DEFAULTS.workedLine;
+	CODE_BLOCK_LANG_FG = CHROME_STYLE_DEFAULTS.codeBlockLanguage;
+	TOOL_STATUS_SUCCESS = CHROME_STYLE_DEFAULTS.statusSuccess;
+	TOOL_STATUS_ERROR = CHROME_STYLE_DEFAULTS.statusError;
+	TOOL_STATUS_PENDING = CHROME_STYLE_DEFAULTS.statusPending;
+	applyToolBranchColor();
+}
 
-const MAX_HL_CHARS = 32_000;
-const CACHE_LIMIT = 48;
-const DIFF_RENDER_CONCURRENCY = 2;
-const WORD_DIFF_MIN_SIM = 0.15;
-const MAX_WRAP_ROWS_WIDE = 3;
-const MAX_WRAP_ROWS_MED = 2;
-const MAX_WRAP_ROWS_NARROW = 1;
+function applyThemePaletteIfNeeded(theme: any): void {
+	if (!theme) return;
+	if (!themeAdaptiveEnabled()) {
+		applyToolBranchColor(theme);
+		return;
+	}
+	const themeName = typeof theme.name === "string" ? theme.name : "";
+	const fingerprint = themePaletteFingerprint(theme);
+	if (_themePaletteCacheTheme === theme && _themePaletteCacheName === themeName && _themePaletteCacheFingerprint === fingerprint) {
+		applyToolBranchColor(theme);
+		return;
+	}
+	if (_themePaletteCacheName !== themeName || _themePaletteCacheFingerprint !== fingerprint) {
+		bumpToolBranchVisualEpoch();
+	}
+	_themePaletteCacheTheme = theme;
+	_themePaletteCacheName = themeName;
+	_themePaletteCacheFingerprint = fingerprint;
+	applyToolBranchColor(theme);
+	TOOL_STATUS_SUCCESS = safeFgAnsi(theme, "success") ?? TOOL_STATUS_SUCCESS;
+	TOOL_STATUS_ERROR = safeFgAnsi(theme, "error") ?? TOOL_STATUS_ERROR;
+	TOOL_STATUS_PENDING = safeFgAnsi(theme, "dim") ?? safeFgAnsi(theme, "muted") ?? safeFgAnsi(theme, "thinkingText") ?? TOOL_STATUS_PENDING;
+}
 
-let D_RST = "\x1b[0m";
-const D_BOLD = "\x1b[1m";
-const D_DIM = "\x1b[2m";
-
-// Diff backgrounds — defaults are transparent; autoDeriveBgFromTheme fills them
-// using pi-tool-display's mix ratios against the theme's toolSuccessBg.
-let BG_ADD = "\x1b[49m";
-let BG_DEL = "\x1b[49m";
-let BG_ADD_W = "\x1b[49m";
-let BG_DEL_W = "\x1b[49m";
-let BG_GUTTER_ADD = "\x1b[49m";
-let BG_GUTTER_DEL = "\x1b[49m";
-let BG_EMPTY = "\x1b[49m";
-let BG_BASE = "\x1b[49m";
-
-let FG_ADD = "\x1b[38;2;100;180;120m";
-let FG_DEL = "\x1b[38;2;200;100;100m";
-let FG_DIM = "\x1b[38;2;80;80;80m";
-let FG_LNUM = "\x1b[38;2;100;100;100m";
+const D_RST = "\x1b[0m";
+const FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
 // Tool branch connectors (├ └ │). Default fixed gray 72 — independent of pi theme.
 const DEFAULT_TOOL_BRANCH_GRAY = 72;
@@ -5610,43 +5494,6 @@ function applyToolBranchColor(theme?: any): void {
 	syncOutlineChromeFromBranch(theme);
 }
 
-/** Strip baked ├/└/│ prefixes (short or long arm) so branch color can be reapplied. */
-function stripBranchMarkupLine(line: string): string {
-	let plain = stripAnsi(line);
-	plain = plain.replace(/^\s*[├└]─?\s*/, "");
-	plain = plain.replace(/^\s*│\s{0,2}/, "");
-	return plain;
-}
-
-function stripBranchMarkupBlock(text: string): string {
-	return text
-		.split("\n")
-		.map((line) => (stripAnsi(line).trim() ? stripBranchMarkupLine(line) : line))
-		.join("\n");
-}
-
-function liveBranchDisplay(state: Record<string, unknown> | undefined, theme: Theme): string | undefined {
-	if (!state || typeof state !== "object") return undefined;
-	const tree = state._ptTree as DiffOutputTree | undefined;
-	if (tree && typeof tree.summary === "string" && Array.isArray(tree.blocks)) {
-		return renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme);
-	}
-	const body = state._ptBody;
-	if (typeof body === "string" && body.trim() && !body.includes("(rendering")) {
-		const finalCollapse = state._ptFinalCollapse === true;
-		return withContinuedProgressiveBranch(
-			appendLocalCollapseAction(body, theme, finalCollapse),
-			theme,
-			finalCollapse,
-		);
-	}
-	const display = state._ptDisplay;
-	if (typeof display === "string" && display.trim()) {
-		return withBranch(stripBranchMarkupBlock(display), theme, false, true);
-	}
-	return undefined;
-}
-
 function refreshAllToolBranchVisuals(ctx: any): void {
 	settingsCacheState.entry = null;
 	syncToolBackgroundMode();
@@ -5669,18 +5516,10 @@ function rebindUiChromeToTheme(ctx: any): void {
 	if (!ctx?.hasUI) return;
 	settingsCacheState.entry = null;
 	syncToolBackgroundMode();
-	const theme = ctx.ui?.theme;
-	invalidateThemePaletteCache();
-	clearHighlightCache();
-	applyDiffPalette();
 	bustSpinnerSettingsCache();
-	applyToolBackgroundMode(theme);
-	applyThemePaletteIfNeeded(theme);
-	syncDiffShikiTheme(theme);
-	if (themeAdaptiveEnabled() && theme?.getFgAnsi && !hasExplicitBgConfig) {
-		autoDeriveBgFromTheme(theme);
-		autoDerivePending = false;
-	}
+	applyToolBackgroundMode(ctx.ui?.theme);
+	applyThemePaletteIfNeeded(ctx.ui?.theme);
+	diffPresentationModule.reset();
 	bumpToolBranchVisualEpoch();
 	refreshAllToolBranchVisuals(ctx);
 }
@@ -5695,1071 +5534,6 @@ function scheduleDeferredChromeRebind(ctx: any, delayMs = 0): void {
 }
 
 let TOOL_RULE = toolBranchRgbAnsi(DEFAULT_TOOL_BRANCH_GRAY);
-let FG_SAFE_MUTED = "\x1b[38;2;139;148;158m";
-let FG_STRIPE = "\x1b[38;2;40;40;40m";
-
-let DIVIDER = `${FG_RULE}│${D_RST}`;
-
-interface DiffColors {
-	fgAdd: string;
-	fgDel: string;
-	fgCtx: string;
-}
-
-let DEFAULT_DIFF_COLORS: DiffColors = { fgAdd: FG_ADD, fgDel: FG_DEL, fgCtx: FG_DIM };
-let autoDerivePending = true;
-let hasExplicitBgConfig = false;
-
-// pi-tool-display tint targets for diff palette derivation
-const ADDITION_TINT_TARGET = { r: 84, g: 190, b: 118 };
-const DELETION_TINT_TARGET = { r: 232, g: 95, b: 122 };
-// Fallback panel bases when theme bg vars are unavailable
-const FALLBACK_BASE_BG_DARK = { r: 32, g: 35, b: 42 };
-const FALLBACK_BASE_BG_LIGHT = { r: 232, g: 233, b: 236 };
-
-function isLightThemeBackground(theme: any): boolean {
-	const panel =
-		themeBgRgb(theme, "toolSuccessBg") ||
-		themeBgRgb(theme, "userMessageBg") ||
-		themeBgRgb(theme, "selectedBg");
-	if (panel) {
-		const lum = 0.2126 * panel.r + 0.7152 * panel.g + 0.0722 * panel.b;
-		return lum > 165;
-	}
-	const fg = themeFgRgb(theme, "text") || themeFgRgb(theme, "fg");
-	if (fg) {
-		const lum = 0.2126 * fg.r + 0.7152 * fg.g + 0.0722 * fg.b;
-		return lum < 95;
-	}
-	return false;
-}
-
-function syncDiffShikiTheme(theme: any): void {
-	if (process.env.DIFF_THEME) return;
-	const config = loadDiffConfig();
-	if (config.diffTheme) return;
-	_diffOnLightBg = isLightThemeBackground(theme);
-	DIFF_THEME = (_diffOnLightBg ? "github-light" : "github-dark") as BundledTheme;
-	clearHighlightCache();
-}
-const UNIVERSAL_DIFF_ADD_FG = { r: 110, g: 210, b: 130 };
-const UNIVERSAL_DIFF_DEL_FG = { r: 225, g: 110, b: 110 };
-
-function mixRgb(
-	a: { r: number; g: number; b: number },
-	b: { r: number; g: number; b: number },
-	ratio: number,
-): { r: number; g: number; b: number } {
-	return {
-		r: a.r + (b.r - a.r) * ratio,
-		g: a.g + (b.g - a.g) * ratio,
-		b: a.b + (b.b - a.b) * ratio,
-	};
-}
-
-function rgbToBgAnsi(c: { r: number; g: number; b: number }): string {
-	return `\x1b[48;2;${Math.round(c.r)};${Math.round(c.g)};${Math.round(c.b)}m`;
-}
-
-function autoDeriveBgFromTheme(theme: any): void {
-	// Diff palette derivation.
-	//
-	// `toolDiffAdded` / `toolDiffRemoved` from the active pi theme give us the
-	// fg accents. The base background is taken from `toolSuccessBg` (close to
-	// the panel color the row will sit on) so the tinted backgrounds blend in
-	// instead of forcing a hardcoded dark hue. Falls back to the universal
-	// dark palette when the theme is unavailable or themeAdaptive=false.
-	const useTheme = themeAdaptiveEnabled() && theme;
-	const onLight = useTheme && isLightThemeBackground(theme);
-	_diffOnLightBg = !!onLight;
-	const addFgRgb = (useTheme && themeFgRgb(theme, "toolDiffAdded")) || UNIVERSAL_DIFF_ADD_FG;
-	const delFgRgb = (useTheme && themeFgRgb(theme, "toolDiffRemoved")) || UNIVERSAL_DIFF_DEL_FG;
-	const base =
-		(useTheme && themeBgRgb(theme, "toolSuccessBg")) ||
-		(useTheme && themeBgRgb(theme, "userMessageBg")) ||
-		(onLight ? FALLBACK_BASE_BG_LIGHT : FALLBACK_BASE_BG_DARK);
-
-	const addTint = mixRgb(addFgRgb, ADDITION_TINT_TARGET, 0.35);
-	const delTint = mixRgb(delFgRgb, DELETION_TINT_TARGET, 0.65);
-
-	FG_ADD = `\x1b[38;2;${Math.round(addFgRgb.r)};${Math.round(addFgRgb.g)};${Math.round(addFgRgb.b)}m`;
-	FG_DEL = `\x1b[38;2;${Math.round(delFgRgb.r)};${Math.round(delFgRgb.g)};${Math.round(delFgRgb.b)}m`;
-	BG_ADD = rgbToBgAnsi(mixRgb(base, addTint, 0.24));
-	BG_DEL = rgbToBgAnsi(mixRgb(base, delTint, 0.12));
-	BG_ADD_W = rgbToBgAnsi(mixRgb(base, addTint, 0.44));
-	BG_DEL_W = rgbToBgAnsi(mixRgb(base, delTint, 0.26));
-	BG_GUTTER_ADD = rgbToBgAnsi(mixRgb(base, addTint, 0.14));
-	BG_GUTTER_DEL = rgbToBgAnsi(mixRgb(base, delTint, 0.08));
-	BG_EMPTY = TRANSPARENT_BG;
-	BG_BASE = TRANSPARENT_BG;
-	D_RST = TRANSPARENT_RESET;
-	DIVIDER = `${FG_RULE}│${D_RST}`;
-	DEFAULT_DIFF_COLORS = { fgAdd: FG_ADD, fgDel: FG_DEL, fgCtx: FG_DIM };
-}
-
-// Track which palette fields the user explicitly set so theme-derived
-// updates don't clobber their config.
-const _explicitFgFields = new Set<"fgAdd" | "fgDel" | "fgDim" | "fgLnum" | "fgRule" | "fgStripe" | "fgSafeMuted">();
-
-// Original Claude-Code-style palette captured at module-load so we can
-// restore it when the user toggles themeAdaptive off at runtime.
-const _claudeStyleDefaults = {
-	BORDER_COLOR: "\x1b[38;5;238m",
-	WORKED_LINE_FG: "\x1b[38;2;140;140;140m",
-	CODE_BLOCK_LANG_FG: "\x1b[38;2;95;95;95m",
-	TOOL_RULE: toolBranchRgbAnsi(DEFAULT_TOOL_BRANCH_GRAY),
-	FG_DIM: "\x1b[38;2;80;80;80m",
-	FG_LNUM: "\x1b[38;2;100;100;100m",
-	FG_RULE: "\x1b[38;2;50;50;50m",
-	FG_STRIPE: "\x1b[38;2;40;40;40m",
-	FG_SAFE_MUTED: "\x1b[38;2;139;148;158m",
-	FG_ADD: "\x1b[38;2;100;180;120m",
-	FG_DEL: "\x1b[38;2;200;100;100m",
-	TOOL_STATUS_SUCCESS: "\x1b[32m",
-	TOOL_STATUS_ERROR: "\x1b[31m",
-	TOOL_STATUS_PENDING: "\x1b[90m",
-};
-
-function resetThemePalette(): void {
-	BORDER_COLOR = _claudeStyleDefaults.BORDER_COLOR;
-	WORKED_LINE_FG = _claudeStyleDefaults.WORKED_LINE_FG;
-	CODE_BLOCK_LANG_FG = _claudeStyleDefaults.CODE_BLOCK_LANG_FG;
-	applyToolBranchColor();
-	TOOL_STATUS_SUCCESS = _claudeStyleDefaults.TOOL_STATUS_SUCCESS;
-	TOOL_STATUS_ERROR = _claudeStyleDefaults.TOOL_STATUS_ERROR;
-	TOOL_STATUS_PENDING = _claudeStyleDefaults.TOOL_STATUS_PENDING;
-	if (!_explicitFgFields.has("fgDim")) FG_DIM = _claudeStyleDefaults.FG_DIM;
-	if (!_explicitFgFields.has("fgLnum")) FG_LNUM = _claudeStyleDefaults.FG_LNUM;
-	if (!_explicitFgFields.has("fgRule")) FG_RULE = _claudeStyleDefaults.FG_RULE;
-	if (!_explicitFgFields.has("fgStripe")) FG_STRIPE = _claudeStyleDefaults.FG_STRIPE;
-	if (!_explicitFgFields.has("fgSafeMuted")) FG_SAFE_MUTED = _claudeStyleDefaults.FG_SAFE_MUTED;
-	if (!_explicitFgFields.has("fgAdd")) FG_ADD = _claudeStyleDefaults.FG_ADD;
-	if (!_explicitFgFields.has("fgDel")) FG_DEL = _claudeStyleDefaults.FG_DEL;
-	DIVIDER = `${FG_RULE}│${D_RST}`;
-	DEFAULT_DIFF_COLORS = { fgAdd: FG_ADD, fgDel: FG_DEL, fgCtx: FG_DIM };
-}
-
-function applyThemePaletteIfNeeded(theme: any): void {
-	if (!theme) return;
-	if (!themeAdaptiveEnabled()) {
-		applyToolBranchColor(theme);
-		syncOutlineChromeFromBranch(theme);
-		return;
-	}
-	const themeName = typeof theme?.name === "string" ? theme.name : "";
-	const fingerprint = themePaletteFingerprint(theme);
-	if (
-		_themePaletteCacheTheme === theme &&
-		_themePaletteCacheName === themeName &&
-		_themePaletteCacheFingerprint === fingerprint
-	) {
-		applyToolBranchColor(theme);
-		syncOutlineChromeFromBranch(theme);
-		return;
-	}
-	const paletteChanged =
-		_themePaletteCacheName !== themeName || _themePaletteCacheFingerprint !== fingerprint;
-	if (paletteChanged) bumpToolBranchVisualEpoch();
-	_themePaletteCacheTheme = theme;
-	_themePaletteCacheName = themeName;
-	_themePaletteCacheFingerprint = fingerprint;
-
-	const borderMuted = safeFgAnsi(theme, "borderMuted");
-	const muted = safeFgAnsi(theme, "muted");
-	const dim = safeFgAnsi(theme, "dim") ?? muted;
-
-	// User box, code fences, thinking/thought text, and ├ └ │ all follow branch chrome.
-	applyToolBranchColor(theme);
-
-	const chromeFg = BORDER_COLOR;
-
-	// Grouped-tool status counts follow the same semantic theme colors as regular tool dots.
-	TOOL_STATUS_SUCCESS = safeFgAnsi(theme, "success") ?? TOOL_STATUS_SUCCESS;
-	TOOL_STATUS_ERROR = safeFgAnsi(theme, "error") ?? TOOL_STATUS_ERROR;
-	const thinking = safeFgAnsi(theme, "thinkingText");
-	TOOL_STATUS_PENDING = dim ?? muted ?? thinking ?? TOOL_STATUS_PENDING;
-
-	// Diff support text colors. These are user-overridable via diffColors.* so
-	// we only touch the ones not explicitly set.
-	if (!_explicitFgFields.has("fgDim") && muted) FG_DIM = muted;
-	if (!_explicitFgFields.has("fgLnum") && muted) FG_LNUM = muted;
-	const ruleChrome = chromeFg ?? borderMuted;
-	if (!_explicitFgFields.has("fgRule") && ruleChrome) FG_RULE = ruleChrome;
-	if (!_explicitFgFields.has("fgStripe") && ruleChrome) FG_STRIPE = ruleChrome;
-	if (!_explicitFgFields.has("fgSafeMuted") && muted) FG_SAFE_MUTED = muted;
-
-	DIVIDER = `${FG_RULE}│${D_RST}`;
-
-	// Re-trigger background derivation against the new theme unless the user
-	// set explicit bg overrides via diffTheme/diffColors.
-	if (!hasExplicitBgConfig) {
-		autoDeriveBgFromTheme(theme);
-		autoDerivePending = false;
-	} else if (themeAdaptiveEnabled()) {
-		_diffOnLightBg = isLightThemeBackground(theme);
-	}
-	syncDiffShikiTheme(theme);
-}
-
-function applyDiffPalette(): void {
-	const config = loadDiffConfig();
-	hasExplicitBgConfig = false;
-	const preset = config.diffTheme ? DIFF_PRESETS[config.diffTheme] : null;
-	if (preset) hasExplicitBgConfig = true;
-	const overrides = config.diffColors ?? {};
-	if (Object.keys(overrides).length > 0) hasExplicitBgConfig = true;
-	_explicitFgFields.clear();
-
-	const applyBg = (key: string, presetValue: string | undefined, set: (value: string) => void) => {
-		const hex = overrides[key] ?? presetValue;
-		if (!hex) return;
-		const ansi = hexToBgAnsi(hex);
-		if (ansi) set(ansi);
-	};
-	const applyFg = (
-		key: "fgAdd" | "fgDel" | "fgDim" | "fgLnum" | "fgRule" | "fgStripe" | "fgSafeMuted",
-		presetValue: string | undefined,
-		set: (value: string) => void,
-	) => {
-		const hex = overrides[key] ?? presetValue;
-		if (!hex) return;
-		const ansi = hexToFgAnsi(hex);
-		if (!ansi) return;
-		set(ansi);
-		_explicitFgFields.add(key);
-	};
-
-	applyBg("bgAdd", preset?.bgAdd, (v) => {
-		BG_ADD = v;
-	});
-	applyBg("bgDel", preset?.bgDel, (v) => {
-		BG_DEL = v;
-	});
-	applyBg("bgAddHighlight", preset?.bgAddHighlight, (v) => {
-		BG_ADD_W = v;
-	});
-	applyBg("bgDelHighlight", preset?.bgDelHighlight, (v) => {
-		BG_DEL_W = v;
-	});
-	applyBg("bgGutterAdd", preset?.bgGutterAdd, (v) => {
-		BG_GUTTER_ADD = v;
-	});
-	applyBg("bgGutterDel", preset?.bgGutterDel, (v) => {
-		BG_GUTTER_DEL = v;
-	});
-	applyBg("bgEmpty", preset?.bgEmpty, (v) => {
-		BG_EMPTY = v;
-	});
-
-	applyFg("fgAdd", preset?.fgAdd, (v) => {
-		FG_ADD = v;
-	});
-	applyFg("fgDel", preset?.fgDel, (v) => {
-		FG_DEL = v;
-	});
-	applyFg("fgDim", preset?.fgDim, (v) => {
-		FG_DIM = v;
-	});
-	applyFg("fgLnum", preset?.fgLnum, (v) => {
-		FG_LNUM = v;
-	});
-	applyFg("fgRule", preset?.fgRule, (v) => {
-		FG_RULE = v;
-	});
-	applyFg("fgStripe", preset?.fgStripe, (v) => {
-		FG_STRIPE = v;
-	});
-	applyFg("fgSafeMuted", preset?.fgSafeMuted, (v) => {
-		FG_SAFE_MUTED = v;
-	});
-
-	const shiki = overrides.shikiTheme ?? preset?.shikiTheme;
-	if (shiki) DIFF_THEME = shiki as BundledTheme;
-
-	DIVIDER = `${FG_RULE}│${D_RST}`;
-	DEFAULT_DIFF_COLORS = { fgAdd: FG_ADD, fgDel: FG_DEL, fgCtx: FG_DIM };
-	// Only trigger auto-derive when the user did NOT supply an explicit
-	// preset or per-color override; otherwise we would overwrite their config
-	// with the hardcoded dark palette on first render.
-	autoDerivePending = !hasExplicitBgConfig;
-}
-
-function resolveDiffColors(theme?: any): DiffColors {
-	applyThemePaletteIfNeeded(theme);
-	if (autoDerivePending && theme?.getFgAnsi) {
-		autoDeriveBgFromTheme(theme);
-		autoDerivePending = false;
-	}
-	return DEFAULT_DIFF_COLORS;
-}
-
-interface DiffLine {
-	type: "add" | "del" | "ctx" | "sep";
-	oldNum: number | null;
-	newNum: number | null;
-	content: string;
-}
-
-interface ParsedDiff {
-	lines: DiffLine[];
-	added: number;
-	removed: number;
-	chars: number;
-}
-
-function diffStrip(value: string): string {
-	return value.replace(ANSI_RE, "");
-}
-
-function tabs(text: string): string {
-	return expandTabStops(text);
-}
-
-function termW(): number {
-	const raw =
-		process.stdout.columns ||
-		(process.stderr as any).columns ||
-		Number.parseInt(process.env.COLUMNS ?? "", 10) ||
-		DEFAULT_TERM_WIDTH;
-	return Math.max(40, Math.min(raw - 4, MAX_TERM_WIDTH));
-}
-
-function branchDiffWidth(componentWidth?: number, chromeWidth = 2): number {
-	const width = typeof componentWidth === "number" && Number.isFinite(componentWidth)
-		? Math.floor(componentWidth)
-		: termW();
-	return Math.max(20, Math.min(width - chromeWidth, MAX_TERM_WIDTH));
-}
-
-function contextDiffWidth(ctx: any, chromeWidth = 2): number {
-	return branchDiffWidth(ctx.state?._diffComponentWidth, chromeWidth);
-}
-
-function adaptiveWrapRows(tw?: number): number {
-	const width = tw ?? termW();
-	if (width >= 180) return MAX_WRAP_ROWS_WIDE;
-	if (width >= 120) return MAX_WRAP_ROWS_MED;
-	return MAX_WRAP_ROWS_NARROW;
-}
-
-function fit(value: string, width: number): string {
-	if (width <= 0) return "";
-	const plain = diffStrip(value);
-	if (plain.length <= width) return value + " ".repeat(width - plain.length);
-	const showWidth = width > 2 ? width - 1 : width;
-	let vis = 0;
-	let i = 0;
-	while (i < value.length && vis < showWidth) {
-		if (value[i] === "\x1b") {
-			const end = value.indexOf("m", i);
-			if (end !== -1) {
-				i = end + 1;
-				continue;
-			}
-		}
-		vis++;
-		i++;
-	}
-	return width > 2 ? `${value.slice(0, i)}${D_RST}${FG_DIM}›${D_RST}` : `${value.slice(0, i)}${D_RST}`;
-}
-
-function ansiState(text: string): string {
-	const matches = text.match(/\x1b\[[0-9;]*m/g) ?? [];
-	let fg = "";
-	let bg = "";
-	for (const seq of matches) {
-		const params = seq.slice(2, -1);
-		if (params === "0") {
-			fg = "";
-			bg = "";
-		} else if (params === "39") {
-			fg = "";
-		} else if (params.startsWith("38;")) {
-			fg = seq;
-		} else if (params.startsWith("48;")) {
-			bg = seq;
-		}
-	}
-	return bg + fg;
-}
-
-function normalizeShikiContrast(ansi: string): string {
-	const darkFgThreshold = _diffOnLightBg ? 140 : 72;
-	return ansi.replace(/\x1b\[([0-9;]*)m/g, (seq, params: string) => {
-		if (params === "30" || params === "90" || params === "38;5;0" || params === "38;5;8") return FG_SAFE_MUTED;
-		if (!params.startsWith("38;2;")) return seq;
-		const parts = params.split(";").map(Number);
-		if (parts.length !== 5 || parts.some((n) => !Number.isFinite(n))) return seq;
-		const [, , r, g, b] = parts;
-		const luminance = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-		if (_diffOnLightBg) {
-			return luminance < darkFgThreshold ? seq : FG_SAFE_MUTED;
-		}
-		return luminance < darkFgThreshold ? FG_SAFE_MUTED : seq;
-	});
-}
-
-function wrapAnsi(text: string, width: number, maxRows = adaptiveWrapRows(), fillBg = ""): string[] {
-	if (width <= 0) return [""];
-	const plain = diffStrip(text);
-	if (plain.length <= width) {
-		const pad = width - plain.length;
-		return pad > 0 ? [text + fillBg + " ".repeat(pad) + (fillBg ? D_RST : "")] : [text];
-	}
-
-	const rows: string[] = [];
-	let row = "";
-	let vis = 0;
-	let i = 0;
-	let onLastRow = false;
-	let effectiveWidth = width;
-
-	while (i < text.length) {
-		if (!onLastRow && rows.length >= maxRows - 1) {
-			onLastRow = true;
-			effectiveWidth = width > 2 ? width - 1 : width;
-		}
-		if (text[i] === "\x1b") {
-			const end = text.indexOf("m", i);
-			if (end !== -1) {
-				row += text.slice(i, end + 1);
-				i = end + 1;
-				continue;
-			}
-		}
-		if (vis >= effectiveWidth) {
-			if (onLastRow) {
-				let hasMore = false;
-				for (let j = i; j < text.length; j++) {
-					if (text[j] === "\x1b") {
-						const e2 = text.indexOf("m", j);
-						if (e2 !== -1) {
-							j = e2;
-							continue;
-						}
-					}
-					hasMore = true;
-					break;
-				}
-				if (hasMore && width > 2) row += `${D_RST}${FG_DIM}›${D_RST}`;
-				else row += fillBg + " ".repeat(Math.max(0, width - vis)) + D_RST;
-				rows.push(row);
-				return rows;
-			}
-			const state = ansiState(row);
-			rows.push(row + D_RST);
-			row = state + fillBg;
-			vis = 0;
-			if (rows.length >= maxRows - 1) {
-				onLastRow = true;
-				effectiveWidth = width > 2 ? width - 1 : width;
-			}
-		}
-		row += text[i];
-		vis++;
-		i++;
-	}
-
-	if (row.length > 0 || rows.length === 0) {
-		rows.push(row + fillBg + " ".repeat(Math.max(0, width - vis)) + D_RST);
-	}
-	return rows;
-}
-
-function lnum(n: number | null, width: number, fg = FG_LNUM): string {
-	if (n === null) return " ".repeat(width);
-	const value = String(n);
-	// Callers reset after the whole gutter cell so wrapped rows keep one
-	// continuous add/remove background through the line-number/sign columns.
-	return `${fg}${" ".repeat(Math.max(0, width - value.length))}${value}`;
-}
-
-function stripes(width: number): string {
-	return BG_BASE + FG_STRIPE + "╱".repeat(width) + D_RST;
-}
-
-function renderDiffStatBar(added: number, removed: number, width = termW()): string {
-	const total = added + removed;
-	if (total === 0 || width < 20) return "";
-	const slots = Math.max(8, Math.min(20, Math.floor(width / 14)));
-	let addSlots = Math.max(0, Math.min(slots, Math.round((added / total) * slots)));
-	if (added > 0 && addSlots === 0) addSlots = 1;
-	if (removed > 0 && addSlots >= slots) addSlots = slots - 1;
-	const removeSlots = Math.max(0, slots - addSlots);
-	const addBar = addSlots > 0 ? `${FG_ADD}${"━".repeat(addSlots)}${D_RST}` : "";
-	const removeBar = removeSlots > 0 ? `${FG_DEL}${"━".repeat(removeSlots)}${D_RST}` : "";
-	return `${FG_DIM}[${D_RST}${addBar}${removeBar}${FG_DIM}]${D_RST}`;
-}
-
-function summarizeDiff(added: number, removed: number): string {
-	const parts: string[] = [];
-	if (added > 0) parts.push(`${FG_ADD}+${added}${D_RST}`);
-	if (removed > 0) parts.push(`${FG_DEL}-${removed}${D_RST}`);
-	if (!parts.length) return `${FG_DIM}no changes${D_RST}`;
-	const bar = renderDiffStatBar(added, removed);
-	return bar ? `${parts.join(" ")} ${bar}` : parts.join(" ");
-}
-
-function diffSummaryWithMeta(added: number, removed: number, hunks: number, mode: string): string {
-	const base = summarizeDiff(added, removed);
-	const extras: string[] = [];
-	if (hunks > 0) extras.push(`${FG_DIM}${hunks} hunk${hunks === 1 ? "" : "s"}${D_RST}`);
-	if (mode) extras.push(`${FG_DIM}${mode}${D_RST}`);
-	return extras.length ? `${base} ${FG_DIM}•${D_RST} ${extras.join(` ${FG_DIM}•${D_RST} `)}` : base;
-}
-
-interface DiffRenderState {
-	toolExpanded: boolean;
-	localDetailEnabled?: boolean;
-	progressiveLocalDetail?: boolean;
-}
-
-function collapsedDiffHint(remainingLines: number, hiddenHunks: number, state: DiffRenderState): string {
-	const width = termW();
-	const candidates = [
-		`… (${remainingLines} more diff lines${hiddenHunks > 0 ? ` • ${hiddenHunks} more hunks` : ""}${toolOutputDetailHint(undefined, state.toolExpanded, true, state.localDetailEnabled !== false, state.progressiveLocalDetail === true)}${BG_BASE}${FG_DIM})`,
-		`… (${remainingLines} more lines${hiddenHunks > 0 ? ` • ${hiddenHunks} hunks` : ""})`,
-		`… (+${remainingLines}${hiddenHunks > 0 ? ` • +${hiddenHunks}h` : ""})`,
-		"…",
-	];
-	for (const candidate of candidates) {
-		if (visibleWidth(candidate) <= width) return candidate;
-	}
-	return truncateToWidth("…", width, "");
-}
-
-function diffRule(width: number): string {
-	return `${BG_BASE}${FG_RULE}${"─".repeat(width)}${D_RST}`;
-}
-
-/** Max line number across diff lines. Loop-based (not Math.max(...spread)) so huge
- *  diffs don't blow the call stack with a RangeError. Returns identical results. */
-function maxLineNumber(lines: DiffLine[]): number {
-	let max = 0;
-	for (let i = 0; i < lines.length; i++) {
-		const n = lines[i].oldNum ?? lines[i].newNum ?? 0;
-		if (n > max) max = n;
-	}
-	return max;
-}
-
-function splitDiffRowCount(diff: ParsedDiff): number {
-	let rows = 0;
-	let index = 0;
-	while (index < diff.lines.length) {
-		const line = diff.lines[index];
-		if (line.type === "sep" || line.type === "ctx") {
-			rows++;
-			index++;
-			continue;
-		}
-		let deleted = 0;
-		let added = 0;
-		while (index < diff.lines.length && diff.lines[index].type === "del") {
-			deleted++;
-			index++;
-		}
-		while (index < diff.lines.length && diff.lines[index].type === "add") {
-			added++;
-			index++;
-		}
-		rows += Math.max(deleted, added);
-	}
-	return rows;
-}
-
-function shouldUseSplit(diff: ParsedDiff, tw: number, maxRows = MAX_PREVIEW_LINES): boolean {
-	if (!diff.lines.length) return false;
-	if (tw < SPLIT_MIN_WIDTH) return false;
-	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
-	const half = Math.floor((tw - 1) / 2);
-	const gw = nw + 5;
-	const cw = Math.max(12, half - gw);
-	if (cw < SPLIT_MIN_CODE_WIDTH) return false;
-	const vis = diff.lines.slice(0, maxRows);
-	let contentLines = 0;
-	let wrapCandidates = 0;
-	for (const line of vis) {
-		if (line.type === "sep") continue;
-		contentLines++;
-		if (tabs(line.content).length > cw) wrapCandidates++;
-	}
-	if (contentLines === 0) return true;
-	const wrapRatio = wrapCandidates / contentLines;
-	if (wrapCandidates >= SPLIT_MAX_WRAP_LINES) return false;
-	if (wrapRatio >= SPLIT_MAX_WRAP_RATIO) return false;
-	return true;
-}
-
-function diffFitsRenderLimit(diff: ParsedDiff, width: number, maxRows: number): boolean {
-	return shouldUseSplit(diff, width, maxRows)
-		? splitDiffRowCount(diff) <= maxRows
-		: diff.lines.length <= maxRows;
-}
-
-const EXT_LANG: Record<string, BundledLanguage> = {
-	ts: "typescript",
-	tsx: "tsx",
-	js: "javascript",
-	jsx: "jsx",
-	mjs: "javascript",
-	cjs: "javascript",
-	py: "python",
-	rb: "ruby",
-	rs: "rust",
-	go: "go",
-	java: "java",
-	c: "c",
-	cpp: "cpp",
-	h: "c",
-	hpp: "cpp",
-	cs: "csharp",
-	swift: "swift",
-	kt: "kotlin",
-	html: "html",
-	css: "css",
-	scss: "scss",
-	json: "json",
-	yaml: "yaml",
-	yml: "yaml",
-	toml: "toml",
-	md: "markdown",
-	sql: "sql",
-	sh: "bash",
-	bash: "bash",
-	zsh: "bash",
-	lua: "lua",
-	php: "php",
-	dart: "dart",
-	xml: "xml",
-	graphql: "graphql",
-	svelte: "svelte",
-	vue: "vue",
-};
-
-function lang(filePath: string): BundledLanguage | undefined {
-	return EXT_LANG[extname(filePath).slice(1).toLowerCase()];
-}
-
-async function codeToAnsiLazy(code: string, language: BundledLanguage, theme: BundledTheme): Promise<string> {
-	if (!codeToAnsiLoader) {
-		// Self-healing: a failed import (missing dep, transient error) must not leave a
-		// permanently-rejected promise that later becomes an unhandled rejection. Reset
-		// on failure so the next call retries.
-		codeToAnsiLoader = import("@shikijs/cli").then(
-			(mod) => mod.codeToANSI,
-			(err) => {
-				codeToAnsiLoader = null;
-				throw err;
-			},
-		);
-	}
-	const codeToAnsi = await codeToAnsiLoader;
-	return codeToAnsi(code, language, theme);
-}
-
-const hlCache = new Map<string, string[]>();
-
-function clearHighlightCache(): void {
-	hlCache.clear();
-}
-
-function touchCache(key: string, value: string[]): string[] {
-	hlCache.delete(key);
-	hlCache.set(key, value);
-	while (hlCache.size > CACHE_LIMIT) {
-		const first = hlCache.keys().next().value;
-		if (first === undefined) break;
-		hlCache.delete(first);
-	}
-	return value;
-}
-
-async function hlBlock(code: string, language: BundledLanguage | undefined): Promise<string[]> {
-	if (!code) return [""];
-	if (!language || code.length > MAX_HL_CHARS) return code.split("\n");
-	const key = `${DIFF_THEME}\0${language}\0${code}`;
-	const hit = hlCache.get(key);
-	if (hit) return touchCache(key, hit);
-	try {
-		const ansi = normalizeShikiContrast(await codeToAnsiLazy(code, language, DIFF_THEME));
-		const out = (ansi.endsWith("\n") ? ansi.slice(0, -1) : ansi).split("\n");
-		return touchCache(key, out);
-	} catch {
-		return code.split("\n");
-	}
-}
-
-async function mapWithConcurrency<T, R>(items: T[], limit: number, mapItem: (item: T, index: number) => Promise<R>): Promise<R[]> {
-	const safeLimit = Math.max(1, Math.min(items.length || 1, Math.floor(limit)));
-	const results = new Array<R>(items.length);
-	let nextIndex = 0;
-	await Promise.all(Array.from({ length: safeLimit }, async () => {
-		while (true) {
-			const index = nextIndex++;
-			if (index >= items.length) return;
-			results[index] = await mapItem(items[index], index);
-		}
-	}));
-	return results;
-}
-
-function parseDiff(oldContent: string, newContent: string, ctxLines = 3): ParsedDiff {
-	const patch = Diff.structuredPatch("", "", oldContent, newContent, "", "", { context: ctxLines });
-	const lines: DiffLine[] = [];
-	let added = 0;
-	let removed = 0;
-	for (let hi = 0; hi < patch.hunks.length; hi++) {
-		if (hi > 0) {
-			const prev = patch.hunks[hi - 1];
-			const gap = patch.hunks[hi].oldStart - (prev.oldStart + prev.oldLines);
-			lines.push({ type: "sep", oldNum: null, newNum: gap > 0 ? gap : null, content: "" });
-		}
-		const hunk = patch.hunks[hi];
-		let oldLine = hunk.oldStart;
-		let newLine = hunk.newStart;
-		for (const raw of hunk.lines) {
-			if (raw === "\\ No newline at end of file") continue;
-			const ch = raw[0];
-			const text = raw.slice(1);
-			if (ch === "+") {
-				lines.push({ type: "add", oldNum: null, newNum: newLine++, content: text });
-				added++;
-			} else if (ch === "-") {
-				lines.push({ type: "del", oldNum: oldLine++, newNum: null, content: text });
-				removed++;
-			} else {
-				lines.push({ type: "ctx", oldNum: oldLine++, newNum: newLine++, content: text });
-			}
-		}
-	}
-	return { lines, added, removed, chars: oldContent.length + newContent.length };
-}
-
-function getCachedParsedDiff(ctx: any, key: string, oldContent: string, newContent: string): ParsedDiff {
-	if (ctx.state?._parsedDiffKey === key && ctx.state._parsedDiff) {
-		return ctx.state._parsedDiff as ParsedDiff;
-	}
-	const diff = parseDiff(oldContent, newContent);
-	if (ctx.state) {
-		ctx.state._parsedDiffKey = key;
-		ctx.state._parsedDiff = diff;
-	}
-	return diff;
-}
-
-function wordDiffAnalysis(
-	oldText: string,
-	newText: string,
-): { similarity: number; oldRanges: Array<[number, number]>; newRanges: Array<[number, number]> } {
-	if (!oldText && !newText) return { similarity: 1, oldRanges: [], newRanges: [] };
-	const parts = Diff.diffWords(oldText, newText);
-	const oldRanges: Array<[number, number]> = [];
-	const newRanges: Array<[number, number]> = [];
-	let oldPos = 0;
-	let newPos = 0;
-	let same = 0;
-	for (const part of parts) {
-		if (part.removed) {
-			oldRanges.push([oldPos, oldPos + part.value.length]);
-			oldPos += part.value.length;
-		} else if (part.added) {
-			newRanges.push([newPos, newPos + part.value.length]);
-			newPos += part.value.length;
-		} else {
-			const len = part.value.length;
-			same += len;
-			oldPos += len;
-			newPos += len;
-		}
-	}
-	const maxLen = Math.max(oldText.length, newText.length);
-	return { similarity: maxLen > 0 ? same / maxLen : 1, oldRanges, newRanges };
-}
-
-function injectBg(ansiLine: string, ranges: Array<[number, number]>, baseBg: string, hlBg: string): string {
-	if (!ranges.length) return baseBg + ansiLine + D_RST;
-	let out = baseBg;
-	let vis = 0;
-	let inHL = false;
-	let rangeIndex = 0;
-	let i = 0;
-	while (i < ansiLine.length) {
-		if (ansiLine[i] === "\x1b") {
-			const end = ansiLine.indexOf("m", i);
-			if (end !== -1) {
-				const seq = ansiLine.slice(i, end + 1);
-				out += seq;
-				if (seq === "\x1b[0m") out += inHL ? hlBg : baseBg;
-				i = end + 1;
-				continue;
-			}
-		}
-		while (rangeIndex < ranges.length && vis >= ranges[rangeIndex][1]) rangeIndex++;
-		const want = rangeIndex < ranges.length && vis >= ranges[rangeIndex][0] && vis < ranges[rangeIndex][1];
-		if (want !== inHL) {
-			inHL = want;
-			out += inHL ? hlBg : baseBg;
-		}
-		out += ansiLine[i];
-		vis++;
-		i++;
-	}
-	return out + D_RST;
-}
-
-function plainWordDiff(oldText: string, newText: string): { old: string; new: string } {
-	const parts = Diff.diffWords(oldText, newText);
-	let oldOut = "";
-	let newOut = "";
-	for (const part of parts) {
-		if (part.removed) oldOut += `${BG_DEL_W}${part.value}${D_RST}${BG_DEL}`;
-		else if (part.added) newOut += `${BG_ADD_W}${part.value}${D_RST}${BG_ADD}`;
-		else {
-			oldOut += part.value;
-			newOut += part.value;
-		}
-	}
-	return { old: oldOut, new: newOut };
-}
-
-async function renderUnified(
-	diff: ParsedDiff,
-	language: BundledLanguage | undefined,
-	state: DiffRenderState,
-	max = MAX_RENDER_LINES,
-	dc: DiffColors = DEFAULT_DIFF_COLORS,
-	width = termW(),
-): Promise<string> {
-	if (!diff.lines.length) return "";
-	const vis = diff.lines.slice(0, max);
-	const tw = width;
-	const nw = Math.max(2, String(maxLineNumber(vis)).length);
-	const gw = nw + 5;
-	const cw = Math.max(20, tw - gw);
-	const canHL = diff.chars <= MAX_HL_CHARS;
-
-	const oldSrc: string[] = [];
-	const newSrc: string[] = [];
-	for (const line of vis) {
-		if (line.type === "ctx" || line.type === "del") oldSrc.push(line.content);
-		if (line.type === "ctx" || line.type === "add") newSrc.push(line.content);
-	}
-	const [oldHL, newHL] = canHL
-		? await Promise.all([hlBlock(oldSrc.join("\n"), language), hlBlock(newSrc.join("\n"), language)])
-		: [oldSrc, newSrc];
-
-	let oldIndex = 0;
-	let newIndex = 0;
-	let index = 0;
-	const out: string[] = [diffRule(tw)];
-
-	function emitRow(num: number | null, sign: string, gutterBg: string, signFg: string, body: string, bodyBg = ""): void {
-		const borderFg = sign === "-" ? dc.fgDel : sign === "+" ? dc.fgAdd : "";
-		const border = borderFg ? `${borderFg}▌${D_RST}` : `${BG_BASE} `;
-		const numFg = borderFg || FG_LNUM;
-		const gutter = `${border}${gutterBg}${lnum(num, nw, numFg)}${signFg}${sign} ${D_RST}${DIVIDER} `;
-		const cont = `${border}${gutterBg}${" ".repeat(nw + 2)}${D_RST}${DIVIDER} `;
-		const rows = wrapAnsi(tabs(body), cw, adaptiveWrapRows(), bodyBg);
-		out.push(`${gutter}${rows[0]}${D_RST}`);
-		for (let r = 1; r < rows.length; r++) out.push(`${cont}${rows[r]}${D_RST}`);
-	}
-
-	while (index < vis.length) {
-		const line = vis[index];
-		if (line.type === "sep") {
-			const gap = line.newNum;
-			const label = gap && gap > 0 ? ` ${gap} unmodified lines ` : "···";
-			const totalW = Math.min(tw, 72);
-			const pad = Math.max(0, totalW - label.length - 2);
-			const half1 = Math.floor(pad / 2);
-			const half2 = pad - half1;
-			out.push(`${BG_BASE}${FG_DIM}${"─".repeat(half1)}${label}${"─".repeat(half2)}${D_RST}`);
-			index++;
-			continue;
-		}
-		if (line.type === "ctx") {
-			const hl = oldHL[oldIndex] ?? line.content;
-			emitRow(line.newNum, " ", BG_BASE, dc.fgCtx, `${BG_BASE}${D_DIM}${hl}`, BG_BASE);
-			oldIndex++;
-			newIndex++;
-			index++;
-			continue;
-		}
-
-		const dels: Array<{ l: DiffLine; hl: string }> = [];
-		while (index < vis.length && vis[index].type === "del") {
-			dels.push({ l: vis[index], hl: oldHL[oldIndex] ?? vis[index].content });
-			oldIndex++;
-			index++;
-		}
-		const adds: Array<{ l: DiffLine; hl: string }> = [];
-		while (index < vis.length && vis[index].type === "add") {
-			adds.push({ l: vis[index], hl: newHL[newIndex] ?? vis[index].content });
-			newIndex++;
-			index++;
-		}
-
-		const isPaired = dels.length === 1 && adds.length === 1;
-		const wd = isPaired ? wordDiffAnalysis(dels[0].l.content, adds[0].l.content) : null;
-		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && canHL) {
-			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, `${dc.fgDel}${D_BOLD}`, injectBg(dels[0].hl, wd.oldRanges, BG_DEL, BG_DEL_W), BG_DEL);
-			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, `${dc.fgAdd}${D_BOLD}`, injectBg(adds[0].hl, wd.newRanges, BG_ADD, BG_ADD_W), BG_ADD);
-			continue;
-		}
-		if (isPaired && wd && wd.similarity >= WORD_DIFF_MIN_SIM && !canHL) {
-			const pwd = plainWordDiff(dels[0].l.content, adds[0].l.content);
-			emitRow(dels[0].l.oldNum, "-", BG_GUTTER_DEL, `${dc.fgDel}${D_BOLD}`, `${BG_DEL}${pwd.old}`, BG_DEL);
-			emitRow(adds[0].l.newNum, "+", BG_GUTTER_ADD, `${dc.fgAdd}${D_BOLD}`, `${BG_ADD}${pwd.new}`, BG_ADD);
-			continue;
-		}
-		for (const d of dels) emitRow(d.l.oldNum, "-", BG_GUTTER_DEL, `${dc.fgDel}${D_BOLD}`, `${BG_DEL}${canHL ? d.hl : d.l.content}`, BG_DEL);
-		for (const a of adds) emitRow(a.l.newNum, "+", BG_GUTTER_ADD, `${dc.fgAdd}${D_BOLD}`, `${BG_ADD}${canHL ? a.hl : a.l.content}`, BG_ADD);
-	}
-
-	out.push(diffRule(tw));
-	if (diff.lines.length > vis.length) out.push(`${BG_BASE}${FG_DIM}${collapsedDiffHint(diff.lines.length - vis.length, 0, state)}${D_RST}`);
-	return out.join("\n");
-}
-
-async function renderSplit(
-	diff: ParsedDiff,
-	language: BundledLanguage | undefined,
-	state: DiffRenderState,
-	max = MAX_PREVIEW_LINES,
-	dc: DiffColors = DEFAULT_DIFF_COLORS,
-	width = termW(),
-): Promise<string> {
-	const tw = width;
-	if (!shouldUseSplit(diff, tw, max)) return renderUnified(diff, language, state, max, dc, width);
-	if (!diff.lines.length) return "";
-
-	type Row = { left: DiffLine | null; right: DiffLine | null };
-	const rows: Row[] = [];
-	let i = 0;
-	while (i < diff.lines.length) {
-		const line = diff.lines[i];
-		if (line.type === "sep" || line.type === "ctx") {
-			rows.push({ left: line, right: line });
-			i++;
-			continue;
-		}
-		const dels: DiffLine[] = [];
-		const adds: DiffLine[] = [];
-		while (i < diff.lines.length && diff.lines[i].type === "del") dels.push(diff.lines[i++]);
-		while (i < diff.lines.length && diff.lines[i].type === "add") adds.push(diff.lines[i++]);
-		const n = Math.max(dels.length, adds.length);
-		for (let j = 0; j < n; j++) rows.push({ left: dels[j] ?? null, right: adds[j] ?? null });
-	}
-
-	const vis = rows.slice(0, max);
-	const half = Math.floor((tw - 1) / 2);
-	const nw = Math.max(2, String(maxLineNumber(diff.lines)).length);
-	const gw = nw + 5;
-	const cw = Math.max(12, half - gw);
-	const canHL = diff.chars <= MAX_HL_CHARS;
-
-	const leftSrc: string[] = [];
-	const rightSrc: string[] = [];
-	for (const row of vis) {
-		if (row.left && row.left.type !== "sep") leftSrc.push(row.left.content);
-		if (row.right && row.right.type !== "sep") rightSrc.push(row.right.content);
-	}
-	const [leftHL, rightHL] = canHL
-		? await Promise.all([hlBlock(leftSrc.join("\n"), language), hlBlock(rightSrc.join("\n"), language)])
-		: [leftSrc, rightSrc];
-
-	let leftIndex = 0;
-	let rightIndex = 0;
-
-	type HalfResult = { gutter: string; contGutter: string; bodyRows: string[] };
-	function halfBuild(
-		line: DiffLine | null,
-		hl: string,
-		ranges: Array<[number, number]> | null,
-		side: "left" | "right",
-	): HalfResult {
-		if (!line) {
-			const gPat = FG_STRIPE + "╱".repeat(nw + 2) + D_RST;
-			const gutter = ` ${gPat}${FG_RULE}│${D_RST} `;
-			return { gutter, contGutter: gutter, bodyRows: [stripes(cw)] };
-		}
-		if (line.type === "sep") {
-			const gap = line.newNum;
-			const label = gap && gap > 0 ? `··· ${gap} lines ···` : "···";
-			const gutter = `${BG_BASE} ${FG_DIM}${fit("", nw + 2)}${D_RST}${FG_RULE}│${D_RST} `;
-			return { gutter, contGutter: gutter, bodyRows: [`${BG_BASE}${FG_DIM}${fit(label, cw)}${D_RST}`] };
-		}
-		const isDel = line.type === "del";
-		const isAdd = line.type === "add";
-		const gBg = isDel ? BG_GUTTER_DEL : isAdd ? BG_GUTTER_ADD : BG_BASE;
-		const cBg = isDel ? BG_DEL : isAdd ? BG_ADD : BG_BASE;
-		const sFg = isDel ? dc.fgDel : isAdd ? dc.fgAdd : dc.fgCtx;
-		const sign = isDel ? "-" : isAdd ? "+" : " ";
-		const num = isDel ? line.oldNum : isAdd ? line.newNum : side === "left" ? line.oldNum : line.newNum;
-		const borderFg = isDel ? dc.fgDel : isAdd ? dc.fgAdd : "";
-		const border = borderFg ? `${borderFg}▌${D_RST}` : ` ${BG_BASE}`;
-		const numFg = borderFg || FG_LNUM;
-		let body: string;
-		if (ranges && ranges.length > 0) body = injectBg(hl, ranges, cBg, isDel ? BG_DEL_W : BG_ADD_W);
-		else if (isDel || isAdd) body = `${cBg}${hl}`;
-		else body = `${BG_BASE}${D_DIM}${hl}`;
-		const gutter = `${border}${gBg}${lnum(num, nw, numFg)}${sFg}${D_BOLD}${sign} ${D_RST}${FG_RULE}│${D_RST} `;
-		const contGutter = `${border}${gBg}${" ".repeat(nw + 2)}${D_RST}${FG_RULE}│${D_RST} `;
-		return { gutter, contGutter, bodyRows: wrapAnsi(tabs(body), cw, adaptiveWrapRows(), cBg) };
-	}
-
-	const out: string[] = [];
-	const hdrOld = `${BG_BASE}${" ".repeat(Math.max(0, nw - 2))}${dc.fgDel}${D_DIM}old${D_RST}`;
-	const hdrNew = `${BG_BASE}${" ".repeat(Math.max(0, nw - 2))}${dc.fgAdd}${D_DIM}new${D_RST}`;
-	out.push(`${BG_BASE}${hdrOld}${" ".repeat(Math.max(0, half - nw - 1))}${FG_RULE}┊${D_RST}${hdrNew}`);
-	out.push(`${diffRule(half)}${FG_RULE}┊${D_RST}${diffRule(half)}`);
-
-	for (const row of vis) {
-		const leftLine = row.left;
-		const rightLine = row.right;
-		const paired = Boolean(leftLine && rightLine && leftLine.type === "del" && rightLine.type === "add");
-		const wd = paired && leftLine && rightLine ? wordDiffAnalysis(leftLine.content, rightLine.content) : null;
-		let leftResult: HalfResult;
-		let rightResult: HalfResult;
-		if (paired && wd && leftLine && rightLine && wd.similarity >= WORD_DIFF_MIN_SIM && canHL) {
-			leftResult = halfBuild(leftLine, leftHL[leftIndex++] ?? leftLine.content, wd.oldRanges, "left");
-			rightResult = halfBuild(rightLine, rightHL[rightIndex++] ?? rightLine.content, wd.newRanges, "right");
-		} else if (paired && wd && leftLine && rightLine && wd.similarity >= WORD_DIFF_MIN_SIM && !canHL) {
-			const pwd = plainWordDiff(leftLine.content, rightLine.content);
-			leftIndex++;
-			rightIndex++;
-			leftResult = halfBuild(leftLine, pwd.old, null, "left");
-			rightResult = halfBuild(rightLine, pwd.new, null, "right");
-		} else {
-			leftResult = halfBuild(
-				row.left,
-				row.left && row.left.type !== "sep" ? (leftHL[leftIndex++] ?? row.left.content) : "",
-				null,
-				"left",
-			);
-			rightResult = halfBuild(
-				row.right,
-				row.right && row.right.type !== "sep" ? (rightHL[rightIndex++] ?? row.right.content) : "",
-				null,
-				"right",
-			);
-		}
-		const maxRows = Math.max(leftResult.bodyRows.length, rightResult.bodyRows.length);
-		for (let rowIndex = 0; rowIndex < maxRows; rowIndex++) {
-			const lg = rowIndex === 0 ? leftResult.gutter : leftResult.contGutter;
-			const rg = rowIndex === 0 ? rightResult.gutter : rightResult.contGutter;
-			const lb = leftResult.bodyRows[rowIndex] ?? (!row.left ? stripes(cw) : `${BG_EMPTY}${" ".repeat(cw)}${D_RST}`);
-			const rb = rightResult.bodyRows[rowIndex] ?? (!row.right ? stripes(cw) : `${BG_EMPTY}${" ".repeat(cw)}${D_RST}`);
-			out.push(`${lg}${lb}${DIVIDER}${rg}${rb}`);
-		}
-	}
-
-	out.push(`${diffRule(half)}${FG_RULE}┊${D_RST}${diffRule(half)}`);
-	if (rows.length > vis.length) out.push(`${BG_BASE}${FG_DIM}${collapsedDiffHint(rows.length - vis.length, 0, state)}${D_RST}`);
-	return out.join("\n");
-}
-
 function getEditOperations(input: any): Array<{ oldText: string; newText: string }> {
 	if (Array.isArray(input?.edits)) {
 		return input.edits
@@ -6772,296 +5546,6 @@ function getEditOperations(input: any): Array<{ oldText: string; newText: string
 	const oldText = typeof input?.oldText === "string" ? input.oldText : typeof input?.old_text === "string" ? input.old_text : "";
 	const newText = typeof input?.newText === "string" ? input.newText : typeof input?.new_text === "string" ? input.new_text : "";
 	return oldText && oldText !== newText ? [{ oldText, newText }] : [];
-}
-
-function summarizeEditOperations(operations: Array<{ oldText: string; newText: string }>) {
-	const diffs = operations.map((edit) => parseDiff(edit.oldText, edit.newText));
-	const totalAdded = diffs.reduce((sum, diff) => sum + diff.added, 0);
-	const totalRemoved = diffs.reduce((sum, diff) => sum + diff.removed, 0);
-	const totalLines = diffs.reduce((sum, diff) => sum + diff.lines.length, 0);
-	const totalHunks = diffs.reduce((sum, diff) => sum + diff.lines.filter((l) => l.type === "sep").length + (diff.lines.length ? 1 : 0), 0);
-	return { diffs, totalAdded, totalRemoved, totalLines, totalHunks, summary: summarizeDiff(totalAdded, totalRemoved) };
-}
-
-type EditOperationSummary = ReturnType<typeof summarizeEditOperations>;
-
-function getCachedEditOperationSummary(ctx: any, key: string, operations: Array<{ oldText: string; newText: string }>): EditOperationSummary {
-	if (ctx.state?._editSummaryKey === key && ctx.state._editSummary) {
-		return ctx.state._editSummary as EditOperationSummary;
-	}
-	const summary = summarizeEditOperations(operations);
-	if (ctx.state) {
-		ctx.state._editSummaryKey = key;
-		ctx.state._editSummary = summary;
-	}
-	return summary;
-}
-
-function normalizeToLf(text: string): string {
-	return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-}
-
-function stripBomText(text: string): string {
-	return text.startsWith("\uFEFF") ? text.slice(1) : text;
-}
-
-function normalizeTextForFuzzyMatch(text: string): string {
-	return text
-		.normalize("NFKC")
-		.split("\n")
-		.map((line) => line.trimEnd())
-		.join("\n")
-		.replace(/[\u2018\u2019\u201A\u201B]/g, "'")
-		.replace(/[\u201C\u201D\u201E\u201F]/g, '"')
-		.replace(/[\u2010\u2011\u2012\u2013\u2014\u2015\u2212]/g, "-")
-		.replace(/[\u00A0\u2002-\u200A\u202F\u205F\u3000]/g, " ");
-}
-
-function findEditMatch(content: string, oldText: string): { found: boolean; index: number; matchLength: number; usedFuzzyMatch: boolean } {
-	const exactIndex = content.indexOf(oldText);
-	if (exactIndex !== -1) return { found: true, index: exactIndex, matchLength: oldText.length, usedFuzzyMatch: false };
-	const fuzzyContent = normalizeTextForFuzzyMatch(content);
-	const fuzzyOldText = normalizeTextForFuzzyMatch(oldText);
-	const fuzzyIndex = fuzzyContent.indexOf(fuzzyOldText);
-	return fuzzyIndex === -1
-		? { found: false, index: -1, matchLength: 0, usedFuzzyMatch: false }
-		: { found: true, index: fuzzyIndex, matchLength: fuzzyOldText.length, usedFuzzyMatch: true };
-}
-
-function countFuzzyOccurrences(content: string, oldText: string): number {
-	const fuzzyContent = normalizeTextForFuzzyMatch(content);
-	const fuzzyOldText = normalizeTextForFuzzyMatch(oldText);
-	return fuzzyContent.split(fuzzyOldText).length - 1;
-}
-
-function lineNumberAtIndex(text: string, index: number): number {
-	return text.slice(0, Math.max(0, index)).split("\n").length;
-}
-
-function countLineBreaks(text: string): number {
-	return (text.match(/\n/g) ?? []).length;
-}
-
-function offsetParsedDiff(diff: ParsedDiff, oldOffset: number, newOffset = oldOffset): ParsedDiff {
-	return {
-		...diff,
-		lines: diff.lines.map((line) =>
-			line.type === "sep"
-				? line
-				: {
-					...line,
-					oldNum: line.oldNum === null ? null : line.oldNum + oldOffset,
-					newNum: line.newNum === null ? null : line.newNum + newOffset,
-				},
-		),
-	};
-}
-
-function getFirstChangedNewLine(diff: ParsedDiff): number {
-	let currentNewLine = 0;
-	for (let i = 0; i < diff.lines.length; i++) {
-		const line = diff.lines[i];
-		if (line.type === "sep") {
-			currentNewLine = 0;
-			continue;
-		}
-		if (line.type === "ctx") {
-			currentNewLine = (line.newNum ?? currentNewLine) + 1;
-			continue;
-		}
-		if (line.type === "add") return line.newNum ?? currentNewLine;
-		if (currentNewLine > 0) return currentNewLine;
-		const next = diff.lines.slice(i + 1).find((entry) => entry.type !== "sep" && entry.newNum !== null);
-		if (next && next.newNum !== null) return next.newNum;
-		return line.oldNum ?? 0;
-	}
-	return 0;
-}
-
-interface LocalizedEditDiff {
-	diff: ParsedDiff;
-	line: number;
-}
-
-interface LocalizedEditDiffCache {
-	sourceKey: string;
-	localizedDiffs: LocalizedEditDiff[];
-}
-
-async function computeLocalizedEditDiffs(filePath: string, operations: Array<{ oldText: string; newText: string }>, cwd: string): Promise<LocalizedEditDiff[] | null> {
-	if (!filePath || operations.length === 0) return null;
-	try {
-		const rawContent = await readFileAsync(resolve(cwd, filePath), "utf8");
-		const normalizedContent = normalizeToLf(stripBomText(rawContent));
-		const normalizedOps = operations.map((edit) => ({ oldText: normalizeToLf(edit.oldText), newText: normalizeToLf(edit.newText) }));
-		const localize = (state: "before" | "after"): LocalizedEditDiff[] | null => {
-			const chunks = normalizedOps.map((edit) => state === "before" ? edit.oldText : edit.newText);
-			if (chunks.some((chunk) => chunk.length === 0)) return null;
-			const baseContent = chunks.some((chunk) => findEditMatch(normalizedContent, chunk).usedFuzzyMatch)
-				? normalizeTextForFuzzyMatch(normalizedContent)
-				: normalizedContent;
-			const matches = chunks.map((chunk, editIndex) => {
-				const match = findEditMatch(baseContent, chunk);
-				if (!match.found || countFuzzyOccurrences(baseContent, chunk) !== 1) return null;
-				return { editIndex, matchIndex: match.index, matchLength: match.matchLength };
-			});
-			if (matches.some((match) => match === null)) return null;
-			const ordered = [...(matches as Array<{ editIndex: number; matchIndex: number; matchLength: number }>)].sort((a, b) => a.matchIndex - b.matchIndex);
-			for (let i = 1; i < ordered.length; i++) {
-				const prev = ordered[i - 1];
-				const current = ordered[i];
-				if (prev.matchIndex + prev.matchLength > current.matchIndex) return null;
-			}
-			const localized: Array<LocalizedEditDiff | null> = Array(operations.length).fill(null);
-			let lineDelta = 0;
-			for (const match of ordered) {
-				const operation = normalizedOps[match.editIndex];
-				const matchedChunk = baseContent.slice(match.matchIndex, match.matchIndex + match.matchLength);
-				const oldChunk = state === "before" ? matchedChunk : operation.oldText;
-				const newChunk = state === "before" ? operation.newText : matchedChunk;
-				const matchedStartLine = lineNumberAtIndex(baseContent, match.matchIndex);
-				const oldStartLine = state === "before" ? matchedStartLine : matchedStartLine - lineDelta;
-				const newStartLine = state === "before" ? matchedStartLine + lineDelta : matchedStartLine;
-				const diff = offsetParsedDiff(parseDiff(oldChunk, newChunk), oldStartLine - 1, newStartLine - 1);
-				localized[match.editIndex] = { diff, line: getFirstChangedNewLine(diff) };
-				lineDelta += countLineBreaks(newChunk) - countLineBreaks(oldChunk);
-			}
-			return localized.every(Boolean) ? (localized as LocalizedEditDiff[]) : null;
-		};
-		const before = localize("before");
-		const after = localize("after");
-		if (!before) return after;
-		if (!after) return before;
-		const beforeMatchLength = normalizedOps.reduce((total, edit) => total + edit.oldText.length, 0);
-		const afterMatchLength = normalizedOps.reduce((total, edit) => total + edit.newText.length, 0);
-		return afterMatchLength > beforeMatchLength ? after : before;
-	} catch {
-		return null;
-	}
-}
-
-async function getCachedLocalizedEditDiffs(
-	ctx: any,
-	sourceKey: string,
-	filePath: string,
-	operations: Array<{ oldText: string; newText: string }>,
-	cwd: string,
-): Promise<LocalizedEditDiff[] | null> {
-	const cached = ctx.state?._ptLocalizedDiffCache as LocalizedEditDiffCache | undefined;
-	if (cached?.sourceKey === sourceKey) return cached.localizedDiffs;
-	const localizedDiffs = await computeLocalizedEditDiffs(filePath, operations, cwd);
-	if (localizedDiffs && ctx.state) {
-		ctx.state._ptLocalizedDiffCache = { sourceKey, localizedDiffs } satisfies LocalizedEditDiffCache;
-	}
-	return localizedDiffs;
-}
-
-function renderEditPreviewBody(
-	ctx: any,
-	key: string,
-	theme: Theme,
-	language: BundledLanguage | undefined,
-	operations: Array<{ oldText: string; newText: string }>,
-	diffs: ParsedDiff[],
-	lines: number[],
-	localDetailLevel: ToolClickDetailLevel,
-	totalBudget: number,
-	localClickControls: boolean,
-	pendingViewport?: ToolCollapseViewportSettlement,
-): void {
-	const dc = resolveDiffColors(theme);
-	const branchWidth = contextDiffWidth(ctx, 3);
-	const totalAdded = diffs.reduce((sum, diff) => sum + diff.added, 0);
-	const totalRemoved = diffs.reduce((sum, diff) => sum + diff.removed, 0);
-	const totalHunks = diffs.reduce((sum, diff) => sum + countDiffHunks(diff), 0);
-	const totalLines = diffs.reduce((sum, diff) => sum + diff.lines.length, 0);
-	const commitTree = (tree: DiffOutputTree): void => {
-		ctx.state._ptTree = tree;
-		ctx.state._ptBody = [
-			tree.summary,
-			...tree.blocks.flatMap((block) => [block.heading ?? "", block.content]),
-			tree.terminalAction ?? "",
-		].filter(Boolean).join("\n");
-		ctx.state._ptDisplay = renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme);
-	};
-	if (operations.length === 1) {
-		const [diff] = diffs;
-		const line = lines[0] ?? getFirstChangedNewLine(diff);
-		const hasHiddenCollapsedContent = !diffFitsRenderLimit(diff, branchWidth, 32);
-		const summary = `${diffSummaryWithMeta(diff.added, diff.removed, countDiffHunks(diff), "")}${formatLineMeta(line, theme)}`;
-		const resultSummary = hasHiddenCollapsedContent ? markResultSummary(summary) : summary;
-		const previewLines = ctx.expanded ? totalBudget : 32;
-		const finalCollapse = localClickControls
-			&& hasHiddenCollapsedContent
-			&& ctx.expanded
-			&& (localDetailLevel >= 2 || diffFitsRenderLimit(diff, branchWidth, previewLines));
-		ctx.state._ptFinalCollapse = finalCollapse;
-		renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
-			.then((rendered) => {
-				if (ctx.state._pk !== key) return;
-				commitTree({
-					summary: resultSummary,
-					blocks: [{ content: rendered }],
-					terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
-				});
-				ctx.state._ptAsyncRenderPending = false;
-				safeInvalidate(ctx, pendingViewport);
-			})
-			.catch(() => {
-				if (ctx.state._pk !== key) return;
-				commitTree({
-					summary: resultSummary,
-					blocks: [],
-					terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
-				});
-				ctx.state._ptAsyncRenderPending = false;
-				safeInvalidate(ctx, pendingViewport);
-			});
-		return;
-	}
-	const collapsedMaxShown = Math.min(operations.length, 3);
-	const collapsedPreviewLines = Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, collapsedMaxShown)));
-	const hasHiddenCollapsedContent = collapsedMaxShown < operations.length
-		|| diffs.slice(0, collapsedMaxShown).some((diff) => !diffFitsRenderLimit(diff, branchWidth, collapsedPreviewLines));
-	const aggregateSummary = `${operations.length} edits ${diffSummaryWithMeta(totalAdded, totalRemoved, totalHunks, "")}${totalLines ? ` ${theme.fg("muted", `(${totalLines} diff lines)`)}` : ""}`;
-	const resultSummary = hasHiddenCollapsedContent ? markResultSummary(aggregateSummary) : aggregateSummary;
-	const maxShown = ctx.expanded ? operations.length : collapsedMaxShown;
-	const previewLines = ctx.expanded
-		? Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
-		: collapsedPreviewLines;
-	const finalCollapse = localClickControls
-		&& hasHiddenCollapsedContent
-		&& ctx.expanded
-		&& (localDetailLevel >= 2
-			|| (maxShown === operations.length && diffs.every((diff) => diffFitsRenderLimit(diff, branchWidth, previewLines))));
-	ctx.state._ptFinalCollapse = finalCollapse;
-	mapWithConcurrency(diffs.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (diff, index) => {
-		const line = lines[index] ?? getFirstChangedNewLine(diff);
-		const heading = `Edit ${index + 1}/${operations.length}${formatLineMeta(line, theme)}`;
-		return renderSplit(diff, language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, branchWidth)
-			.then((rendered) => ({ heading, content: rendered }))
-			.catch(() => ({ heading: `${heading} ${summarizeDiff(diff.added, diff.removed)}`, content: "" }));
-	})
-		.then((blocks) => {
-			if (ctx.state._pk !== key) return;
-			const remainder = operations.length - maxShown;
-			const terminalAction = remainder > 0
-				? `${theme.fg("muted", `… ${remainder} more edit block${remainder === 1 ? "" : "s"}`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
-				: finalCollapse ? localCollapseActionHint(theme) : undefined;
-			commitTree({ summary: resultSummary, blocks, terminalAction });
-			ctx.state._ptAsyncRenderPending = false;
-			safeInvalidate(ctx, pendingViewport);
-		})
-		.catch(() => {
-			if (ctx.state._pk !== key) return;
-			commitTree({
-				summary: resultSummary,
-				blocks: [],
-				terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
-			});
-			ctx.state._ptAsyncRenderPending = false;
-			safeInvalidate(ctx, pendingViewport);
-		});
 }
 
 function stripThinkingPresentationArtifacts(text: string): string {
@@ -7544,445 +6028,20 @@ function getStringArrayArg(args: any, ...keys: string[]): string[] {
 	return [];
 }
 
-function extractApplyPatchFiles(patchText: string): string[] {
-	if (!patchText) return [];
-	const files = new Set<string>();
-	for (const match of patchText.matchAll(/^\*\*\* (?:Add|Update|Delete) File: (.+)$/gm)) {
-		const filePath = match[1]?.trim();
-		if (filePath) files.add(filePath);
-	}
-	return [...files];
-}
-
-interface ApplyPatchChangePreview {
-	kind: "add" | "update" | "delete";
-	path: string;
-	displayPath: string;
-	moveTo?: string;
-	diff: ParsedDiff;
-	language: BundledLanguage | undefined;
-	hunks: number;
-	summary: string;
-	line: number;
-}
-
-interface ApplyPatchPreview {
-	changes: ApplyPatchChangePreview[];
-	totalAdded: number;
-	totalRemoved: number;
-	totalHunks: number;
-	totalLines: number;
-	summary: string;
-}
-
-interface ApplyPatchResultMeta {
-	changeCount: number;
-	totalAdded: number;
-	totalRemoved: number;
-	totalHunks: number;
-	totalLines: number;
-	firstChange?: {
-		displayPath: string;
-		kind: ApplyPatchChangePreview["kind"];
-		hunks: number;
-		line: number;
-		added: number;
-		removed: number;
-	};
-}
-
-function buildApplyPatchResultMeta(preview: ApplyPatchPreview): ApplyPatchResultMeta {
-	const firstChange = preview.changes[0];
-	return {
-		changeCount: preview.changes.length,
-		totalAdded: preview.totalAdded,
-		totalRemoved: preview.totalRemoved,
-		totalHunks: preview.totalHunks,
-		totalLines: preview.totalLines,
-		firstChange: firstChange
-			? {
-				displayPath: firstChange.displayPath,
-				kind: firstChange.kind,
-				hunks: firstChange.hunks,
-				line: firstChange.line,
-				added: firstChange.diff.added,
-				removed: firstChange.diff.removed,
-			}
-			: undefined,
-	};
-}
-
-function countDiffHunks(diff: ParsedDiff): number {
-	return diff.lines.length === 0 ? 0 : diff.lines.filter((line) => line.type === "sep").length + 1;
-}
-
-function getApplyPatchLine(diff: ParsedDiff, kind: ApplyPatchChangePreview["kind"]): number {
-	if (kind === "add") {
-		return diff.lines.find((line) => line.type === "add" && line.newNum !== null)?.newNum ?? 1;
-	}
-	if (kind === "delete") {
-		return diff.lines.find((line) => line.type === "del" && line.oldNum !== null)?.oldNum ?? 1;
-	}
-	for (const line of diff.lines) {
-		if (line.type === "add" && line.newNum !== null) return line.newNum;
-		if (line.type === "del" && line.oldNum !== null) return line.oldNum;
-	}
-	return 0;
-}
-
-function parsePatchBodyLine(rawLine: string): { marker: "+" | "-" | " "; content: string } {
-	const marker = rawLine[0];
-	if (marker === "+" || marker === "-" || marker === " ") return { marker, content: rawLine.slice(1) };
-	return { marker: " ", content: rawLine };
-}
-
-function findLineSequence(haystack: string[], needle: string[], fromIndex = 0): number {
-	if (needle.length === 0) return Math.max(0, fromIndex);
-	outer: for (let i = Math.max(0, fromIndex); i <= haystack.length - needle.length; i++) {
-		for (let j = 0; j < needle.length; j++) {
-			if (haystack[i + j] !== needle[j]) continue outer;
-		}
-		return i;
-	}
-	return -1;
-}
-
-function inferApplyPatchHunkStarts(lines: string[], sourceContent: string): Array<{ oldStart: number | null; newStart: number | null }> {
-	const sourceLines = normalizeToLf(sourceContent).split("\n");
-	const hunks: string[][] = [];
-	let currentHunk: string[] | null = null;
-	for (const rawLine of lines) {
-		if (rawLine.startsWith("*** Move to: ")) continue;
-		if (rawLine.startsWith("@@")) {
-			if (currentHunk) hunks.push(currentHunk);
-			currentHunk = [];
-			continue;
-		}
-		if (!currentHunk) currentHunk = [];
-		currentHunk.push(rawLine);
-	}
-	if (currentHunk) hunks.push(currentHunk);
-
-	const starts: Array<{ oldStart: number | null; newStart: number | null }> = [];
-	let searchFrom = 0;
-	let lineDelta = 0;
-	for (const hunk of hunks) {
-		const oldLines = hunk
-			.map((rawLine) => parsePatchBodyLine(rawLine))
-			.filter((line) => line.marker !== "+")
-			.map((line) => line.content);
-		let matchIndex = findLineSequence(sourceLines, oldLines, searchFrom);
-		if (matchIndex === -1) matchIndex = findLineSequence(sourceLines, oldLines, 0);
-		const oldStart = matchIndex === -1 ? null : matchIndex + 1;
-		const newStart = oldStart === null ? null : oldStart + lineDelta;
-		starts.push({ oldStart, newStart });
-		if (matchIndex === -1) continue;
-		searchFrom = matchIndex + oldLines.length;
-		const added = hunk.filter((rawLine) => parsePatchBodyLine(rawLine).marker === "+").length;
-		const removed = hunk.filter((rawLine) => parsePatchBodyLine(rawLine).marker === "-").length;
-		lineDelta += added - removed;
-	}
-	return starts;
-}
-
-function stripPatchLinePrefix(line: string, prefix: "+" | "-"): string {
-	return line.startsWith(prefix) ? line.slice(1) : line;
-}
-
-function trimDiffSeparators(lines: DiffLine[]): DiffLine[] {
-	const trimmed = [...lines];
-	while (trimmed[0]?.type === "sep") trimmed.shift();
-	while (trimmed[trimmed.length - 1]?.type === "sep") trimmed.pop();
-	return trimmed;
-}
-
-function parseApplyPatchUpdateDiff(lines: string[], sourceContent?: string): ParsedDiff {
-	const diffLines: DiffLine[] = [];
-	let added = 0;
-	let removed = 0;
-	let chars = 0;
-	let oldLine: number | null = null;
-	let newLine: number | null = null;
-	let inHunk = false;
-	const inferredStarts = sourceContent ? inferApplyPatchHunkStarts(lines, sourceContent) : [];
-	let hunkIndex = 0;
-
-	for (const rawLine of lines) {
-		if (rawLine.startsWith("*** Move to: ")) continue;
-		if (rawLine.startsWith("@@")) {
-			if (diffLines.length > 0 && diffLines[diffLines.length - 1]?.type !== "sep") {
-				diffLines.push({ type: "sep", oldNum: null, newNum: null, content: "" });
-			}
-			const match = rawLine.match(/^@@\s*-(\d+)(?:,\d+)?\s+\+(\d+)(?:,\d+)?\s*@@/);
-			const inferred = inferredStarts[hunkIndex] ?? { oldStart: null, newStart: null };
-			oldLine = match ? Number.parseInt(match[1], 10) : inferred.oldStart;
-			newLine = match ? Number.parseInt(match[2], 10) : inferred.newStart;
-			hunkIndex++;
-			inHunk = true;
-			continue;
-		}
-		if (rawLine === "\\ No newline at end of file") continue;
-		if (!inHunk) {
-			const inferred = inferredStarts[hunkIndex] ?? { oldStart: null, newStart: null };
-			oldLine = inferred.oldStart;
-			newLine = inferred.newStart;
-			hunkIndex++;
-			inHunk = true;
-		}
-
-		const { marker, content } = parsePatchBodyLine(rawLine);
-
-		chars += content.length;
-		if (marker === "+") {
-			diffLines.push({ type: "add", oldNum: null, newNum: newLine, content });
-			added++;
-			if (newLine !== null) newLine++;
-			continue;
-		}
-		if (marker === "-") {
-			diffLines.push({ type: "del", oldNum: oldLine, newNum: null, content });
-			removed++;
-			if (oldLine !== null) oldLine++;
-			continue;
-		}
-		diffLines.push({ type: "ctx", oldNum: oldLine, newNum: newLine, content });
-		if (oldLine !== null) oldLine++;
-		if (newLine !== null) newLine++;
-	}
-
-	return {
-		lines: trimDiffSeparators(diffLines),
-		added,
-		removed,
-		chars,
-	};
-}
-
-function parseApplyPatchPreview(patchText: string, sp: (path: string) => string, cwd = process.cwd()): ApplyPatchPreview {
-	const normalized = patchText.replace(/\r\n/g, "\n");
-	const lines = normalized.split("\n");
-	const changes: ApplyPatchChangePreview[] = [];
-	let index = 0;
-
-	const fileHeader = /^\*\*\* (Add|Update|Delete) File: (.+)$/;
-	const endHeader = /^\*\*\* End Patch$/;
-
-	while (index < lines.length) {
-		const line = lines[index];
-		if (!line || line === "*** Begin Patch") {
-			index++;
-			continue;
-		}
-		if (endHeader.test(line)) break;
-		const header = line.match(fileHeader);
-		if (!header) {
-			index++;
-			continue;
-		}
-
-		const kind = header[1].toLowerCase() as ApplyPatchChangePreview["kind"];
-		const path = header[2].trim();
-		index++;
-
-		let moveTo: string | undefined;
-		const body: string[] = [];
-		while (index < lines.length && !fileHeader.test(lines[index]) && !endHeader.test(lines[index])) {
-			if (lines[index].startsWith("*** Move to: ")) {
-				moveTo = lines[index].slice("*** Move to: ".length).trim();
-				index++;
-				continue;
-			}
-			body.push(lines[index]);
-			index++;
-		}
-
-		const displayPath = moveTo ? `${sp(path)} ${BORDER_COLOR}→${TRANSPARENT_RESET} ${sp(moveTo)}` : sp(path);
-		let sourceContent: string | undefined;
-		if (kind === "update") {
-			try {
-				sourceContent = readFileSync(resolve(cwd, path), "utf8");
-			} catch {
-				sourceContent = undefined;
-			}
-		}
-		const diff = kind === "add"
-			? parseDiff("", body.map((entry) => stripPatchLinePrefix(entry, "+")).join("\n"))
-			: kind === "delete"
-				? parseDiff(body.map((entry) => stripPatchLinePrefix(entry, "-")).join("\n"), "")
-				: parseApplyPatchUpdateDiff(body, sourceContent);
-		changes.push({
-			kind,
-			path,
-			displayPath,
-			moveTo,
-			diff,
-			language: lang(moveTo || path),
-			hunks: countDiffHunks(diff),
-			summary: summarizeDiff(diff.added, diff.removed),
-			line: getApplyPatchLine(diff, kind),
-		});
-	}
-
-	const totalAdded = changes.reduce((sum, change) => sum + change.diff.added, 0);
-	const totalRemoved = changes.reduce((sum, change) => sum + change.diff.removed, 0);
-	const totalHunks = changes.reduce((sum, change) => sum + change.hunks, 0);
-	const totalLines = changes.reduce((sum, change) => sum + change.diff.lines.length, 0);
-	return {
-		changes,
-		totalAdded,
-		totalRemoved,
-		totalHunks,
-		totalLines,
-		summary: summarizeDiff(totalAdded, totalRemoved),
-	};
-}
-
-function describeApplyPatchChange(change: ApplyPatchChangePreview): string {
-	if (change.moveTo) return `Rename ${change.displayPath}`;
-	if (change.kind === "add") return `Create ${change.displayPath}`;
-	if (change.kind === "delete") return `Delete ${change.displayPath}`;
-	return `Update ${change.displayPath}`;
-}
-
-function formatLineMeta(line: number, theme: Theme): string {
-	return line > 0 ? ` ${theme.fg("muted", `at line ${line}`)}` : "";
-}
-
-function formatApplyPatchLine(change: ApplyPatchChangePreview, theme: Theme): string {
-	return formatLineMeta(change.line, theme);
-}
-
-function getCachedApplyPatchPreview(patchText: string, sp: (path: string) => string, ctx: any): ApplyPatchPreview | null {
-	if (!patchText) return null;
-	const key = `apply-meta:${ctx.cwd ?? process.cwd()}:${hashText(patchText)}`;
-	if (ctx.state?._applyPatchMetaKey === key && ctx.state._applyPatchPreview) {
-		return ctx.state._applyPatchPreview as ApplyPatchPreview;
-	}
-	try {
-		const preview = parseApplyPatchPreview(patchText, sp, ctx.cwd ?? process.cwd());
-		if (ctx.state) {
-			ctx.state._applyPatchMetaKey = key;
-			ctx.state._applyPatchPreview = preview;
-			ctx.state._applyPatchMeta = buildApplyPatchResultMeta(preview);
-		}
-		return preview;
-	} catch {
-		return null;
-	}
-}
-
-function getApplyPatchResultMeta(args: any, ctx: any, sp: (path: string) => string): ApplyPatchResultMeta | null {
-	const patchText = getStringArg(args ?? ctx?.args, "patchText", "patch_text");
-	if (!patchText) return null;
-	const preview = getCachedApplyPatchPreview(patchText, sp, ctx);
-	return preview && ctx.state?._applyPatchMeta ? (ctx.state._applyPatchMeta as ApplyPatchResultMeta) : null;
-}
-
-function renderApplyPatchCall(args: any, theme: Theme, ctx: any, sp: (path: string) => string): Text {
+function renderApplyPatchCall(args: any, theme: Theme, ctx: any): Text {
 	syncToolCallStatus(ctx);
 	const patchText = getStringArg(args, "patchText", "patch_text");
-	const summary = stableCallSummary(ctx, "_callSummary", () => summarizeOpenAiToolCall("apply_patch", args, theme, sp));
-	const hdr = toolHeader("Apply Patch", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
-
-	if (!ctx.argsComplete) return makeText(ctx.lastComponent, hdr);
-	const preview = getCachedApplyPatchPreview(patchText, sp, ctx);
-	if (!preview || preview.changes.length === 0) {
-		ctx.state._openAiPatchFiles = [];
-		return makeText(ctx.lastComponent, hdr);
-	}
-	ctx.state._openAiPatchFiles = preview.changes.map((change) => change.displayPath);
-
-	const diffWidth = contextDiffWidth(ctx);
-	const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-	const normalBudget = preview.changes.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
-	const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
-	const collapsedMaxShown = Math.min(preview.changes.length, 3);
-	const collapsedPreviewLines = preview.changes.length === 1
-		? 32
-		: Math.max(8, Math.floor(MAX_PREVIEW_LINES / Math.max(1, collapsedMaxShown)));
-	const hasHiddenCollapsedContent = collapsedMaxShown < preview.changes.length
-		|| preview.changes.slice(0, collapsedMaxShown).some(
-			(change) => !diffFitsRenderLimit(change.diff, diffWidth, collapsedPreviewLines),
-		);
-	const markSummary = (text: string): string => hasHiddenCollapsedContent ? markResultSummary(text) : text;
-	const maxShown = ctx.expanded ? preview.changes.length : collapsedMaxShown;
-	const previewLines = ctx.expanded
-		? preview.changes.length === 1
-			? totalBudget
-			: Math.max(6, Math.floor(totalBudget / Math.max(1, maxShown)))
-		: collapsedPreviewLines;
-	const allReturnedFits = maxShown === preview.changes.length
-		&& preview.changes.every((change) => diffFitsRenderLimit(change.diff, diffWidth, previewLines));
-	const finalCollapse = progressiveLocalControlsEnabled()
-		&& hasHiddenCollapsedContent
-		&& ctx.expanded
-		&& (localDetailLevel >= 2 || allReturnedFits);
-	const key = `apply-preview:${ctx.state._applyPatchMetaKey ?? hashText(patchText)}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}`;
-	const commitTree = (tree: DiffOutputTree): void => {
-		ctx.state._applyPatchPreviewTree = tree;
-		ctx.state._applyPatchPreviewBody = [
-			tree.summary,
-			...tree.blocks.flatMap((block) => [block.heading ?? "", block.content]),
-			tree.terminalAction ?? "",
-		].filter(Boolean).join("\n");
-		ctx.state._applyPatchPreviewDisplay = renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme);
+	const source: DiffSource = {
+		kind: "apply-patch",
+		patchText,
+		cwd: ctx.cwd ?? process.cwd(),
 	};
-	if (ctx.state._applyPatchPreviewKey !== key) {
-		ctx.state._applyPatchPreviewKey = key;
-		ctx.state._applyPatchPreviewBody = theme.fg("muted", "(rendering…)");
-		ctx.state._applyPatchPreviewDisplay = withBranch(ctx.state._applyPatchPreviewBody, theme, false, true);
-		const dc = resolveDiffColors(theme);
-		const pendingViewport = claimToolCollapseViewportSettlement(ctx.state);
-		if (preview.changes.length === 1) {
-			const [change] = preview.changes;
-			const mode = change.kind === "add" ? "new file" : change.kind === "delete" ? "delete" : "";
-			const aggregateSummary = markSummary(`${describeApplyPatchChange(change)} ${diffSummaryWithMeta(change.diff.added, change.diff.removed, change.hunks, mode)}${formatApplyPatchLine(change, theme)}`);
-			renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
-				.then((rendered) => {
-					if (ctx.state._applyPatchPreviewKey !== key) return;
-					commitTree({
-						summary: aggregateSummary,
-						blocks: [{ content: rendered }],
-						terminalAction: finalCollapse ? localCollapseActionHint(theme) : undefined,
-					});
-					safeInvalidate(ctx, pendingViewport);
-				})
-				.catch(() => {
-					if (ctx.state._applyPatchPreviewKey !== key) return;
-					commitTree({ summary: aggregateSummary, blocks: [] });
-					safeInvalidate(ctx, pendingViewport);
-				});
-		} else {
-			mapWithConcurrency(preview.changes.slice(0, maxShown), DIFF_RENDER_CONCURRENCY, async (change) => {
-				const heading = `${describeApplyPatchChange(change)} ${change.summary}${formatApplyPatchLine(change, theme)}`;
-				return renderSplit(change.diff, change.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
-					.then((rendered) => ({ heading, content: rendered }))
-					.catch(() => ({ heading, content: "" }));
-			})
-				.then((blocks) => {
-					if (ctx.state._applyPatchPreviewKey !== key) return;
-					const remainder = preview.changes.length - maxShown;
-					const aggregate = `${preview.changes.length} files ${diffSummaryWithMeta(preview.totalAdded, preview.totalRemoved, preview.totalHunks, "")}${preview.totalLines ? ` ${theme.fg("muted", `(${preview.totalLines} diff lines)`)}` : ""}`;
-					const terminalAction = remainder > 0
-						? `${theme.fg("muted", `… ${remainder} more file patch${remainder === 1 ? "" : "es"}`)}${toolOutputDetailHint(theme, ctx.expanded, true, localDetailLevel < 2, true)}`
-						: finalCollapse ? localCollapseActionHint(theme) : undefined;
-					commitTree({ summary: markSummary(aggregate), blocks, terminalAction });
-					safeInvalidate(ctx, pendingViewport);
-				})
-				.catch(() => {
-					if (ctx.state._applyPatchPreviewKey !== key) return;
-					const aggregate = `${preview.changes.length} files ${diffSummaryWithMeta(preview.totalAdded, preview.totalRemoved, preview.totalHunks, "")}`;
-					commitTree({ summary: markSummary(aggregate), blocks: [] });
-					safeInvalidate(ctx, pendingViewport);
-				});
-		}
-	}
-
-	const tree = ctx.state._applyPatchPreviewTree as DiffOutputTree | undefined;
-	const body = tree
-		? renderDiffOutputTree(tree.summary, tree.blocks, tree.terminalAction, theme)
-		: ctx.state._applyPatchPreviewDisplay as string | undefined;
-	return makeResponsiveDiffText(ctx, ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
+	const presentation = presentDiff(ctx, theme, "apply-call", source, undefined, 2, ctx.argsComplete === true);
+	const summary = stableCallSummary(ctx, "_callSummary", () => presentation.headerSummary ?? theme.fg("muted", "patch"));
+	const hdr = toolHeader("Apply Patch", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
+	if (ctx.argsComplete !== true) return makeText(ctx.lastComponent, hdr);
+	ctx.state._openAiPatchFiles = [...presentation.affectedPaths];
+	return makeResponsiveDiffText(ctx, ctx.lastComponent, presentation.body ? `${hdr}\n${presentation.body}` : hdr);
 }
 
 function renderApplyPatchResult(result: any, isPartial: boolean, theme: Theme, ctx: any): Text {
@@ -7991,27 +6050,19 @@ function renderApplyPatchResult(result: any, isPartial: boolean, theme: Theme, c
 	}
 	clearBlinkTimer(ctx);
 	setToolStatus(ctx, ctx.isError ? "error" : "success");
-
 	if (ctx.isError) {
 		const raw = getTextContent(result).trim();
 		const firstLine = raw ? raw.split("\n")[0] : "Apply patch failed";
 		return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", firstLine)));
 	}
-
-	const meta = getApplyPatchResultMeta(ctx.args, ctx, (path: string) => shortPath(ctx.cwd ?? process.cwd(), path));
-	if (!meta || meta.changeCount === 0) {
-		return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Applied")), theme));
-	}
-	if (ctx.state?._applyPatchPreviewTree) return makeText(ctx.lastComponent, "");
-
-	if (meta.changeCount === 1 && meta.firstChange) {
-		const change = meta.firstChange;
-		const summary = diffSummaryWithMeta(change.added, change.removed, change.hunks, change.kind === "add" ? "new file" : change.kind === "delete" ? "delete" : "");
-		return makeText(ctx.lastComponent, withBranch(markResultSummary(`${theme.fg("success", "Applied")} ${theme.fg("muted", change.displayPath)} ${summary}${formatLineMeta(change.line, theme)}`), theme));
-	}
-
-	const summary = diffSummaryWithMeta(meta.totalAdded, meta.totalRemoved, meta.totalHunks, "");
-	return makeText(ctx.lastComponent, withBranch(markResultSummary(`${theme.fg("success", "Applied")} ${meta.changeCount} files ${summary}${meta.totalLines ? ` ${theme.fg("muted", `(${meta.totalLines} diff lines)`)}` : ""}`), theme));
+	const patchText = getStringArg(ctx.args, "patchText", "patch_text");
+	const source: DiffSource = {
+		kind: "apply-patch",
+		patchText,
+		cwd: ctx.cwd ?? process.cwd(),
+	};
+	const presentation = presentDiff(ctx, theme, "apply-result", source, (result as any).details?.diffEvidence, 2);
+	return makeResponsiveDiffText(ctx, ctx.lastComponent, presentation.body);
 }
 
 function summarizeMcpToolCall(args: any, theme: Theme): string {
@@ -8269,13 +6320,6 @@ function renderMcpToolResult(result: any, expanded: boolean, isPartial: boolean,
 
 function summarizeOpenAiToolCall(name: string, args: any, theme: Theme, sp: (path: string) => string): string {
 	switch (name) {
-		case "apply_patch": {
-			const patchText = getStringArg(args, "patchText", "patch_text");
-			const files = extractApplyPatchFiles(patchText);
-			if (files.length === 0) return theme.fg("muted", "patch");
-			if (files.length === 1) return sp(files[0]);
-			return `${sp(files[0])} ${theme.fg("muted", `(+${files.length - 1} files)`)}`;
-		}
 		case "webfetch":
 			return getStringArg(args, "url") || theme.fg("muted", "fetch page");
 		case "fetch_content": {
@@ -8550,6 +6594,87 @@ function renderOpenAiToolResult(name: string, result: any, expanded: boolean, is
 }
 
 // ===========================================================================
+// Diff presentation host adapter
+// ===========================================================================
+
+const diffPresentationModule = createDiffPresentationModule({
+	readSettings,
+	chrome: {
+		markResultSummary,
+		branch(content, view, options) {
+			const theme = view.theme as Theme;
+			return options.final ? withFinalBranchBlock(content, theme) : withBranch(content, theme, false, options.continued === true);
+		},
+		tree(summary, blocks, terminalAction, view) {
+			return renderDiffOutputTree(
+				summary,
+				blocks.map((block) => ({
+					heading: block.heading,
+					content: block.content,
+				})),
+				terminalAction,
+				view.theme as Theme,
+			);
+		},
+		detailHint(view, hasMore) {
+			return toolOutputDetailHint(view.theme as Theme, view.expanded, hasMore, view.localDetail < 2, true);
+		},
+		collapseHint(view) {
+			return localCollapseActionHint(view.theme as Theme);
+		},
+	},
+	displayPath: shortPath,
+	moveArrow: () => `${BORDER_COLOR}→${TRANSPARENT_RESET}`,
+	resolveRuleAnsi: (theme) => resolveThemeChromeFg(theme) ?? safeFgAnsi(theme, "borderMuted") ?? undefined,
+});
+
+function contextDiffWidth(ctx: any, chromeWidth: 2 | 3): number {
+	const measured = ctx.state?._diffComponentWidth;
+	const width = typeof measured === "number" && Number.isFinite(measured) ? Math.floor(measured) : Math.max(40, Math.min((process.stdout.columns || Number.parseInt(process.env.COLUMNS ?? "", 10) || 200) - 4, 210));
+	return Math.max(20, Math.min(width - chromeWidth, 210));
+}
+
+function diffPresentationView(ctx: any, theme: Theme, chromeWidth: 2 | 3) {
+	return {
+		width: contextDiffWidth(ctx, chromeWidth),
+		expanded: ctx.expanded === true,
+		localDetail: progressiveLocalDetailLevelForRender(ctx.state),
+		localClickControls: progressiveLocalControlsEnabled(),
+		theme: theme as DiffTheme,
+	} as const;
+}
+
+function presentDiff(ctx: any, theme: Theme, surface: DiffPresentationSurface, source: DiffSource | undefined, evidence: DiffEvidence | unknown, chromeWidth: 2 | 3, sourceComplete = true) {
+	return diffPresentationModule.present({
+		owner: ctx.state ?? ctx,
+		surface,
+		source,
+		evidence,
+		sourceComplete,
+		view: diffPresentationView(ctx, theme, chromeWidth),
+		settlement: {
+			begin() {
+				const pendingViewport = claimToolCollapseViewportSettlement(ctx.state);
+				return { complete: () => safeInvalidate(ctx, pendingViewport) };
+			},
+		},
+	});
+}
+
+async function captureDiff(source: DiffSource): Promise<DiffEvidence | undefined> {
+	try {
+		return await diffPresentationModule.capture(source);
+	} catch {
+		return undefined;
+	}
+}
+
+function attachDiffEvidence(result: any, evidence: DiffEvidence | undefined): void {
+	if (!evidence || !result || typeof result !== "object") return;
+	result.details = { ...(result.details ?? {}), diffEvidence: evidence };
+}
+
+// ===========================================================================
 // Extension
 // ===========================================================================
 
@@ -8568,7 +6693,6 @@ export default function (pi: ExtensionAPI) {
 	patchAssistantMessages();
 	patchToolExecutionRenderers();
 	refreshRetainedToolGroupClickHandlers();
-	applyDiffPalette();
 	registerThinkingLabels(pi);
 	syncExtraToolDetailMode();
 
@@ -8861,7 +6985,7 @@ export default function (pi: ExtensionAPI) {
 			// Invalidate caches so the next render re-derives from the active
 			// theme (or falls back to the fixed Claude palette).
 			invalidateThemePaletteCache();
-			autoDerivePending = true;
+			diffPresentationModule.reset();
 			if (next) {
 				if (ctx.hasUI) applyThemePaletteIfNeeded(ctx.ui.theme);
 			} else {
@@ -9324,16 +7448,15 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				old = null;
 			}
-			const result = await writeTool.execute(toolCallId, params, signal, onUpdate);
 			const content = params.content ?? "";
-			if (old !== null && old !== content) {
-				const diff = parseDiff(old, content);
-				(result as any).details = { _type: "diff", summary: summarizeDiff(diff.added, diff.removed), diff, language: lang(fp) };
-			} else if (old === null) {
-				(result as any).details = { _type: "new", lines: lineCount(content), filePath: fp };
-			} else if (old === content) {
-				(result as any).details = { _type: "noChange" };
-			}
+			const evidence = await captureDiff({
+				kind: "write",
+				path: fp,
+				before: old,
+				after: content,
+			});
+			const result = await writeTool.execute(toolCallId, params, signal, onUpdate);
+			attachDiffEvidence(result, evidence);
 			return result;
 		},
 		renderCall(args, theme, ctx) {
@@ -9342,10 +7465,15 @@ export default function (pi: ExtensionAPI) {
 			syncToolCallStatus(ctx);
 			const wasNew = getWriteWasNewFile(ctx, cwd, fp, revealSummary);
 			const label = wasNew === true ? "Create" : "Write";
-			const summary = stableCallSummary(ctx, "_callSummary", () => {
-				const base = sp(fp);
-				return shouldRevealCallArgs(ctx) ? `${base} ${theme.fg("muted", `(${lineCount(args.content ?? "")} lines)`)}` : base;
-			}, revealSummary);
+			const summary = stableCallSummary(
+				ctx,
+				"_callSummary",
+				() => {
+					const base = sp(fp);
+					return shouldRevealCallArgs(ctx) ? `${base} ${theme.fg("muted", `(${lineCount(args.content ?? "")} lines)`)}` : base;
+				},
+				revealSummary,
+			);
 			const hdr = toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
 			return makeText(ctx.lastComponent, hdr);
 		},
@@ -9364,87 +7492,16 @@ export default function (pi: ExtensionAPI) {
 						.join("\n") ?? "Error";
 				return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", e)));
 			}
-			const d = (result as any).details;
-			if (d?._type === "diff") {
-				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-				const localClickControls = progressiveLocalControlsEnabled();
-				const collapsedLimit = diffCollapsedLimit();
-				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : collapsedLimit;
-				const hunks = d.diff?.lines?.filter((l: any) => l.type === "sep").length + (d.diff?.lines?.length ? 1 : 0);
-				const diffWidth = contextDiffWidth(ctx);
-				const hasHiddenCollapsedContent = !diffFitsRenderLimit(d.diff, diffWidth, collapsedLimit);
-				const finalCollapse = localClickControls && hasHiddenCollapsedContent && ctx.expanded
-					&& (localDetailLevel >= 2 || diffFitsRenderLimit(d.diff, diffWidth, previewLines));
-				const mode = shouldUseSplit(d.diff, diffWidth, previewLines) ? "split" : "unified";
-				const summaryText = diffSummaryWithMeta(d.diff.added, d.diff.removed, hunks, mode);
-				const richSummary = hasHiddenCollapsedContent ? markResultSummary(summaryText) : summaryText;
-				const key = `wd:${diffWidth}:${d.summary}:${d.diff?.lines?.length ?? 0}:${d.language ?? ""}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
-				if (ctx.state._wdk !== key) {
-					ctx.state._wdk = key;
-					ctx.state._ptAsyncRenderPending = true;
-					if (typeof ctx.state._wdt !== "string" || !ctx.state._wdt.trim()) {
-						ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
-					}
-					const dc = resolveDiffColors(theme);
-					const pendingViewport = claimToolCollapseViewportSettlement(ctx.state);
-					renderSplit(d.diff, d.language, { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
-						.then((rendered) => {
-							if (ctx.state._wdk !== key) return;
-							ctx.state._wdt = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
-							ctx.state._ptAsyncRenderPending = false;
-							safeInvalidate(ctx, pendingViewport);
-						})
-						.catch(() => {
-							if (ctx.state._wdk !== key) return;
-							ctx.state._wdt = withBranch(richSummary, theme);
-							ctx.state._ptAsyncRenderPending = false;
-							safeInvalidate(ctx, pendingViewport);
-						});
-				}
-				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._wdt ?? withBranch(richSummary, theme));
+			const details = (result as any).details;
+			const evidence = details?.diffEvidence;
+			const fp = ctx.args?.path ?? (ctx.args as any)?.file_path ?? "";
+			const content = ctx.args?.content;
+			const source: DiffSource | undefined = !evidence && typeof content === "string" && details?._type === "new" ? { kind: "write", path: fp, before: null, after: content } : !evidence && typeof content === "string" && details?._type === "noChange" ? { kind: "write", path: fp, before: content, after: content } : undefined;
+			if (!evidence && !source) {
+				return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Written")), theme));
 			}
-			if (d?._type === "noChange") return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("muted", "✓ no changes")), theme));
-			if (d?._type === "new") {
-				const content = typeof ctx.args?.content === "string" ? ctx.args.content : "";
-				const lineTotal = typeof d.lines === "number" ? d.lines : lineCount(content);
-				const contentHash = hashText(content);
-				const syntheticDiff = getCachedParsedDiff(ctx, `nf-diff:${d.filePath}:${contentHash}`, "", content);
-				const collapsedLimit = diffCollapsedLimit();
-				const hasHiddenCollapsedContent = syntheticDiff.lines.length > collapsedLimit;
-				const summaryText = diffSummaryWithMeta(syntheticDiff.added, 0, 1, "new file");
-				const richSummary = hasHiddenCollapsedContent ? markResultSummary(summaryText) : summaryText;
-				const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-				const localClickControls = progressiveLocalControlsEnabled();
-				const previewLines = ctx.expanded ? progressiveExpandedBudget(MAX_RENDER_LINES, ctx.state) : collapsedLimit;
-				const finalCollapse = localClickControls && hasHiddenCollapsedContent && ctx.expanded
-					&& (localDetailLevel >= 2 || syntheticDiff.lines.length <= previewLines);
-				const diffWidth = contextDiffWidth(ctx);
-				const pk = `nf:${d.filePath}:${contentHash}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${previewLines}`;
-				if (ctx.state._nfk !== pk) {
-					ctx.state._nfk = pk;
-					ctx.state._ptAsyncRenderPending = true;
-					if (typeof ctx.state._nft !== "string" || !ctx.state._nft.trim()) {
-						ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${theme.fg("muted", "rendering diff…")}`, theme);
-					}
-					const dc = resolveDiffColors(theme);
-					const pendingViewport = claimToolCollapseViewportSettlement(ctx.state);
-					renderUnified(syntheticDiff, lang(d.filePath), { toolExpanded: ctx.expanded, localDetailEnabled: localDetailLevel < 2, progressiveLocalDetail: true }, previewLines, dc, diffWidth)
-						.then((rendered) => {
-							if (ctx.state._nfk !== pk) return;
-							ctx.state._nft = withFinalBranchBlock(`${richSummary}\n${appendLocalCollapseAction(rendered, theme, finalCollapse)}`, theme);
-							ctx.state._ptAsyncRenderPending = false;
-							safeInvalidate(ctx, pendingViewport);
-						})
-						.catch(() => {
-							if (ctx.state._nfk !== pk) return;
-							ctx.state._nft = withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme);
-							ctx.state._ptAsyncRenderPending = false;
-							safeInvalidate(ctx, pendingViewport);
-						});
-				}
-				return makeResponsiveDiffText(ctx, ctx.lastComponent, ctx.state._nft ?? withBranch(`${richSummary} ${theme.fg("muted", `(${lineTotal} lines)`)}`, theme));
-			}
-			return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Written")), theme));
+			const presentation = presentDiff(ctx, theme, "write-result", source, evidence, 2);
+			return makeResponsiveDiffText(ctx, ctx.lastComponent, presentation.body);
 		},
 	});
 
@@ -9457,79 +7514,32 @@ export default function (pi: ExtensionAPI) {
 		async execute(toolCallId, params, signal, onUpdate, _ctx) {
 			const fp = params.path ?? (params as any).file_path ?? "";
 			const operations = getEditOperations(params);
-			const localizedDiffs = operations.length === 1 ? await computeLocalizedEditDiffs(fp, operations, cwd) : null;
+			const evidence = await captureDiff({
+				kind: "edit",
+				path: fp,
+				edits: operations,
+				cwd,
+			});
 			const result = await editTool.execute(toolCallId, params, signal, onUpdate);
-			if (operations.length === 0) return result;
-			const { diffs, summary, totalLines, totalHunks } = summarizeEditOperations(operations);
-			const baseDetails = (((result as any).details ?? {}) as Record<string, unknown>);
-			if (operations.length === 1) {
-				const localized = localizedDiffs?.[0];
-				const editLine = localized?.line ?? (typeof baseDetails.firstChangedLine === "number" ? baseDetails.firstChangedLine : 0);
-				const diff = localized?.diff ?? diffs[0];
-				(result as any).details = {
-					...baseDetails,
-					_type: "editInfo",
-					summary,
-					editLine,
-					hunks: countDiffHunks(diff),
-					added: diff?.added ?? 0,
-					removed: diff?.removed ?? 0,
-				};
-				return result;
-			}
-			(result as any).details = {
-				...baseDetails,
-				_type: "multiEditInfo",
-				summary,
-				editCount: operations.length,
-				diffLineCount: totalLines,
-				hunks: totalHunks,
-				totalAdded: diffs.reduce((sum, diff) => sum + diff.added, 0),
-				totalRemoved: diffs.reduce((sum, diff) => sum + diff.removed, 0),
-			};
+			attachDiffEvidence(result, evidence);
 			return result;
 		},
 		renderCall(args, theme, ctx) {
 			const fp = args?.path ?? (args as any)?.file_path ?? "";
 			const operations = getEditOperations(args);
 			const revealSummary = shouldRevealCallArgs(ctx) || (!!fp && hasOwnArg(args, "edits"));
-			const summary = stableCallSummary(ctx, "_callSummary", () => shouldRevealCallArgs(ctx) && operations.length > 1 ? `${sp(fp)} ${theme.fg("muted", `(${operations.length} edits)`)}` : sp(fp), revealSummary);
+			const summary = stableCallSummary(ctx, "_callSummary", () => (shouldRevealCallArgs(ctx) && operations.length > 1 ? `${sp(fp)} ${theme.fg("muted", `(${operations.length} edits)`)}` : sp(fp)), revealSummary);
 			syncToolCallStatus(ctx);
 			const hdr = toolHeader("Edit", summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme));
 			if (!(ctx.argsComplete && operations.length > 0)) return makeText(ctx.lastComponent, hdr);
-			const diffWidth = contextDiffWidth(ctx, 3);
-			const localDetailLevel = progressiveLocalDetailLevelForRender(ctx.state);
-			const normalBudget = operations.length === 1 ? MAX_PREVIEW_LINES : MAX_RENDER_LINES;
-			const totalBudget = ctx.expanded ? progressiveExpandedBudget(normalBudget, ctx.state) : normalBudget;
-			const localClickControls = progressiveLocalControlsEnabled();
-			const operationHash = hashText(operations.map((edit) => `${edit.oldText}\u0000${edit.newText}`).join("\u0001"));
-			const sourceKey = `edit:${fp}:${operationHash}`;
-			const key = `${sourceKey}:${diffWidth}:${ctx.expanded ? 1 : 0}:${localDetailLevel}:${totalBudget}:${localClickControls ? 1 : 0}`;
-			const { diffs: fallbackDiffs } = getCachedEditOperationSummary(ctx, key, operations);
-			if (ctx.state._pk !== key) {
-				ctx.state._pk = key;
-				ctx.state._ptAsyncRenderPending = true;
-				if (typeof ctx.state._ptDisplay !== "string" || !ctx.state._ptDisplay.trim()) {
-					ctx.state._ptBody = theme.fg("muted", "(rendering…)");
-					ctx.state._ptFinalCollapse = false;
-					ctx.state._ptDisplay = withBranch(ctx.state._ptBody, theme, false, true);
-				}
-				const lg = lang(fp);
-				const pendingViewport = claimToolCollapseViewportSettlement(ctx.state);
-				void getCachedLocalizedEditDiffs(ctx, sourceKey, fp, operations, cwd)
-					.then((localizedDiffs) => {
-						if (ctx.state._pk !== key) return;
-						const diffs = localizedDiffs?.map((entry) => entry.diff) ?? fallbackDiffs;
-						const lines = localizedDiffs?.map((entry) => entry.line) ?? diffs.map((diff) => getFirstChangedNewLine(diff));
-						renderEditPreviewBody(ctx, key, theme, lg, operations, diffs, lines, localDetailLevel, totalBudget, localClickControls, pendingViewport);
-					})
-					.catch(() => {
-						if (ctx.state._pk !== key) return;
-						renderEditPreviewBody(ctx, key, theme, lg, operations, fallbackDiffs, fallbackDiffs.map((diff) => getFirstChangedNewLine(diff)), localDetailLevel, totalBudget, localClickControls, pendingViewport);
-					});
-			}
-			const body = liveBranchDisplay(ctx.state, theme) ?? (ctx.state._ptDisplay as string | undefined);
-			return makeResponsiveDiffText(ctx, ctx.lastComponent, body ? `${hdr}\n${body}` : hdr);
+			const source: DiffSource = {
+				kind: "edit",
+				path: fp,
+				edits: operations,
+				cwd: ctx.cwd ?? cwd,
+			};
+			const presentation = presentDiff(ctx, theme, "edit-call", source, undefined, 3);
+			return makeResponsiveDiffText(ctx, ctx.lastComponent, presentation.body ? `${hdr}\n${presentation.body}` : hdr);
 		},
 		renderResult(result, { expanded, isPartial }, theme, ctx) {
 			if (isPartial) {
@@ -9545,22 +7555,20 @@ export default function (pi: ExtensionAPI) {
 						.join("\n") ?? "Error";
 				return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", e)));
 			}
-			const editResultType = (result as any).details?._type;
-			if ((editResultType === "editInfo" || editResultType === "multiEditInfo") && ctx.state?._ptTree) {
-				return makeText(ctx.lastComponent, "");
+			const evidence = (result as any).details?.diffEvidence;
+			const fp = ctx.args?.path ?? (ctx.args as any)?.file_path ?? "";
+			const edits = getEditOperations(ctx.args);
+			if (!evidence && edits.length === 0) {
+				return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Applied")), theme));
 			}
-			if (editResultType === "editInfo") {
-				const { editLine, hunks, added, removed } = (result as any).details;
-				const loc = formatLineMeta(editLine ?? 0, theme);
-				const summary = diffSummaryWithMeta(added ?? 0, removed ?? 0, hunks ?? 0, "");
-				return makeText(ctx.lastComponent, withBranch(markResultSummary(`${summary}${loc}`), theme));
-			}
-			if (editResultType === "multiEditInfo") {
-				const { editCount, diffLineCount, hunks, totalAdded, totalRemoved } = (result as any).details;
-				const summary = diffSummaryWithMeta(totalAdded ?? 0, totalRemoved ?? 0, hunks ?? 0, "");
-				return makeText(ctx.lastComponent, withBranch(markResultSummary(`${editCount} edits ${summary}${typeof diffLineCount === "number" ? ` ${theme.fg("muted", `(${diffLineCount} diff lines)`)}` : ""}`), theme));
-			}
-			return makeText(ctx.lastComponent, withBranch(markResultSummary(theme.fg("success", "Applied")), theme));
+			const source: DiffSource = {
+				kind: "edit",
+				path: fp,
+				edits,
+				cwd: ctx.cwd ?? cwd,
+			};
+			const presentation = presentDiff(ctx, theme, "edit-result", source, evidence, 3);
+			return makeResponsiveDiffText(ctx, ctx.lastComponent, presentation.body);
 		},
 	});
 
@@ -9589,17 +7597,24 @@ export default function (pi: ExtensionAPI) {
 				parameters: record.parameters,
 				prepareArguments: typeof record.prepareArguments === "function" ? record.prepareArguments : undefined,
 				async execute(toolCallId: string, params: any, signal: AbortSignal | undefined, onUpdate: any, ctx: any) {
-					return await Promise.resolve(execute(toolCallId, params, signal, onUpdate, ctx));
+					const evidence =
+						name === "apply_patch"
+							? await captureDiff({
+									kind: "apply-patch",
+									patchText: getStringArg(params, "patchText", "patch_text"),
+									cwd: ctx?.cwd ?? cwd,
+								})
+							: undefined;
+					const result = await Promise.resolve(execute(toolCallId, params, signal, onUpdate, ctx));
+					attachDiffEvidence(result, evidence);
+					return result;
 				},
 				renderCall(args: any, theme: Theme, ctx: any) {
-					if (name === "apply_patch") return renderApplyPatchCall(args, theme, ctx, sp);
+					if (name === "apply_patch") return renderApplyPatchCall(args, theme, ctx);
 					syncToolCallStatus(ctx);
 					ctx.state._openAiPatchFiles = [];
 					const summary = stableCallSummary(ctx, "_callSummary", () => summarizeOpenAiToolCall(name, args, theme, sp));
-					return makeText(
-						ctx.lastComponent,
-						toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
-					);
+					return makeText(ctx.lastComponent, toolHeader(label, summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)));
 				},
 				renderResult(result: any, { expanded, isPartial }: any, theme: Theme, ctx: any) {
 					if (name === "apply_patch") return renderApplyPatchResult(result, isPartial, theme, ctx);
@@ -9684,13 +7699,14 @@ export default function (pi: ExtensionAPI) {
 	// Session rebuild (resume/reload/fork) must not leave history partials blinking.
 	pi.on("session_start", async () => {
 		_clearAllBlinkContexts();
+		diffPresentationModule.reset();
 	});
 	pi.on("session_shutdown", async () => {
 		_clearAllBlinkContexts();
 		clearAllBashDurationContexts();
 		clearRtkRewriteState();
 		WRITE_EXISTED_BEFORE.clear();
-		clearHighlightCache();
+		diffPresentationModule.reset();
 		invalidateThemePaletteCache();
 		bumpToolBranchVisualEpoch();
 	});

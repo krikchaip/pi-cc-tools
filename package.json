@@ -32,6 +32,7 @@
     "extensions/spinner.ts",
     "extensions/bash-command.ts",
     "extensions/click-expansion/",
+    "extensions/diff-presentation/",
     "config/config.example.json",
     "README.md",
     "CHANGELOG.md"

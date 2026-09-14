@@ -31,7 +31,7 @@ await withRendererHarness(
       (globalThis as any)[PRELOADED_AGENT_GETTER] = producerGetter;
     },
   },
-  async ({ fakePi, theme, ToolExecutionComponent, Container, emitLifecycle, writePiSettings }) => {
+  async ({ fakePi, theme, ToolExecutionComponent, Container, tempPiDir, emitLifecycle, writePiSettings }) => {
     const {
       BashExecutionComponent,
       BranchSummaryMessageComponent,
@@ -600,62 +600,64 @@ await withRendererHarness(
       extraExpandedPreviewMaxLines: 15,
     });
     const write = fakePi.tools.get("write");
-    if (typeof write?.renderResult !== "function") throw new Error("Write renderer was not registered");
-    const diffLines = [
-      { type: "del", content: "const value = 'old';", oldNum: 1, newNum: null },
-      { type: "add", content: "const value = 'new';", oldNum: null, newNum: 1 },
-      ...Array.from({ length: 40 }, (_, index) => ({
-        type: "ctx",
-        content: `context line ${index + 1}`,
-        oldNum: index + 2,
-        newNum: index + 2,
-      })),
-    ];
-    const writeResult = {
-      content: [{ type: "text", text: "Wrote fixture.ts" }],
-      details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 400, lines: diffLines } },
+    if (typeof write?.execute !== "function" || typeof write?.renderResult !== "function") {
+      throw new Error("Write tool was not registered");
+    }
+    const executeWriteFixture = async (
+      id: string,
+      fileName: string,
+      before: string | null,
+      after: string,
+    ): Promise<{ args: { path: string; content: string }; result: any }> => {
+      const path = join(tempPiDir, fileName);
+      if (before === null) rmSync(path, { force: true });
+      else writeFileSync(path, before);
+      const args = { path, content: after };
+      const result = await write.execute(id, args, undefined, undefined, { cwd: process.cwd() });
+      return { args, result };
     };
+    const contextLines = Array.from({ length: 40 }, (_, index) => `context line ${index + 1}`);
+    const oldContextLines = Array.from({ length: 40 }, (_, index) => `old context line ${index + 1}`);
+    const smallOldContent = ["const value = 'old';", ...oldContextLines].join("\n");
+    const smallNewContent = ["const value = 'new';", ...contextLines].join("\n");
+    const { result: writeResult, args: writeArgs } = await executeWriteFixture(
+      "write_collapsed_fixture",
+      "write-collapsed-fixture.ts",
+      smallOldContent,
+      smallNewContent,
+    );
     const writeContext = {
       state: {},
       isError: false,
       lastComponent: undefined,
-      args: { path: "fixture.ts", content: "new" },
+      args: writeArgs,
       cwd: process.cwd(),
       expanded: false,
     } as any;
     write.renderResult(writeResult, { expanded: false, isPartial: false }, theme, writeContext);
-    await waitFor(() => typeof writeContext.state._wdt === "string" && writeContext.state._wdt.includes("more diff lines"));
+    await waitFor(() => write.renderResult(writeResult, { expanded: false, isPartial: false }, theme, writeContext)
+      .render(120).some((line: string) => plain(line).includes("more diff lines")));
     const writeRaw = write.renderResult(writeResult, { expanded: false, isPartial: false }, theme, writeContext).render(120).join("\n");
     assertCollapsedIndicator(writeRaw, "more diff lines", true);
 
-    const expandedDiffLines = [
-      ...diffLines,
-      ...Array.from({ length: 180 }, (_, index) => ({
-        type: "ctx",
-        content: `expanded context line ${index + 1}`,
-        oldNum: index + 42,
-        newNum: index + 42,
-      })),
-    ];
+    const expandedContextLines = Array.from({ length: 260 }, (_, index) => `expanded context line ${index + 1}`);
+    const oldExpandedContextLines = Array.from({ length: 260 }, (_, index) => `old expanded context line ${index + 1}`);
+    const expandedOldContent = ["const value = 'old';", ...oldContextLines, ...oldExpandedContextLines].join("\n");
+    const expandedNewContent = ["const value = 'new';", ...contextLines, ...expandedContextLines].join("\n");
+    const expandedWriteFixture = await executeWriteFixture(
+      "write_expanded_fixture",
+      "write-expanded-fixture.ts",
+      expandedOldContent,
+      expandedNewContent,
+    );
     const createContent = Array.from({ length: 220 }, (_, index) => `created line ${index + 1}`).join("\n");
-    for (const { result, args, stateKey } of [
-      {
-        result: {
-          content: [{ type: "text", text: "Wrote fixture.ts" }],
-          details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 4000, lines: expandedDiffLines } },
-        },
-        args: { path: "fixture.ts", content: "new" },
-        stateKey: "_wdt",
-      },
-      {
-        result: {
-          content: [{ type: "text", text: "Wrote created-fixture.ts" }],
-          details: { _type: "new", lines: 220, filePath: "created-fixture.ts" },
-        },
-        args: { path: "created-fixture.ts", content: createContent },
-        stateKey: "_nft",
-      },
-    ]) {
+    const newFileWriteFixture = await executeWriteFixture(
+      "write_created_fixture",
+      "write-created-fixture.ts",
+      null,
+      createContent,
+    );
+    for (const { result, args } of [expandedWriteFixture, newFileWriteFixture]) {
       const context = {
         state: {},
         isError: false,
@@ -665,7 +667,8 @@ await withRendererHarness(
         expanded: true,
       } as any;
       write.renderResult(result, { expanded: true, isPartial: false }, theme, context);
-      await waitFor(() => typeof context.state[stateKey] === "string" && context.state[stateKey].includes("more diff lines"));
+      await waitFor(() => write.renderResult(result, { expanded: true, isPartial: false }, theme, context)
+        .render(120).some((line: string) => plain(line).includes("more diff lines")));
       const raw = write.renderResult(result, { expanded: true, isPartial: false }, theme, context).render(120).join("\n");
       assertExpandedIndicator(raw, "more diff lines");
     }
@@ -754,7 +757,8 @@ await withRendererHarness(
       executionStarted: true,
     } as any;
     edit.renderCall(editArgs, theme, editContext);
-    await waitFor(() => typeof editContext.state._ptBody === "string" && editContext.state._ptBody.includes("more edit block"));
+    await waitFor(() => edit.renderCall(editArgs, theme, editContext)
+      .render(120).some((line: string) => plain(line).includes("more edit block")));
     const editRaw = edit.renderCall(editArgs, theme, editContext).render(120).join("\n");
     assertCollapsedIndicator(editRaw, "more edit block");
 
@@ -1567,7 +1571,7 @@ await withRendererHarness(
     const writeExecution = new ToolExecutionComponent(
       "write",
       "write_click_fixture",
-      { path: "fixture.ts", content: "new" },
+      expandedWriteFixture.args,
       {},
       write,
       { mode: "fullscreen", requestRender() {} } as any,
@@ -1575,21 +1579,15 @@ await withRendererHarness(
     ) as any;
     writeExecution.markExecutionStarted();
     writeExecution.setArgsComplete();
-    writeExecution.updateResult({
-      content: [{ type: "text", text: "Wrote fixture.ts" }],
-      details: {
-        _type: "diff",
-        summary: "+1 -1",
-        diff: { added: 1, removed: 1, chars: 4000, lines: expandedDiffLines },
-        language: "typescript",
-      },
-      isError: false,
-    }, false);
+    writeExecution.updateResult({ ...expandedWriteFixture.result, isError: false }, false);
     writeExecution.setExpanded(true);
     await waitFor(
-      () => typeof writeExecution.rendererState._wdt === "string"
-        && writeExecution.rendererState._wdt.includes("more diff lines")
-        && writeExecution.rendererState._wdk.endsWith(":150"),
+      () => {
+        const rows = writeExecution.render(120).map((line: string) => plain(line));
+        return rows.some((line: string) => line.includes("expanded context line 109"))
+          && rows.some((line: string) => line.includes("more diff lines"))
+          && !rows.some((line: string) => line.includes("expanded context line 110"));
+      },
       "expanded Write diff at its normal 150-line render cap",
     );
     const writeExecutionRows = writeExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
@@ -1602,20 +1600,20 @@ await withRendererHarness(
     if (writeDetailRow < 0 || !writeExecution.activateClickAction("detail")) {
       throw new Error(`expanded Write diff did not bind its standard-detail row: ${JSON.stringify(writeExecutionRows)}`);
     }
-    const detailLevelSymbol = Symbol.for("pi-claude-style-tools:tool-click-detail-level");
-    if (writeExecution.rendererState[detailLevelSymbol] !== 1) {
-      throw new Error("Write standard-detail activation did not persist level 1");
-    }
     await waitFor(
-      () => typeof writeExecution.rendererState._wdk === "string"
-        && writeExecution.rendererState._wdk.endsWith(":200")
-        && writeExecution.rendererState._ptAsyncRenderPending === false,
-      `standard-detail Write diff at its configured 200-line render cap (key: ${writeExecution.rendererState._wdk})`,
+      () => {
+        const rows = writeExecution.render(120).map((line: string) => plain(line));
+        return rows.some((line: string) => line.includes("expanded context line 159"))
+          && rows.some((line: string) => line.includes("more diff lines"))
+          && !rows.some((line: string) => line.includes("expanded context line 160"));
+      },
+      "standard-detail Write diff at its configured 200-line render cap",
     );
-    if (!/\x1b\[38;2;\d+;\d+;\d+mconst/.test(writeExecution.rendererState._wdt)) {
+    const standardWriteRaw = writeExecution.render(120).join("\n");
+    if (!/\x1b\[38;2;\d+;\d+;\d+mconst/.test(standardWriteRaw)) {
       throw new Error("standard-detail Write diff lost syntax highlighting above 150 rendered lines");
     }
-    const standardWriteRows = writeExecution.render(120).map((line: string) => line.replace(/\x1b\[[0-9;]*m/g, ""));
+    const standardWriteRows = standardWriteRaw.split("\n").map((line: string) => plain(line));
     const writeExtraDetailRow = standardWriteRows.findIndex((line: string, index: number) => (
       line.includes("more diff lines") && writeDetailActionX(index) >= 0
     ));
@@ -1624,10 +1622,16 @@ await withRendererHarness(
       throw new Error(`standard-detail Write diff did not use one space after its branch indicator: ${JSON.stringify(writeExtraDetailText)}`);
     }
 
+    const effectiveFinalWriteFixture = await executeWriteFixture(
+      "write_effective_final_fixture",
+      "write-effective-final-fixture.ts",
+      Array.from({ length: 30 }, (_, index) => `old effective line ${index + 1}`).join("\n"),
+      Array.from({ length: 150 }, (_, index) => `effective final line ${index + 1}`).join("\n"),
+    );
     const effectiveFinalWrite = new ToolExecutionComponent(
       "write",
       "write_effective_final_fixture",
-      { path: "effective-final.ts", content: "new" },
+      effectiveFinalWriteFixture.args,
       {},
       write,
       { mode: "fullscreen", requestRender() {} } as any,
@@ -1635,16 +1639,15 @@ await withRendererHarness(
     ) as any;
     effectiveFinalWrite.markExecutionStarted();
     effectiveFinalWrite.setArgsComplete();
-    effectiveFinalWrite.updateResult({
-      content: [{ type: "text", text: "Wrote effective-final.ts" }],
-      details: { _type: "diff", summary: "+1 -1", diff: { added: 1, removed: 1, chars: 3000, lines: expandedDiffLines.slice(0, 180) } },
-      isError: false,
-    }, false);
+    effectiveFinalWrite.updateResult({ ...effectiveFinalWriteFixture.result, isError: false }, false);
     effectiveFinalWrite.setExpanded(true);
     await waitFor(
-      () => typeof effectiveFinalWrite.rendererState._wdt === "string"
-        && effectiveFinalWrite.rendererState._wdt.includes("more diff lines")
-        && effectiveFinalWrite.rendererState._wdk.endsWith(":150"),
+      () => {
+        const rows = effectiveFinalWrite.render(120).map((line: string) => plain(line));
+        return rows.some((line: string) => line.includes("effective final line 120"))
+          && rows.some((line: string) => line.includes("more diff lines"))
+          && !rows.some((line: string) => line.includes("effective final line 121"));
+      },
       "effective-final Write normal detail layer",
     );
     effectiveFinalWrite.render(120);
@@ -1652,11 +1655,12 @@ await withRendererHarness(
       throw new Error("effective-final Write did not enter level 1");
     }
     await waitFor(
-      () => typeof effectiveFinalWrite.rendererState._wdk === "string"
-        && effectiveFinalWrite.rendererState._wdk.endsWith(":200")
-        && effectiveFinalWrite.rendererState._ptAsyncRenderPending === false
-        && typeof effectiveFinalWrite.rendererState._wdt === "string"
-        && !effectiveFinalWrite.rendererState._wdt.includes("rendering diff"),
+      () => {
+        const rows = effectiveFinalWrite.render(120).map((line: string) => plain(line));
+        return rows.some((line: string) => line.includes("effective final line 150"))
+          && rows.some((line: string) => line.includes("click to collapse"))
+          && !rows.some((line: string) => line.includes("rendering diff"));
+      },
       "effective-final Write level-1 collapse row",
     );
     const effectiveFinalWriteRows = effectiveFinalWrite.render(120).map((line: string) => plain(line));
@@ -1671,34 +1675,27 @@ await withRendererHarness(
     if (writeExtraDetailRow < 0 || !writeExecution.activateClickAction("detail")) {
       throw new Error(`standard-detail Write diff did not preserve its extra-detail row: ${JSON.stringify(standardWriteRows)}`);
     }
-    if (writeExecution.rendererState[detailLevelSymbol] !== 2) {
-      throw new Error("Write extra-detail activation did not persist level 2");
-    }
     await waitFor(
-      () => typeof writeExecution.rendererState._wdk === "string"
-        && writeExecution.rendererState._wdk.endsWith(":240"),
-      `extra-detail Write diff at its configured 240-line render cap (key: ${writeExecution.rendererState._wdk})`,
+      () => {
+        const rows = writeExecution.render(120).map((line: string) => plain(line));
+        return rows.some((line: string) => line.includes("expanded context line 199"))
+          && rows.some((line: string) => line.includes("more diff lines"))
+          && !rows.some((line: string) => line.includes("expanded context line 200"));
+      },
+      "extra-detail Write diff at its configured 240-line render cap",
     );
 
     {
-      const pairedWriteLines = [
-        ...Array.from({ length: 100 }, (_, index) => ({
-          type: "del",
-          content: `old paired line ${index + 1}`,
-          oldNum: index + 1,
-          newNum: null,
-        })),
-        ...Array.from({ length: 100 }, (_, index) => ({
-          type: "add",
-          content: `new paired line ${index + 1}`,
-          oldNum: null,
-          newNum: index + 1,
-        })),
-      ];
+      const pairedWriteFixture = await executeWriteFixture(
+        "write_normal_split_final_fixture",
+        "write-paired-final-fixture.ts",
+        Array.from({ length: 100 }, (_, index) => `old paired line ${index + 1}`).join("\n"),
+        Array.from({ length: 100 }, (_, index) => `new paired line ${index + 1}`).join("\n"),
+      );
       const pairedWriteExecution = new ToolExecutionComponent(
         "write",
         "write_normal_split_final_fixture",
-        { path: "paired-final.ts", content: "new" },
+        pairedWriteFixture.args,
         {},
         write,
         { mode: "fullscreen", requestRender() {} } as any,
@@ -1706,15 +1703,7 @@ await withRendererHarness(
       ) as any;
       pairedWriteExecution.markExecutionStarted();
       pairedWriteExecution.setArgsComplete();
-      pairedWriteExecution.updateResult({
-        content: [{ type: "text", text: "Wrote paired-final.ts" }],
-        details: {
-          _type: "diff",
-          summary: "+100 -100",
-          diff: { added: 100, removed: 100, chars: 4000, lines: pairedWriteLines },
-        },
-        isError: false,
-      }, false);
+      pairedWriteExecution.updateResult({ ...pairedWriteFixture.result, isError: false }, false);
       await waitFor(
         () => pairedWriteExecution.render(180).some((line: string) => plain(line).includes("more diff lines")),
         "collapsed paired Write split diff",
@@ -1754,10 +1743,16 @@ await withRendererHarness(
 
     {
       const newFileContent = Array.from({ length: 100 }, (_, index) => `new file line ${index + 1}`).join("\n");
+      const normalNewFileFixture = await executeWriteFixture(
+        "write_normal_new_file_final_fixture",
+        "write-new-final-fixture.ts",
+        null,
+        newFileContent,
+      );
       const newFileWriteExecution = new ToolExecutionComponent(
         "write",
         "write_normal_new_file_final_fixture",
-        { path: "new-final.ts", content: newFileContent },
+        normalNewFileFixture.args,
         {},
         write,
         { mode: "fullscreen", requestRender() {} } as any,
@@ -1765,11 +1760,7 @@ await withRendererHarness(
       ) as any;
       newFileWriteExecution.markExecutionStarted();
       newFileWriteExecution.setArgsComplete();
-      newFileWriteExecution.updateResult({
-        content: [{ type: "text", text: "Wrote new-final.ts" }],
-        details: { _type: "new", lines: 100, filePath: "new-final.ts" },
-        isError: false,
-      }, false);
+      newFileWriteExecution.updateResult({ ...normalNewFileFixture.result, isError: false }, false);
       await waitFor(
         () => newFileWriteExecution.render(120).some((line: string) => plain(line).includes("more diff lines")),
         "collapsed new-file Write diff",
@@ -1808,10 +1799,16 @@ await withRendererHarness(
     }
 
     {
+      const shortWriteFixture = await executeWriteFixture(
+        "write_short_fully_visible_fixture",
+        "write-short-fixture.ts",
+        "const value = 1;",
+        "const value = 2;",
+      );
       const shortWriteExecution = new ToolExecutionComponent(
         "write",
         "write_short_fully_visible_fixture",
-        { path: "short-write.ts", content: "const value = 2;" },
+        shortWriteFixture.args,
         {},
         write,
         { mode: "fullscreen", requestRender() {} } as any,
@@ -1819,23 +1816,7 @@ await withRendererHarness(
       ) as any;
       shortWriteExecution.markExecutionStarted();
       shortWriteExecution.setArgsComplete();
-      shortWriteExecution.updateResult({
-        content: [{ type: "text", text: "Wrote short-write.ts" }],
-        details: {
-          _type: "diff",
-          summary: "+1 -1",
-          diff: {
-            added: 1,
-            removed: 1,
-            chars: 32,
-            lines: [
-              { type: "del", content: "const value = 1;", oldNum: 1, newNum: null },
-              { type: "add", content: "const value = 2;", oldNum: null, newNum: 1 },
-            ],
-          },
-        },
-        isError: false,
-      }, false);
+      shortWriteExecution.updateResult({ ...shortWriteFixture.result, isError: false }, false);
       await waitFor(
         () => shortWriteExecution.render(120).some((line: string) => {
           const text = plain(line);
@@ -1866,10 +1847,16 @@ await withRendererHarness(
     }
 
     {
+      const tabbedWriteFixture = await executeWriteFixture(
+        "write_tab_indentation_fixture",
+        "write-tabbed-fixture.ts",
+        null,
+        "    WRITE_SPACE_INDENT\n\tWRITE_TAB_INDENT",
+      );
       const tabbedWriteExecution = new ToolExecutionComponent(
         "write",
         "write_tab_indentation_fixture",
-        { path: "tabbed-write.ts", content: "    WRITE_SPACE_INDENT\n\tWRITE_TAB_INDENT" },
+        tabbedWriteFixture.args,
         {},
         write,
         { mode: "fullscreen", requestRender() {} } as any,
@@ -1877,11 +1864,7 @@ await withRendererHarness(
       ) as any;
       tabbedWriteExecution.markExecutionStarted();
       tabbedWriteExecution.setArgsComplete();
-      tabbedWriteExecution.updateResult({
-        content: [{ type: "text", text: "Wrote tabbed-write.ts" }],
-        details: { _type: "new", filePath: "tabbed-write.ts", lines: 2 },
-        isError: false,
-      }, false);
+      tabbedWriteExecution.updateResult({ ...tabbedWriteFixture.result, isError: false }, false);
       await waitFor(
         () => tabbedWriteExecution.render(120).some((line: string) => plain(line).includes("WRITE_TAB_INDENT")),
         "tab-indented new-file Write preview",
@@ -1913,6 +1896,23 @@ await withRendererHarness(
         { mode: "fullscreen", requestRender() {} } as any,
         process.cwd(),
       ) as any;
+      const incompleteApplyPatchExecution = new ToolExecutionComponent(
+        "apply_patch",
+        "apply_patch_incomplete_header_fixture",
+        { patchText: shortPatchText },
+        {},
+        applyPatch,
+        { mode: "fullscreen", requestRender() {} } as any,
+        process.cwd(),
+      ) as any;
+      incompleteApplyPatchExecution.markExecutionStarted();
+      const incompleteApplyPatchRows = incompleteApplyPatchExecution.render(120).map((line: string) => plain(line));
+      if (
+        !incompleteApplyPatchRows.some((line: string) => line.includes("Apply Patch") && line.includes("apply-short-visible.ts"))
+        || incompleteApplyPatchRows.some((line: string) => line.includes("rendering") || line.includes("Create apply-short-visible.ts"))
+      ) {
+        throw new Error(`incomplete Apply Patch did not keep its module-owned header-only presentation: ${JSON.stringify(incompleteApplyPatchRows)}`);
+      }
       shortApplyPatchExecution.markExecutionStarted();
       shortApplyPatchExecution.setArgsComplete();
       await waitFor(
@@ -2090,11 +2090,19 @@ await withRendererHarness(
     }
 
     {
+      const restoredEditPath = join(tempPiDir, "restored-edit-fixture.ts");
+      writeFileSync(restoredEditPath, "old restored value");
       const restoredEditArgs = {
-        path: "restored-edit-fixture.ts",
-        oldText: "old restored value",
-        newText: "new restored value",
+        path: restoredEditPath,
+        edits: [{ oldText: "old restored value", newText: "new restored value" }],
       };
+      const restoredEditResult = await edit.execute(
+        "restored_edit_fixture",
+        restoredEditArgs,
+        undefined,
+        undefined,
+        { cwd: process.cwd() },
+      );
       const restoredEditExecution = new ToolExecutionComponent(
         "edit",
         "restored_edit_fixture",
@@ -2104,18 +2112,7 @@ await withRendererHarness(
         { mode: "fullscreen", requestRender() {} } as any,
         process.cwd(),
       ) as any;
-      restoredEditExecution.updateResult({
-        content: [{ type: "text", text: "Applied edit" }],
-        details: {
-          _type: "editInfo",
-          summary: "+1 -1",
-          editLine: 1,
-          hunks: 1,
-          added: 1,
-          removed: 1,
-        },
-        isError: false,
-      }, false);
+      restoredEditExecution.updateResult({ ...restoredEditResult, isError: false }, false);
       const restoredEditRows = restoredEditExecution.render(120).map((line: string) => plain(line));
       if (
         restoredEditRows.filter((line: string) => line.includes("1 hunk")).length !== 1
@@ -2150,21 +2147,20 @@ await withRendererHarness(
       addedOnlyEditExecution.setArgsComplete();
       addedOnlyEditExecution.render(120);
       await waitFor(
-        () => addedOnlyEditExecution.rendererState?._ptAsyncRenderPending !== true
-          && addedOnlyEditExecution.rendererState?._ptTree?.blocks?.[0]?.content,
+        () => {
+          const rows = addedOnlyEditExecution.render(120).map((line: string) => plain(line));
+          const summaryRow = rows.findIndex((line: string) => line.includes("1 hunk"));
+          return summaryRow >= 0
+            && /^│ ─+\s*$/.test(rows[summaryRow + 1] ?? "")
+            && !rows.some((line: string) => line.includes("rendering diff"));
+        },
         "added-only Edit preview",
-      );
-      const firstAddedOnlyDiffRow = plain(
-        addedOnlyEditExecution.rendererState?._ptTree?.blocks?.[0]?.content?.split("\n")?.[0] ?? "",
       );
       const addedOnlyRows = addedOnlyEditExecution.render(120).map((line: string) => plain(line));
       const addedOnlySummaryRow = addedOnlyRows.findIndex((line: string) => line.includes("1 hunk"));
       const physicalRowAfterAddedOnlySummary = addedOnlyRows[addedOnlySummaryRow + 1] ?? "";
-      if (
-        !/^─+$/.test(firstAddedOnlyDiffRow.trim())
-        || !/^│ ─+\s*$/.test(physicalRowAfterAddedOnlySummary)
-      ) {
-        throw new Error(`single unified Edit did not place its top border directly after the summary: ${JSON.stringify({ logicalRuleWidth: firstAddedOnlyDiffRow.length, physicalRowAfterAddedOnlySummary, addedOnlyRows })}`);
+      if (addedOnlySummaryRow < 0 || !/^│ ─+\s*$/.test(physicalRowAfterAddedOnlySummary)) {
+        throw new Error(`single unified Edit did not place its top border directly after the summary: ${JSON.stringify({ physicalRowAfterAddedOnlySummary, addedOnlyRows })}`);
       }
     }
 
@@ -2229,17 +2225,13 @@ await withRendererHarness(
         "complete fully visible short Edit execution",
       );
       const completeShortEditRows = shortEditExecution.render(shortEditWidth).map((line: string) => plain(line));
-      const completeShortEditTree = shortEditExecution.rendererState?._ptTree;
-      const firstShortEditDiffRow = plain(
-        completeShortEditTree?.blocks?.[0]?.content?.split("\n")?.[0] ?? "",
-      );
       const completeShortEditSummaryRow = completeShortEditRows.findIndex((line: string) => line.includes("1 hunk"));
       const physicalRowAfterShortEditSummary = completeShortEditRows[completeShortEditSummaryRow + 1] ?? "";
       if (
-        !completeShortEditTree?.summary?.trim()
-        || !firstShortEditDiffRow.includes("old")
-        || !firstShortEditDiffRow.includes("new")
-        || !firstShortEditDiffRow.includes("┊")
+        completeShortEditSummaryRow < 0
+        || !physicalRowAfterShortEditSummary.includes("old")
+        || !physicalRowAfterShortEditSummary.includes("new")
+        || !physicalRowAfterShortEditSummary.includes("┊")
         || !/^│ old.*┊new/.test(physicalRowAfterShortEditSummary)
       ) {
         throw new Error(`single split Edit inserted a physical gap above its diff: ${JSON.stringify(completeShortEditRows)}`);
@@ -2310,23 +2302,28 @@ await withRendererHarness(
         postEditExecution.setArgsComplete();
         await waitFor(
           () => {
-            postEditExecution.render(180);
-            return postEditExecution.rendererState?._ptAsyncRenderPending !== true
-              && postEditExecution.rendererState?._ptTree?.blocks?.length === 2;
+            const rows = postEditExecution.render(180).map((line: string) => plain(line));
+            return rows.filter((line: string) => /Edit [12]\/2/.test(line)).length === 2
+              && rows.some((line: string) => line.includes("MULTI_A_101"))
+              && rows.some((line: string) => line.includes("MULTI_B_351"))
+              && !rows.some((line: string) => line.includes("rendering diff"));
           },
           "post-write multi-Edit localization",
         );
-        const tree = postEditExecution.rendererState?._ptTree;
+        const postEditRows = postEditExecution.render(180).map((line: string) => plain(line));
         const expectedBlocks = [
           { token: "MULTI_A_101", line: 101 },
           { token: "MULTI_B_351", line: 351 },
         ];
         for (const [index, expected] of expectedBlocks.entries()) {
-          const heading = plain(tree.blocks[index]?.heading ?? "");
-          const contentRows = plain(tree.blocks[index]?.content ?? "").split("\n");
-          const row = contentRows.find((line: string) => line.includes(expected.token)) ?? "";
+          const headingIndex = postEditRows.findIndex((line: string) => line.includes(`Edit ${index + 1}/2`));
+          const nextHeadingIndex = postEditRows.findIndex((line: string, row: number) => row > headingIndex && /Edit \d\/2/.test(line));
+          const blockRows = postEditRows.slice(headingIndex + 1, nextHeadingIndex < 0 ? undefined : nextHeadingIndex);
+          const heading = postEditRows[headingIndex] ?? "";
+          const row = blockRows.find((line: string) => line.includes(expected.token)) ?? "";
           if (
-            !heading.includes(`at line ${expected.line}`)
+            headingIndex < 0
+            || !heading.includes(`at line ${expected.line}`)
             || !new RegExp(`\\b${expected.line}\\+`).test(row)
           ) {
             throw new Error(`post-write multi-Edit lost source line ${expected.line}: ${JSON.stringify({ heading, row })}`);
@@ -2363,15 +2360,17 @@ await withRendererHarness(
         retainedExecution.setArgsComplete();
         await waitFor(
           () => {
-            retainedExecution.render(180);
-            return retainedExecution.rendererState?._ptAsyncRenderPending !== true
-              && retainedExecution.rendererState?._ptTree?.blocks?.length === 2;
+            const rows = retainedExecution.render(180).map((line: string) => plain(line));
+            return rows.filter((line: string) => /Edit [12]\/2/.test(line)).length === 2
+              && rows.some((line: string) => line.includes("RETAINED_83"))
+              && !rows.some((line: string) => line.includes("rendering diff"));
           },
           "post-write retained-prefix multi-Edit localization",
         );
-        const retainedTree = retainedExecution.rendererState?._ptTree;
-        const secondHeading = plain(retainedTree.blocks[1]?.heading ?? "");
-        const secondRows = plain(retainedTree.blocks[1]?.content ?? "").split("\n");
+        const retainedRows = retainedExecution.render(180).map((line: string) => plain(line));
+        const secondHeadingIndex = retainedRows.findIndex((line: string) => line.includes("Edit 2/2"));
+        const secondHeading = retainedRows[secondHeadingIndex] ?? "";
+        const secondRows = retainedRows.slice(secondHeadingIndex + 1);
         const secondAnchorRow = secondRows.find((line: string) => line.includes("RETAINED_83")) ?? "";
         if (
           !secondHeading.includes("at line 88")
@@ -2431,13 +2430,16 @@ await withRendererHarness(
         throw new Error(`Edit replaced its stable preview during async expansion: ${JSON.stringify(immediateExpandedEditRows)}`);
       }
       await waitFor(
-        () => asyncEditExecution.rendererState?._ptAsyncRenderPending !== true
-          && asyncEditExecution.render(120).some((line: string, row: number) => (
-            plain(line).includes("more diff lines")
-            && Array.from({ length: 120 }, (_, x) => x).some(
-              (x) => asyncEditExecution.clickActionAtPoint(x, row) === "detail",
-            )
-          )),
+        () => {
+          const rows = asyncEditExecution.render(120);
+          return !rows.some((line: string) => plain(line).includes("rendering diff"))
+            && rows.some((line: string, row: number) => (
+              plain(line).includes("more diff lines")
+              && Array.from({ length: 120 }, (_, x) => x).some(
+                (x) => asyncEditExecution.clickActionAtPoint(x, row) === "detail",
+              )
+            ));
+        },
         "normal expanded async Edit preview",
       );
       const normalAsyncEditRows = asyncEditExecution.render(120).map((line: string) => plain(line));
@@ -2526,8 +2528,11 @@ await withRendererHarness(
         isError: false,
       }, false);
       await waitFor(
-        () => editAnchorExecution.rendererState?._ptAsyncRenderPending !== true
-          && editAnchorExecution.render(editAnchorWidth).some((line: string) => plain(line).includes("more edit block")),
+        () => {
+          const rows = editAnchorExecution.render(editAnchorWidth).map((line: string) => plain(line));
+          return rows.some((line: string) => line.includes("more edit block"))
+            && !rows.some((line: string) => line.includes("rendering diff"));
+        },
         "settled collapsed multi-Edit preview",
       );
 
