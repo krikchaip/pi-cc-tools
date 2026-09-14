@@ -4,13 +4,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-import { createDiffPresentationModule } from "../../extensions/diff-presentation/index.ts";
+import {
+    createDiffPresentationModule,
+    type DiffPresentationChrome,
+} from "../../extensions/diff-presentation/index.ts";
 
 const theme = {
     fg(_color: string, text: string) {
         return text;
     },
 } as any;
+
+const isLightTheme = () => false;
 
 function plain(text: string): string {
     return text.replace(/\x1b\[[0-9;]*m/g, "");
@@ -22,6 +27,72 @@ function assertDeepFrozen(value: unknown): void {
     for (const child of Object.values(value)) assertDeepFrozen(child);
 }
 
+function taggedChrome(tag: string): DiffPresentationChrome {
+    return {
+        markResultSummary: (text: string) => `${tag}:${text}`,
+        branch: (content: string) => content,
+        tree: (summary: string, blocks: readonly { content: string }[], terminalAction?: string) =>
+            [summary, ...blocks.map((block) => block.content), terminalAction].filter(Boolean).join("\n"),
+        detailHint: () => "",
+        collapseHint: () => "",
+    };
+}
+
+test("keeps factory instances isolated for frames and reset", async () => {
+    const first = createDiffPresentationModule({
+        readSettings: () => ({}),
+        isLightTheme,
+        chrome: taggedChrome("A"),
+    });
+    const second = createDiffPresentationModule({
+        readSettings: () => ({}),
+        isLightTheme,
+        chrome: taggedChrome("B"),
+    });
+    const owner = {};
+    const base = {
+        owner,
+        surface: "write-result" as const,
+        view: {
+            width: 120,
+            expanded: false,
+            localDetail: 0 as const,
+            localClickControls: false,
+            theme,
+        },
+        settlement: { begin: () => ({ complete() {} }) },
+    };
+    const unchanged = {
+        ...base,
+        source: { kind: "write" as const, path: "fixture.ts", before: "same\n", after: "same\n" },
+    };
+
+    const firstBody = first.present(unchanged).body;
+    const secondBody = second.present(unchanged).body;
+    const pendingOwner = {};
+    const pending = first.present({
+        ...base,
+        owner: pendingOwner,
+        source: { kind: "write" as const, path: "fixture.ts", before: "old\n", after: "new\n" },
+    });
+    const firstPendingBeforeSecondReset = first.isPending(pendingOwner);
+    second.reset();
+    const firstPendingAfterSecondReset = first.isPending(pendingOwner);
+    await pending.settled;
+
+    assert.deepEqual({
+        firstBody,
+        secondBody,
+        firstPendingBeforeSecondReset,
+        firstPendingAfterSecondReset,
+    }, {
+        firstBody: "A:✓ no changes",
+        secondBody: "B:✓ no changes",
+        firstPendingBeforeSecondReset: true,
+        firstPendingAfterSecondReset: true,
+    });
+});
+
 test("captures serializable Write evidence and presents it through one settled seam", async () => {
     const presentation = createDiffPresentationModule({
         readSettings: () => ({
@@ -29,6 +100,7 @@ test("captures serializable Write evidence and presents it through one settled s
             expandedPreviewMaxLines: 150,
             extraExpandedPreviewMaxLines: 240,
         }),
+        isLightTheme,
     });
     const evidence = await presentation.capture({
         kind: "write",
@@ -72,7 +144,7 @@ test("captures serializable Write evidence and presents it through one settled s
 });
 
 test("owns incomplete Apply Patch headers without starting body presentation", async () => {
-    const presentation = createDiffPresentationModule({ readSettings: () => ({}) });
+    const presentation = createDiffPresentationModule({ readSettings: () => ({}), isLightTheme });
     const owner = {};
     let settlements = 0;
     const base = {
@@ -148,7 +220,7 @@ test("Apply Patch evidence preserves Update inference after the source file chan
         " const tail = true;",
         "*** End Patch",
     ].join("\n");
-    const presentation = createDiffPresentationModule({ readSettings: () => ({}) });
+    const presentation = createDiffPresentationModule({ readSettings: () => ({}), isLightTheme });
     const evidence = await presentation.capture({ kind: "apply-patch", patchText, cwd });
     assert.ok(evidence);
     assertDeepFrozen(evidence);
@@ -189,6 +261,7 @@ test("Apply Patch evidence preserves Update inference after the source file chan
 test("result suppression updates after its async call presentation settles", async () => {
     const presentation = createDiffPresentationModule({
         readSettings: () => ({}),
+        isLightTheme,
         readFile: async () => "const value = 1;\n",
     });
     const owner = {};

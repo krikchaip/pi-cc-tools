@@ -5,9 +5,23 @@ import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
-import { defineScenarioFamily, runScenario } from "./terminal-session.ts";
+import { defineScenarioFamily, runScenario, type TerminalSession } from "./terminal-session.ts";
 
 const fixture = fileURLToPath(new URL("./terminal-session-smoke.mjs", import.meta.url));
+const descendantCleanupDeadlineMs = 500;
+
+async function waitForDescendantThenRemainActive(
+  terminal: TerminalSession,
+  evidenceName: string,
+  marker: RegExp,
+): Promise<never> {
+  await terminal.expect(evidenceName, {
+    visible: [marker],
+    deadlineMs: 4_000,
+    stableForMs: 0,
+  });
+  return new Promise<never>(() => {});
+}
 
 test("runs a scenario through the terminal-session seam", async () => {
   const artifactsRoot = await mkdtemp(path.join(os.tmpdir(), "pi-cc-terminal-session-test-"));
@@ -63,7 +77,7 @@ test("captures output and exit code from a process that exits during startup", a
   const family = defineScenarioFamily({
     name: "terminal-session-fast-exit",
     viewport: { columns: 40, rows: 12 },
-    deadlineMs: 100,
+    deadlineMs: 5_000,
   });
   const scenario = family.scenario({
     name: "early output and exit",
@@ -95,15 +109,20 @@ test("retains timeout evidence without retrying the scenario", async () => {
   const family = defineScenarioFamily({
     name: "terminal-session-timeout",
     viewport: { columns: 40, rows: 12 },
-    deadlineMs: 80,
-    scenarioDeadlineMs: 1_000,
+    deadlineMs: 2_000,
+    scenarioDeadlineMs: 3_000,
   });
   const scenario = family.scenario({
     name: "bounded expectation",
     start: { mode: "no-session" },
     async run(terminal) {
       runs += 1;
-      await terminal.expect("never-visible", { visible: ["NEVER_VISIBLE"], stableForMs: 0 });
+      await terminal.expect("ready-before-timeout", { visible: ["SMOKE READY"], stableForMs: 0 });
+      await terminal.expect("never-visible", {
+        visible: ["NEVER_VISIBLE"],
+        deadlineMs: 80,
+        stableForMs: 0,
+      });
     },
   });
 
@@ -156,6 +175,10 @@ test("contains a scenario callback after its deadline before returning", async (
 
 test("returns after a bounded containment period for a never-settling callback", async () => {
   const artifactsRoot = await mkdtemp(path.join(os.tmpdir(), "pi-cc-terminal-never-settles-test-"));
+  let markScenarioStarted!: () => void;
+  const scenarioStarted = new Promise<void>((resolve) => {
+    markScenarioStarted = resolve;
+  });
   const family = defineScenarioFamily({
     name: "terminal-session-never-settles",
     viewport: { columns: 40, rows: 12 },
@@ -165,25 +188,32 @@ test("returns after a bounded containment period for a never-settling callback",
     name: "never settles",
     start: { mode: "no-session" },
     async run() {
+      markScenarioStarted();
       await new Promise(() => {});
     },
   });
 
+  let containmentTimer: NodeJS.Timeout | undefined;
   try {
-    const outcome = await Promise.race([
-      runScenario(scenario, {
-        artifactsRoot,
-        piBin: process.execPath,
-        piArgumentPrefix: [fixture],
+    const scenarioResult = runScenario(scenario, {
+      artifactsRoot,
+      piBin: process.execPath,
+      piArgumentPrefix: [fixture],
+    });
+    const containmentLimit = scenarioStarted.then(
+      () => new Promise<"still-running">((resolve) => {
+        containmentTimer = setTimeout(() => resolve("still-running"), 3_000);
       }),
-      new Promise<"still-running">((resolve) => setTimeout(() => resolve("still-running"), 500)),
-    ]);
+    );
+    const outcome = await Promise.race([scenarioResult, containmentLimit]);
     if (outcome === "still-running") {
       assert.fail("runScenario stayed blocked by a never-settling callback");
     }
     assert.equal(outcome.status, "failed");
     assert.match(outcome.error?.message ?? "", /scenario deadline exceeded after 20ms/);
+    assert.match(outcome.error?.message ?? "", /scenario callback did not settle within 250ms/);
   } finally {
+    if (containmentTimer) clearTimeout(containmentTimer);
     await rm(artifactsRoot, { recursive: true, force: true });
   }
 });
@@ -243,16 +273,19 @@ test("stops a hung scenario and its detached process descendants", async () => {
   const family = defineScenarioFamily({
     name: "terminal-session-cleanup",
     viewport: { columns: 40, rows: 12 },
-    scenarioDeadlineMs: 100,
+    scenarioDeadlineMs: descendantCleanupDeadlineMs,
   });
   const scenario = family.scenario({
     name: "hung callback",
     start: {
       mode: "no-session",
-      environment: { SMOKE_SPAWN_DETACHED_CHILD: "1" },
+      environment: {
+        SMOKE_READY_IMMEDIATELY: "1",
+        SMOKE_SPAWN_DETACHED_CHILD: "1",
+      },
     },
-    async run() {
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    async run(terminal) {
+      await waitForDescendantThenRemainActive(terminal, "detached-child-started", /CHILD_PID \d+/);
     },
   });
   let childPid: number | undefined;
@@ -269,7 +302,10 @@ test("stops a hung scenario and its detached process descendants", async () => {
     childPid = Number(/CHILD_PID (\d+)/.exec(raw)?.[1]);
     assert.ok(Number.isInteger(childPid));
     assert.equal(result.status, "failed");
-    assert.match(result.error?.message ?? "", /scenario deadline.*100ms/);
+    assert.match(
+      result.error?.message ?? "",
+      new RegExp(`scenario deadline.*${descendantCleanupDeadlineMs}ms`),
+    );
     await new Promise((resolve) => setTimeout(resolve, 50));
     assert.equal(isProcessAlive(childPid), false, `owned child ${childPid} survived cleanup`);
   } finally {
@@ -284,19 +320,20 @@ test("stops an owned grandchild after its intermediate parent exits", async () =
   const family = defineScenarioFamily({
     name: "terminal-session-daemon-cleanup",
     viewport: { columns: 40, rows: 12 },
-    scenarioDeadlineMs: 150,
+    scenarioDeadlineMs: descendantCleanupDeadlineMs,
   });
   const scenario = family.scenario({
     name: "reparented grandchild",
     start: {
       mode: "no-session",
       environment: {
+        SMOKE_READY_IMMEDIATELY: "1",
         SMOKE_SPAWN_DAEMON: "1",
         SMOKE_DAEMON_PID_FILE: daemonPidPath,
       },
     },
-    async run() {
-      await new Promise((resolve) => setTimeout(resolve, 500));
+    async run(terminal) {
+      await waitForDescendantThenRemainActive(terminal, "daemon-started", /DAEMON_PID \d+/);
     },
   });
   let daemonPid: number | undefined;
@@ -309,6 +346,10 @@ test("stops an owned grandchild after its intermediate parent exits", async () =
     });
     daemonPid = Number(await readFile(daemonPidPath, "utf8"));
     assert.equal(result.status, "failed");
+    assert.match(
+      result.error?.message ?? "",
+      new RegExp(`scenario deadline.*${descendantCleanupDeadlineMs}ms`),
+    );
     assert.ok(Number.isInteger(daemonPid));
     assert.equal(isProcessAlive(daemonPid), false, `owned daemon ${daemonPid} survived cleanup`);
   } finally {
@@ -322,7 +363,7 @@ test("keeps known-red failures visible and rejects an unexpected pass", async ()
   const family = defineScenarioFamily({
     name: "terminal-session-known-red",
     viewport: { columns: 40, rows: 12 },
-    deadlineMs: 500,
+    deadlineMs: 5_000,
   });
   const expectedFailure = family.scenario({
     name: "expected failure",

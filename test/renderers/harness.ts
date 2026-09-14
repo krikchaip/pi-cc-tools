@@ -56,9 +56,10 @@ export async function withRendererHarness(
 
   const fakePi = {
     tools: new Map<string, any>(),
+    commands: new Map<string, any>(),
     handlers: new Map<string, any[]>(),
     registerTool(definition: any) { this.tools.set(definition.name, definition); },
-    registerCommand() {},
+    registerCommand(name: string, definition: any) { this.commands.set(name, definition); },
     registerShortcut() {},
     on(name: string, handler: any) { this.handlers.set(name, [...(this.handlers.get(name) ?? []), handler]); },
     getThinkingLevel() { return "off"; },

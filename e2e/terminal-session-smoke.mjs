@@ -8,11 +8,15 @@ process.stdin.resume();
 
 let input = "";
 let ready = false;
+let childMarker = "";
+let daemonMarker = "";
 
 function showReady() {
   ready = true;
   process.stdout.write("\u001b[?1000h\u001b[?1006h\u001b[2J\u001b[HSMOKE READY\r\n");
   process.stdout.write(`HOME ${process.env.HOME}\r\nAGENT ${process.env.PI_CODING_AGENT_DIR}\r\n`);
+  if (childMarker) process.stdout.write(childMarker);
+  if (daemonMarker) process.stdout.write(daemonMarker);
   if (process.env.SESSION_REF) {
     const sessionArgument = process.argv[process.argv.indexOf("--session") + 1];
     process.stdout.write(`SESSION_REF_MATCH ${process.env.SESSION_REF === sessionArgument}\r\n`);
@@ -24,7 +28,8 @@ if (process.env.SMOKE_SPAWN_CHILD === "1" || process.env.SMOKE_SPAWN_DETACHED_CH
     detached: process.env.SMOKE_SPAWN_DETACHED_CHILD === "1",
     stdio: "ignore",
   });
-  process.stdout.write(`CHILD_PID ${child.pid}\r\n`);
+  childMarker = `CHILD_PID ${child.pid}\r\n`;
+  if (ready) process.stdout.write(childMarker);
 }
 
 if (process.env.SMOKE_SPAWN_DAEMON === "1") {
@@ -36,11 +41,16 @@ if (process.env.SMOKE_SPAWN_DAEMON === "1") {
       stdio: "ignore",
     });
     writeFileSync(process.env.SMOKE_DAEMON_PID_FILE, String(daemon.pid));
+    process.stdout.write(\`DAEMON_PID \${daemon.pid}\\r\\n\`);
     daemon.unref();
   `], {
     detached: true,
     env: process.env,
-    stdio: "ignore",
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  helper.stdout?.on("data", (chunk) => {
+    daemonMarker += chunk.toString();
+    if (ready) process.stdout.write(chunk);
   });
   helper.unref();
 }

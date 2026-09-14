@@ -5299,29 +5299,28 @@ function themeBgRgb(theme: any, key: string): Rgb | null {
 	return ansi ? parseAnsiRgb(ansi) : null;
 }
 
-function isLightThemeBackground(theme: any): boolean {
-	const bg = themeBgRgb(theme, "toolSuccessBg") || themeBgRgb(theme, "userMessageBg") || themeBgRgb(theme, "selectedBg");
-	if (bg) {
-		const lum = 0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b;
-		return lum > 155;
-	}
-	const fg = themeFgRgb(theme, "text") || themeFgRgb(theme, "fg");
-	if (fg) {
-		const lum = 0.2126 * fg.r + 0.7152 * fg.g + 0.0722 * fg.b;
-		return lum < 125;
-	}
-	return false;
+function normalizedLuminance(rgb: Rgb): number {
+	return Math.round((0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b) * 1e9) / 1e9;
 }
+
+function isLightThemeBackground(theme: any): boolean {
+	const panel = themeBgRgb(theme, "toolSuccessBg") || themeBgRgb(theme, "userMessageBg") || themeBgRgb(theme, "selectedBg");
+	if (panel) return normalizedLuminance(panel) > 165;
+	const foreground = themeFgRgb(theme, "text") || themeFgRgb(theme, "fg");
+	return foreground ? normalizedLuminance(foreground) < 95 : false;
+}
+
+type ThemePaletteCacheKey = Readonly<{
+	theme: unknown;
+	name: string;
+	fingerprint: string;
+	overrides: string;
+}>;
 
 // Cache theme identity so we only recompute on theme change. The Theme
 // object is reused across renders within a single session unless the user
 // switches themes via the picker.
-// Cache theme identity so we only recompute on theme change. The Theme
-// object is reused across renders within a single session unless the user
-// switches themes via the picker.
-let _themePaletteCacheTheme: unknown = null;
-let _themePaletteCacheName: string | null = null;
-let _themePaletteCacheFingerprint: string | null = null;
+let _themePaletteCacheKey: ThemePaletteCacheKey | undefined;
 
 /** Resolved-color fingerprint so palette re-derives when the active theme file changes under the same name/object. */
 function themePaletteFingerprint(theme: any): string {
@@ -5330,9 +5329,7 @@ function themePaletteFingerprint(theme: any): string {
 }
 
 function invalidateThemePaletteCache(): void {
-	_themePaletteCacheTheme = null;
-	_themePaletteCacheName = null;
-	_themePaletteCacheFingerprint = null;
+	_themePaletteCacheKey = undefined;
 }
 
 function themeAdaptiveEnabled(): boolean {
@@ -5347,44 +5344,71 @@ const CHROME_STYLE_DEFAULTS = {
 	statusSuccess: "\x1b[32m",
 	statusError: "\x1b[31m",
 	statusPending: "\x1b[90m",
+	dim: "\x1b[38;2;80;80;80m",
+	rule: "\x1b[38;2;50;50;50m",
 } as const;
 
 function resetThemePalette(): void {
+	const configured = diffPresentationModule.compatibility.configuredForegrounds();
 	BORDER_COLOR = CHROME_STYLE_DEFAULTS.border;
 	WORKED_LINE_FG = CHROME_STYLE_DEFAULTS.workedLine;
 	CODE_BLOCK_LANG_FG = CHROME_STYLE_DEFAULTS.codeBlockLanguage;
 	TOOL_STATUS_SUCCESS = CHROME_STYLE_DEFAULTS.statusSuccess;
 	TOOL_STATUS_ERROR = CHROME_STYLE_DEFAULTS.statusError;
 	TOOL_STATUS_PENDING = CHROME_STYLE_DEFAULTS.statusPending;
+	FG_DIM = configured.dim ?? CHROME_STYLE_DEFAULTS.dim;
+	FG_RULE = configured.rule ?? CHROME_STYLE_DEFAULTS.rule;
 	applyToolBranchColor();
 }
 
 function applyThemePaletteIfNeeded(theme: any): void {
 	if (!theme) return;
+	const configured = diffPresentationModule.compatibility.configuredForegrounds();
 	if (!themeAdaptiveEnabled()) {
+		invalidateThemePaletteCache();
+		FG_DIM = configured.dim ?? CHROME_STYLE_DEFAULTS.dim;
+		FG_RULE = configured.rule ?? CHROME_STYLE_DEFAULTS.rule;
 		applyToolBranchColor(theme);
 		return;
 	}
-	const themeName = typeof theme.name === "string" ? theme.name : "";
-	const fingerprint = themePaletteFingerprint(theme);
-	if (_themePaletteCacheTheme === theme && _themePaletteCacheName === themeName && _themePaletteCacheFingerprint === fingerprint) {
+	const nextCacheKey: ThemePaletteCacheKey = {
+		theme,
+		name: typeof theme.name === "string" ? theme.name : "",
+		fingerprint: themePaletteFingerprint(theme),
+		overrides: `${configured.dim ?? ""}\u001f${configured.rule ?? ""}`,
+	};
+	const previousCacheKey = _themePaletteCacheKey;
+	if (
+		previousCacheKey
+		&& previousCacheKey.theme === nextCacheKey.theme
+		&& previousCacheKey.name === nextCacheKey.name
+		&& previousCacheKey.fingerprint === nextCacheKey.fingerprint
+		&& previousCacheKey.overrides === nextCacheKey.overrides
+	) {
 		applyToolBranchColor(theme);
 		return;
 	}
-	if (_themePaletteCacheName !== themeName || _themePaletteCacheFingerprint !== fingerprint) {
+	if (
+		!previousCacheKey
+		|| previousCacheKey.name !== nextCacheKey.name
+		|| previousCacheKey.fingerprint !== nextCacheKey.fingerprint
+		|| previousCacheKey.overrides !== nextCacheKey.overrides
+	) {
 		bumpToolBranchVisualEpoch();
 	}
-	_themePaletteCacheTheme = theme;
-	_themePaletteCacheName = themeName;
-	_themePaletteCacheFingerprint = fingerprint;
+	_themePaletteCacheKey = nextCacheKey;
 	applyToolBranchColor(theme);
+	const muted = safeFgAnsi(theme, "muted");
 	TOOL_STATUS_SUCCESS = safeFgAnsi(theme, "success") ?? TOOL_STATUS_SUCCESS;
 	TOOL_STATUS_ERROR = safeFgAnsi(theme, "error") ?? TOOL_STATUS_ERROR;
-	TOOL_STATUS_PENDING = safeFgAnsi(theme, "dim") ?? safeFgAnsi(theme, "muted") ?? safeFgAnsi(theme, "thinkingText") ?? TOOL_STATUS_PENDING;
+	TOOL_STATUS_PENDING = safeFgAnsi(theme, "dim") ?? muted ?? safeFgAnsi(theme, "thinkingText") ?? TOOL_STATUS_PENDING;
+	if (configured.dim) FG_DIM = configured.dim;
+	else if (muted) FG_DIM = muted;
+	FG_RULE = configured.rule ?? BORDER_COLOR;
 }
 
 const D_RST = "\x1b[0m";
-const FG_DIM = "\x1b[38;2;80;80;80m";
+let FG_DIM = "\x1b[38;2;80;80;80m";
 let FG_RULE = "\x1b[38;2;50;50;50m";
 // Tool branch connectors (├ └ │). Default fixed gray 72 — independent of pi theme.
 const DEFAULT_TOOL_BRANCH_GRAY = 72;
@@ -6625,6 +6649,7 @@ const diffPresentationModule = createDiffPresentationModule({
 	},
 	displayPath: shortPath,
 	moveArrow: () => `${BORDER_COLOR}→${TRANSPARENT_RESET}`,
+	isLightTheme: isLightThemeBackground,
 	resolveRuleAnsi: (theme) => resolveThemeChromeFg(theme) ?? safeFgAnsi(theme, "borderMuted") ?? undefined,
 });
 

@@ -12,6 +12,7 @@ import type {
   DiffPresentationDependencies,
   DiffPresentationRequest,
   DiffPresentationSettings,
+  DiffSharedForegrounds,
   DiffSource,
   DiffTheme,
   DiffView,
@@ -195,6 +196,37 @@ const DIFF_PRESETS: Readonly<Record<string, DiffPreset>> = {
   },
 };
 
+interface ResolvedDiffConfiguration {
+  readonly hasThemeSelection: boolean;
+  readonly explicitBackground: boolean;
+  color(name: keyof DiffPreset): string | undefined;
+}
+
+function resolveDiffConfiguration(
+  settings: DiffPresentationSettings,
+): ResolvedDiffConfiguration {
+  const preset = settings.diffTheme
+    ? DIFF_PRESETS[settings.diffTheme]
+    : undefined;
+  const overrides = settings.diffColors ?? {};
+  return {
+    hasThemeSelection: Boolean(settings.diffTheme),
+    explicitBackground: Boolean(preset) || Object.keys(overrides).length > 0,
+    color(name) {
+      return overrides[name] ?? preset?.[name];
+    },
+  };
+}
+
+function configuredSharedForegrounds(
+  settings: DiffPresentationSettings,
+): DiffSharedForegrounds {
+  const configuration = resolveDiffConfiguration(settings);
+  const dim = hexToFgAnsi(configuration.color("fgDim") ?? "") || undefined;
+  const rule = hexToFgAnsi(configuration.color("fgRule") ?? "") || undefined;
+  return { dim, rule };
+}
+
 const EXT_LANG: Readonly<Record<string, BundledLanguage>> = {
   ts: "typescript",
   tsx: "tsx",
@@ -267,13 +299,16 @@ class DiffPalette {
   private fgStripe = "\x1b[38;2;40;40;40m";
   private fgSafeMuted = "\x1b[38;2;139;148;158m";
   private readonly clearHighlights: () => void;
+  private readonly isLightTheme: (theme: DiffTheme) => boolean;
   private readonly resolveRuleAnsi?: (theme: DiffTheme) => string | undefined;
 
   constructor(
     clearHighlights: () => void,
+    isLightTheme: (theme: DiffTheme) => boolean,
     resolveRuleAnsi?: (theme: DiffTheme) => string | undefined,
   ) {
     this.clearHighlights = clearHighlights;
+    this.isLightTheme = isLightTheme;
     this.resolveRuleAnsi = resolveRuleAnsi;
   }
 
@@ -290,76 +325,69 @@ class DiffPalette {
     this.key = key;
     this.resetValues();
 
-    const preset = settings.diffTheme
-      ? DIFF_PRESETS[settings.diffTheme]
-      : undefined;
-    const overrides = settings.diffColors ?? {};
-    const explicitBackground =
-      Boolean(preset) || Object.keys(overrides).length > 0;
-    const explicitForeground = new Set<string>();
+    const configuration = resolveDiffConfiguration(settings);
+    const explicitForeground = new Set<keyof DiffPreset>();
     const applyBg = (
-      name: string,
-      value: string | undefined,
+      name: keyof DiffPreset,
       set: (ansi: string) => void,
     ): void => {
-      const ansi = hexToBgAnsi(overrides[name] ?? value ?? "");
+      const ansi = hexToBgAnsi(configuration.color(name) ?? "");
       if (ansi) set(ansi);
     };
     const applyFg = (
-      name: string,
-      value: string | undefined,
+      name: keyof DiffPreset,
       set: (ansi: string) => void,
     ): void => {
-      const ansi = hexToFgAnsi(overrides[name] ?? value ?? "");
+      const ansi = hexToFgAnsi(configuration.color(name) ?? "");
       if (!ansi) return;
       set(ansi);
       explicitForeground.add(name);
     };
-    applyBg("bgAdd", preset?.bgAdd, (v) => {
+    applyBg("bgAdd", (v) => {
       this.bgAdd = v;
     });
-    applyBg("bgDel", preset?.bgDel, (v) => {
+    applyBg("bgDel", (v) => {
       this.bgDel = v;
     });
-    applyBg("bgAddHighlight", preset?.bgAddHighlight, (v) => {
+    applyBg("bgAddHighlight", (v) => {
       this.bgAddWord = v;
     });
-    applyBg("bgDelHighlight", preset?.bgDelHighlight, (v) => {
+    applyBg("bgDelHighlight", (v) => {
       this.bgDelWord = v;
     });
-    applyBg("bgGutterAdd", preset?.bgGutterAdd, (v) => {
+    applyBg("bgGutterAdd", (v) => {
       this.bgGutterAdd = v;
     });
-    applyBg("bgGutterDel", preset?.bgGutterDel, (v) => {
+    applyBg("bgGutterDel", (v) => {
       this.bgGutterDel = v;
     });
-    applyBg("bgEmpty", preset?.bgEmpty, (v) => {
+    applyBg("bgEmpty", (v) => {
       this.bgEmpty = v;
     });
-    applyFg("fgAdd", preset?.fgAdd, (v) => {
+    applyFg("fgAdd", (v) => {
       this.fgAdd = v;
     });
-    applyFg("fgDel", preset?.fgDel, (v) => {
+    applyFg("fgDel", (v) => {
       this.fgDel = v;
     });
-    applyFg("fgDim", preset?.fgDim, (v) => {
+    applyFg("fgDim", (v) => {
       this.fgDim = v;
     });
-    applyFg("fgLnum", preset?.fgLnum, (v) => {
+    applyFg("fgLnum", (v) => {
       this.fgLnum = v;
     });
-    applyFg("fgRule", preset?.fgRule, (v) => {
+    applyFg("fgRule", (v) => {
       this.fgRule = v;
     });
-    applyFg("fgStripe", preset?.fgStripe, (v) => {
+    applyFg("fgStripe", (v) => {
       this.fgStripe = v;
     });
-    applyFg("fgSafeMuted", preset?.fgSafeMuted, (v) => {
+    applyFg("fgSafeMuted", (v) => {
       this.fgSafeMuted = v;
     });
 
     const adaptive = settings.themeAdaptive !== false;
-    this.onLight = adaptive && isLightThemeBackground(theme);
+    this.onLight = adaptive && this.isLightTheme(theme);
     if (adaptive) {
       const muted = safeFgAnsi(theme, "muted");
       const rule =
@@ -370,11 +398,11 @@ class DiffPalette {
       if (!explicitForeground.has("fgStripe") && rule) this.fgStripe = rule;
       if (!explicitForeground.has("fgSafeMuted") && muted)
         this.fgSafeMuted = muted;
-      if (!explicitBackground) this.deriveBackgrounds(theme);
+      if (!configuration.explicitBackground) this.deriveBackgrounds(theme);
     }
-    const selectedShiki = overrides.shikiTheme ?? preset?.shikiTheme;
+    const selectedShiki = configuration.color("shikiTheme");
     if (selectedShiki) this.shikiTheme = selectedShiki as BundledTheme;
-    else if (!process.env.DIFF_THEME && !settings.diffTheme)
+    else if (!process.env.DIFF_THEME && !configuration.hasThemeSelection)
       this.shikiTheme = this.onLight ? "github-light" : "github-dark";
     this.clearHighlights();
   }
@@ -516,8 +544,13 @@ export class DiffPresentationEngine {
       dependencies.readFileSync ?? ((path) => nodeReadFileSync(path, "utf8"));
     this.palette = new DiffPalette(
       () => this.highlights.clear(),
+      dependencies.isLightTheme,
       dependencies.resolveRuleAnsi,
     );
+  }
+
+  configuredForegrounds(): DiffSharedForegrounds {
+    return configuredSharedForegrounds(this.dependencies.readSettings());
   }
 
   async capture(source: DiffSource): Promise<DiffEvidence | undefined> {
@@ -2803,18 +2836,6 @@ function themeFingerprint(theme: DiffTheme): string {
   ]
     .map((key) => safeFgAnsi(theme, key) ?? "")
     .join("\u001f");
-}
-function isLightThemeBackground(theme: DiffTheme): boolean {
-  const panel =
-    themeBgRgb(theme, "toolSuccessBg") ??
-    themeBgRgb(theme, "userMessageBg") ??
-    themeBgRgb(theme, "selectedBg");
-  if (panel) return luminance(panel) > 165;
-  const foreground = themeFgRgb(theme, "text") ?? themeFgRgb(theme, "fg");
-  return foreground ? luminance(foreground) < 95 : false;
-}
-function luminance(rgb: Rgb): number {
-  return 0.2126 * rgb.r + 0.7152 * rgb.g + 0.0722 * rgb.b;
 }
 function parseAnsiRgb(ansi: string): Rgb | undefined {
   const trueColor = ansi.match(/\u001b\[(?:38|48);2;(\d+);(\d+);(\d+)m/);

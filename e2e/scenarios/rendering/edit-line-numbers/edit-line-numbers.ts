@@ -27,7 +27,11 @@ export async function captureEditLineFrames(
     stableForMs: 750,
   });
   await repaint(terminal, editLineViewport);
-  const collapsed = await findVisibleFrame(terminal, "collapsed-summary", summary, "page-up", 4);
+  await findVisibleFrame(terminal, "collapsed-summary", summary, "page-up", 4);
+  const collapsed = await terminal.expect("collapsed-click-ready", {
+    visible: [summary],
+    stableForMs: 500,
+  });
   await terminal.perform({ type: "click", at: collapsed.find(summary) });
   await terminal.expect("expanded-ready", {
     visible: [/click to collapse|more diff lines/],

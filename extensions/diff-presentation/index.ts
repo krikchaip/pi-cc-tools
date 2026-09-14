@@ -5,6 +5,7 @@ export type {
     DiffEvidence,
     DiffOutputTreeBlock,
     DiffPresentationChrome,
+    DiffPresentationCompatibility,
     DiffPresentationDependencies,
     DiffPresentationModule,
     DiffPresentationRequest,
@@ -12,6 +13,7 @@ export type {
     DiffPresentationSnapshot,
     DiffPresentationSurface,
     DiffRenderSettlement,
+    DiffSharedForegrounds,
     DiffSource,
     DiffTheme,
     DiffView,
@@ -26,9 +28,6 @@ import type {
     DiffPresentationSurface,
 } from "./types.ts";
 
-const RUNTIME_KEY = Symbol.for("pi-cc-tools:diff-presentation-runtime:v1");
-const RUNTIME_VERSION = 1;
-
 interface PresentationSlot {
     key?: string;
     frame?: PresentationFrame;
@@ -41,26 +40,31 @@ interface OwnerPresentation {
     readonly slots: Map<DiffPresentationSurface, PresentationSlot>;
 }
 
-interface DiffPresentationRuntime {
-    readonly version: typeof RUNTIME_VERSION;
+interface DiffPresentationState {
     owners: WeakMap<object, OwnerPresentation>;
 }
-
-type RuntimeGlobal = typeof globalThis & { [RUNTIME_KEY]?: DiffPresentationRuntime };
 
 export function createDiffPresentationModule(
     dependencies: DiffPresentationDependencies,
 ): DiffPresentationModule {
     const engine = new DiffPresentationEngine(dependencies);
-    const runtime = getRuntime();
+    const state: DiffPresentationState = {
+        owners: new WeakMap<object, OwnerPresentation>(),
+    };
 
     return {
+        compatibility: Object.freeze({
+            configuredForegrounds() {
+                return engine.configuredForegrounds();
+            },
+        }),
+
         capture(source) {
             return engine.capture(source);
         },
 
         present(request) {
-            const owner = getOwner(runtime, request.owner);
+            const owner = getOwner(state, request.owner);
             const companionReady = hasReadyCompanion(owner, request.surface);
             const prepared = engine.prepare(request, companionReady);
             if (!prepared) return emptySnapshot();
@@ -103,35 +107,23 @@ export function createDiffPresentationModule(
         },
 
         isPending(ownerKey) {
-            const owner = runtime.owners.get(ownerKey);
+            const owner = state.owners.get(ownerKey);
             if (!owner) return false;
             return [...owner.slots.values()].some((slot) => slot.pending !== undefined);
         },
 
         reset() {
-            runtime.owners = new WeakMap<object, OwnerPresentation>();
+            state.owners = new WeakMap<object, OwnerPresentation>();
             engine.reset();
         },
     };
 }
 
-function getRuntime(): DiffPresentationRuntime {
-    const root = globalThis as RuntimeGlobal;
-    const current = root[RUNTIME_KEY];
-    if (current?.version === RUNTIME_VERSION && current.owners instanceof WeakMap) return current;
-    const created: DiffPresentationRuntime = {
-        version: RUNTIME_VERSION,
-        owners: new WeakMap<object, OwnerPresentation>(),
-    };
-    root[RUNTIME_KEY] = created;
-    return created;
-}
-
-function getOwner(runtime: DiffPresentationRuntime, ownerKey: object): OwnerPresentation {
-    let owner = runtime.owners.get(ownerKey);
+function getOwner(state: DiffPresentationState, ownerKey: object): OwnerPresentation {
+    let owner = state.owners.get(ownerKey);
     if (!owner) {
         owner = { slots: new Map<DiffPresentationSurface, PresentationSlot>() };
-        runtime.owners.set(ownerKey, owner);
+        state.owners.set(ownerKey, owner);
     }
     return owner;
 }

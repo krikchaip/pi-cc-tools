@@ -92,6 +92,8 @@ export interface DiffPresentationDependencies {
     readonly moveArrow?: (view: DiffView) => string;
     readonly readFile?: (path: string) => Promise<string>;
     readonly readFileSync?: (path: string) => string;
+    /** Supplies the host's generic light/dark classification policy. */
+    readonly isLightTheme: (theme: DiffTheme) => boolean;
     /** Supplies the host's resolved outline/rule ANSI so diff rules match tool chrome. */
     readonly resolveRuleAnsi?: (theme: DiffTheme) => string | undefined;
 }
@@ -104,7 +106,18 @@ export type DiffEvidence = Readonly<{
     readonly [DIFF_EVIDENCE]: true;
 }>;
 
+export interface DiffSharedForegrounds {
+    readonly dim?: string;
+    readonly rule?: string;
+}
+
+/** Preserves legacy host surfaces that intentionally share configured diff foregrounds. */
+export interface DiffPresentationCompatibility {
+    configuredForegrounds(): DiffSharedForegrounds;
+}
+
 export interface DiffPresentationModule {
+    readonly compatibility: DiffPresentationCompatibility;
     capture(source: DiffSource): Promise<DiffEvidence | undefined>;
     present(request: DiffPresentationRequest): DiffPresentationSnapshot;
     isPending(owner: object): boolean;
