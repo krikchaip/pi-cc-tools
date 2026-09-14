@@ -628,9 +628,10 @@ await withRendererHarness(
       if (imageExecution.imageComponents.length !== 0) {
         throw new Error("collapsed MCP image exposed its payload before local expansion");
       }
+      const collapsedImageRows = imageExecution.render(120).map((line: string) => plain(line));
       const imageActivated = imageExecution.activateClickAction("expand", "top");
       if (!imageActivated || imageExecution.imageComponents.length !== 1) {
-        throw new Error(`expanded MCP image did not reveal its image payload: ${JSON.stringify({ imageActivated, expanded: imageExecution.expanded, imageCount: imageExecution.imageComponents.length, rows: imageExecution.render(120).map((line: string) => plain(line)) })}`);
+        throw new Error(`expanded MCP image did not reveal its image payload: ${JSON.stringify({ imageActivated, expanded: imageExecution.expanded, imageCount: imageExecution.imageComponents.length, collapsedImageRows })}`);
       }
     } finally {
       setCapabilities(savedCapabilities);
@@ -663,11 +664,14 @@ await withRendererHarness(
     summaryGroupParent.addChild(makeShortGroupedExecution("call_summary_group_2", "list_commits", summaryResult.content[0].text));
     const summaryGroup = (summaryGroupParent as any).children[0];
     const summaryGroupRows = summaryGroupParent.render(120).map((line: string) => plain(line));
+    const hasDeadAnchor = summaryGroupRows.some((_line: string, y: number) => (
+      Array.from({ length: 120 }, (_, x) => x).some((x) => summaryGroup.clickAnchorAtPoint?.(x, y) !== undefined)
+    ));
     if (
       summaryGroupRows.some((line: string) => line.includes("click any for details") || line.includes("Responded"))
-      || summaryGroup.clickAnchors.length > 0
+      || hasDeadAnchor
     ) {
-      throw new Error(`MCP summary-mode group exposed dead click anchors: ${JSON.stringify({ summaryGroupRows, clickAnchors: summaryGroup.clickAnchors })}`);
+      throw new Error(`MCP summary-mode group exposed dead click anchors: ${JSON.stringify({ summaryGroupRows, hasDeadAnchor })}`);
     }
 
     console.log("OK  MCP collapsed summary, L0/L1/L2, shapes, errors, renderer priority, and grouped child isolation");

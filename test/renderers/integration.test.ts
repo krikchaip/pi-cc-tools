@@ -366,6 +366,7 @@ await withRendererHarness(
     }
 
     const shortAgentExecution = createAgentExecution("short_standalone", 1, 2);
+    shortAgentExecution.render(100);
     if (!shortAgentExecution.activateClickAction?.("expand")) {
       throw new Error("short standalone Agent did not expand from its result summary");
     }
@@ -451,10 +452,14 @@ await withRendererHarness(
     agentGroupParent.addChild(groupedAgentFirst);
     agentGroupParent.addChild(groupedAgentSecond);
     const agentGroup = (agentGroupParent as any).children[0];
-    if ((agentGroupParent as any).children.length !== 1 || typeof agentGroup?.clickAnchorAtPoint !== "function") {
+    const compactAgentGroupRows = agentGroupParent.render(100).map((line: string) => plain(line));
+    if (
+      (agentGroupParent as any).children.length !== 1
+      || typeof agentGroup?.forEachTool !== "function"
+      || typeof agentGroup?.clickAnchorAtPoint !== "function"
+    ) {
       throw new Error("Agent executions did not enter the standard tool group");
     }
-    const compactAgentGroupRows = agentGroupParent.render(100).map((line: string) => plain(line));
     let groupedAgentHeader: { x: number; y: number } | undefined;
     for (let y = 0; y < compactAgentGroupRows.length && !groupedAgentHeader; y++) {
       for (let x = 0; x < 100; x++) {
