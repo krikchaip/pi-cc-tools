@@ -17,14 +17,11 @@ await withRendererHarness(
       diffTheme: "midnight",
     },
   },
-  async ({ fakePi, ToolExecutionComponent, Container, writePiSettings }) => {
-    const { Text } = await import("../../node_modules/@earendil-works/pi-tui/dist/index.js");
-    const {
-      Theme,
-      getResolvedThemeColors,
-      getThemeByName,
-      setThemeInstance,
-    } = await import("../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js");
+  async ({ fakePi, toolGroup, writePiSettings }) => {
+    const { Text } =
+      await import("../../node_modules/@earendil-works/pi-tui/dist/index.js");
+    const { Theme, getResolvedThemeColors, getThemeByName, setThemeInstance } =
+      await import("../../node_modules/@earendil-works/pi-coding-agent/dist/modes/interactive/theme/theme.js");
 
     const resolved = getResolvedThemeColors("light") as Record<string, string>;
     const backgroundKeys = new Set([
@@ -38,7 +35,8 @@ await withRendererHarness(
     const foregroundColors: Record<string, string> = {};
     const backgroundColors: Record<string, string> = {};
     for (const [key, value] of Object.entries(resolved)) {
-      (backgroundKeys.has(key) ? backgroundColors : foregroundColors)[key] = value;
+      (backgroundKeys.has(key) ? backgroundColors : foregroundColors)[key] =
+        value;
     }
     foregroundColors.muted = "#f000f0";
     foregroundColors.dim = "#00ffff";
@@ -46,9 +44,14 @@ await withRendererHarness(
     backgroundColors.toolSuccessBg = "#a0a0a0";
     backgroundColors.userMessageBg = "#a0a0a0";
     backgroundColors.selectedBg = "#a0a0a0";
-    const adaptiveTheme = new Theme(foregroundColors, backgroundColors, "truecolor", {
-      name: "candidate-5-theme-palette",
-    });
+    const adaptiveTheme = new Theme(
+      foregroundColors,
+      backgroundColors,
+      "truecolor",
+      {
+        name: "candidate-5-theme-palette",
+      },
+    );
     const defaultTheme = getThemeByName("dark");
     const list = fakePi.tools.get("ls");
     const ccTheme = fakePi.commands.get("cc-theme");
@@ -67,12 +70,19 @@ await withRendererHarness(
         lastComponent: undefined,
       };
       list.renderCall({ path: "." }, theme, context);
-      return list.renderResult(
-        { content: [{ type: "text", text: `${label}-${fixtureSequence}.txt\nbeta/` }] },
-        { expanded: true, isPartial: false },
-        theme,
-        context,
-      ).render(120).join("\n");
+      return list
+        .renderResult(
+          {
+            content: [
+              { type: "text", text: `${label}-${fixtureSequence}.txt\nbeta/` },
+            ],
+          },
+          { expanded: true, isPartial: false },
+          theme,
+          context,
+        )
+        .render(120)
+        .join("\n");
     };
 
     const emptyDefinition = {
@@ -83,39 +93,47 @@ await withRendererHarness(
       renderCall: () => new Text(""),
       renderResult: () => new Text(""),
     };
-    const makeEmptyExecution = (id: string) => {
-      const execution = new ToolExecutionComponent(
-        "theme-empty",
-        id,
-        {},
-        {},
-        emptyDefinition,
-        { mode: "fullscreen", requestRender() {} } as any,
-        process.cwd(),
-      ) as any;
-      execution.markExecutionStarted();
-      execution.setArgsComplete();
-      execution.updateResult({ content: [], isError: false }, false);
-      return execution;
-    };
     const renderEmptyGroup = (label: string): string => {
       fixtureSequence += 1;
-      const parent = new Container();
-      parent.addChild(makeEmptyExecution(`${label}_${fixtureSequence}_1`));
-      parent.addChild(makeEmptyExecution(`${label}_${fixtureSequence}_2`));
-      const group = (parent as any).children[0];
-      group.setExpanded(true);
-      return parent.render(120).join("\n");
+      return toolGroup([
+        {
+          tool: "theme-empty",
+          id: `${label}_${fixtureSequence}_1`,
+          definition: emptyDefinition,
+          interaction: "fullscreen",
+          result: { content: [], isError: false },
+          expanded: true,
+        },
+        {
+          tool: "theme-empty",
+          id: `${label}_${fixtureSequence}_2`,
+          definition: emptyDefinition,
+          interaction: "fullscreen",
+          result: { content: [], isError: false },
+          expanded: true,
+        },
+      ])
+        .observe(120)
+        .rawRows.join("\n");
     };
 
-    const assertHostPalette = (label: string, theme: any, ruleAnsi: string, dimAnsi: string): void => {
+    const assertHostPalette = (
+      label: string,
+      theme: any,
+      ruleAnsi: string,
+      dimAnsi: string,
+    ): void => {
       const listRaw = renderList(label, theme);
       if (!listRaw.includes(`${ruleAnsi}├──`)) {
-        throw new Error(`${label} did not preserve List rule: ${JSON.stringify(listRaw)}`);
+        throw new Error(
+          `${label} did not preserve List rule: ${JSON.stringify(listRaw)}`,
+        );
       }
       const groupRaw = renderEmptyGroup(label);
       if (!groupRaw.includes(`${dimAnsi}theme-empty`)) {
-        throw new Error(`${label} did not preserve grouped fallback text: ${JSON.stringify(groupRaw)}`);
+        throw new Error(
+          `${label} did not preserve grouped fallback text: ${JSON.stringify(groupRaw)}`,
+        );
       }
     };
 
@@ -126,7 +144,10 @@ await withRendererHarness(
         notify() {},
       },
     });
-    const setAdaptive = async (mode: "on" | "off", theme: any): Promise<void> => {
+    const setAdaptive = async (
+      mode: "on" | "off",
+      theme: any,
+    ): Promise<void> => {
       await ccTheme.handler(mode, commandContext(theme));
     };
     const assertConfiguredPaletteAcrossAdaptiveModes = async (
@@ -136,7 +157,12 @@ await withRendererHarness(
     ): Promise<void> => {
       for (const mode of ["off", "on"] as const) {
         await setAdaptive(mode, adaptiveTheme);
-        assertHostPalette(`${label} with adaptive ${mode}`, adaptiveTheme, ruleAnsi, dimAnsi);
+        assertHostPalette(
+          `${label} with adaptive ${mode}`,
+          adaptiveTheme,
+          ruleAnsi,
+          dimAnsi,
+        );
       }
     };
 
@@ -144,8 +170,17 @@ await withRendererHarness(
     try {
       const midnightRule = "\x1b[38;2;40;40;40m";
       const midnightDim = "\x1b[38;2;64;64;64m";
-      assertHostPalette("initial midnight preset", adaptiveTheme, midnightRule, midnightDim);
-      await assertConfiguredPaletteAcrossAdaptiveModes("midnight preset", midnightRule, midnightDim);
+      assertHostPalette(
+        "initial midnight preset",
+        adaptiveTheme,
+        midnightRule,
+        midnightDim,
+      );
+      await assertConfiguredPaletteAcrossAdaptiveModes(
+        "midnight preset",
+        midnightRule,
+        midnightDim,
+      );
 
       writePiSettings({
         ...baseSettings,
@@ -158,8 +193,17 @@ await withRendererHarness(
       });
       const directRule = "\x1b[38;2;68;85;102m";
       const directDim = "\x1b[38;2;17;34;51m";
-      assertHostPalette("direct foreground overrides preset", adaptiveTheme, directRule, directDim);
-      await assertConfiguredPaletteAcrossAdaptiveModes("direct overrides", directRule, directDim);
+      assertHostPalette(
+        "direct foreground overrides preset",
+        adaptiveTheme,
+        directRule,
+        directDim,
+      );
+      await assertConfiguredPaletteAcrossAdaptiveModes(
+        "direct overrides",
+        directRule,
+        directDim,
+      );
 
       const adaptiveRule = "\x1b[38;2;64;255;255m";
       const adaptiveDim = "\x1b[38;2;240;0;240m";
@@ -167,7 +211,12 @@ await withRendererHarness(
         ...baseSettings,
         themeAdaptive: true,
       });
-      assertHostPalette("direct config adaptive on", adaptiveTheme, adaptiveRule, adaptiveDim);
+      assertHostPalette(
+        "direct config adaptive on",
+        adaptiveTheme,
+        adaptiveRule,
+        adaptiveDim,
+      );
       writePiSettings({
         ...baseSettings,
         themeAdaptive: false,
@@ -182,27 +231,43 @@ await withRendererHarness(
         ...baseSettings,
         themeAdaptive: true,
       });
-      assertHostPalette("direct config adaptive on again", adaptiveTheme, adaptiveRule, adaptiveDim);
+      assertHostPalette(
+        "direct config adaptive on again",
+        adaptiveTheme,
+        adaptiveRule,
+        adaptiveDim,
+      );
 
-      const renderThresholdBranch = (label: string, panel: number | undefined, foreground: number): string => {
+      const renderThresholdBranch = (
+        label: string,
+        panel: number | undefined,
+        foreground: number,
+      ): string => {
         const channel = (value: number) => value.toString(16).padStart(2, "0");
-        const gray = (value: number) => `#${channel(value)}${channel(value)}${channel(value)}`;
+        const gray = (value: number) =>
+          `#${channel(value)}${channel(value)}${channel(value)}`;
         const thresholdForeground: Record<string, string> = {
           ...foregroundColors,
           dim: "#ffffff",
           muted: "#ffffff",
           text: gray(foreground),
         };
-        const thresholdBackground: Record<string, string> = panel === undefined
-          ? {}
-          : {
-              toolSuccessBg: gray(panel),
-              userMessageBg: gray(panel),
-              selectedBg: gray(panel),
-            };
-        const thresholdTheme = new Theme(thresholdForeground, thresholdBackground, "truecolor", {
-          name: `candidate-5-threshold-${label}`,
-        });
+        const thresholdBackground: Record<string, string> =
+          panel === undefined
+            ? {}
+            : {
+                toolSuccessBg: gray(panel),
+                userMessageBg: gray(panel),
+                selectedBg: gray(panel),
+              };
+        const thresholdTheme = new Theme(
+          thresholdForeground,
+          thresholdBackground,
+          "truecolor",
+          {
+            name: `candidate-5-threshold-${label}`,
+          },
+        );
         setThemeInstance(thresholdTheme);
         renderList(`threshold_${label}`, thresholdTheme);
         return renderEmptyGroup(`threshold_${label}`);
@@ -216,11 +281,15 @@ await withRendererHarness(
       for (const [label, panel, foreground, expected] of thresholdCases) {
         const raw = renderThresholdBranch(label, panel, foreground);
         if (!raw.includes(expected)) {
-          throw new Error(`theme threshold ${label} changed classification: ${JSON.stringify(raw)}`);
+          throw new Error(
+            `theme threshold ${label} changed classification: ${JSON.stringify(raw)}`,
+          );
         }
       }
 
-      console.log("OK  preset/direct foregrounds, adaptive transitions, host palette seams, and light thresholds");
+      console.log(
+        "OK  preset/direct foregrounds, adaptive transitions, host palette seams, and light thresholds",
+      );
     } finally {
       writePiSettings({
         ...baseSettings,
