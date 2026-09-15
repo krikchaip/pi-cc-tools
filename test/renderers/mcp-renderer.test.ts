@@ -692,6 +692,34 @@ await withRendererHarness(
       );
     }
 
+    const retainedPreKernelGroup = toolGroup([
+      {
+        tool: "mcp",
+        id: "retained_pre_kernel_group",
+        args: { server: "github", tool: "get_repository" },
+        definition: legacyDefinition,
+        interaction: "fullscreen",
+        retainedCallRendererVersion: "pre-presentation-kernel",
+        result: {
+          content: [{ type: "text", text: JSON.stringify({ ok: true }) }],
+        },
+      },
+      {
+        tool: "mcp",
+        id: "retained_pre_kernel_peer",
+        args: { server: "github", tool: "list_commits" },
+        definition: legacyDefinition,
+        interaction: "fullscreen",
+        result: {
+          content: [{ type: "text", text: JSON.stringify({ ok: true }) }],
+        },
+      },
+    ]);
+    const retainedPreKernelFrame = retainedPreKernelGroup.observe(120);
+    if (!retainedPreKernelFrame.text.includes("get_repository")) {
+      throw new Error("retained pre-kernel MCP call row was not rendered");
+    }
+
     const shortGroup = toolGroup([
       {
         tool: "mcp",

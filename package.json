@@ -33,6 +33,7 @@
     "extensions/bash-command.ts",
     "extensions/click-expansion/",
     "extensions/diff-presentation/",
+    "extensions/presentation-kernel/",
     "config/config.example.json",
     "README.md",
     "CHANGELOG.md"

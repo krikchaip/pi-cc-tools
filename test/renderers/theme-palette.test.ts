@@ -17,7 +17,7 @@ await withRendererHarness(
       diffTheme: "midnight",
     },
   },
-  async ({ fakePi, toolGroup, writePiSettings }) => {
+  async ({ fakePi, toolExecution, toolGroup, writePiSettings }) => {
     const { Text } =
       await import("../../node_modules/@earendil-works/pi-tui/dist/index.js");
     const { Theme, getResolvedThemeColors, getThemeByName, setThemeInstance } =
@@ -217,6 +217,29 @@ await withRendererHarness(
         adaptiveRule,
         adaptiveDim,
       );
+      const readDefinition = fakePi.tools.get("read");
+      const readSummaryRaw = toolExecution({
+        tool: "read",
+        id: "semantic_dim_palette",
+        args: { path: "palette.txt" },
+        definition: readDefinition,
+        interaction: "fullscreen",
+        result: {
+          content: [{
+            type: "text",
+            text: Array.from({ length: 15 }, (_, index) => `line ${index + 1}`).join("\n"),
+          }],
+          isError: false,
+        },
+      }).observe(120).rawRows.join("\n");
+      if (
+        !readSummaryRaw.includes("\x1b[38;2;240;0;240m15 lines loaded")
+        || !readSummaryRaw.includes("\x1b[38;2;0;255;255mclick")
+      ) {
+        throw new Error(
+          `Read summary conflated muted text and semantic dim: ${JSON.stringify(readSummaryRaw)}`,
+        );
+      }
       writePiSettings({
         ...baseSettings,
         themeAdaptive: false,

@@ -56,6 +56,12 @@ import {
 } from "./click-expansion/index";
 import { createDiffPresentationModule, type DiffEvidence, type DiffPresentationSurface, type DiffSource, type DiffTheme } from "./diff-presentation/index";
 import {
+	presentationKernel,
+	type PresentationThemeSnapshot,
+	type SemanticCallPresentation,
+	type SemanticPresentation,
+} from "./presentation-kernel/index";
+import {
 	registerMouseHostAdapter,
 	type MouseTarget,
 } from "./click-expansion/mouse";
@@ -877,10 +883,20 @@ function getToolArgSummary(tool: any): string {
 	return summarizeText(getStringArg(args, "path", "file_path", "url", "query", "name", "subject", "tool", "description", "prompt") || name, 72);
 }
 
-function getToolCallLine(tool: any): string {
-	const value = (tool as any)?.callRendererComponent?.value;
+function getToolCallLine(tool: any, width?: number): string {
+	const callComponent = tool?.callRendererComponent;
+	if (
+		typeof width === "number"
+		&& isToolTextComponent(callComponent)
+		&& typeof callComponent.getPresentationSurface === "function"
+		&& callComponent.getPresentationSurface() === "call"
+	) {
+		const line = callComponent.render(width).find((row) => stripAnsi(row).trim());
+		if (line) return line;
+	}
+	const value = callComponent?.value;
 	if (typeof value === "string" && value.trim()) {
-		const line = value.split("\n").find((line) => stripAnsi(line).trim()) ?? value;
+		const line = value.split("\n").find((row: string) => stripAnsi(row).trim()) ?? value;
 		return stripWrapMarks(line).replaceAll(CLIP_MARK, "");
 	}
 	const summary = getToolArgSummary(tool);
@@ -902,7 +918,14 @@ function alignTrailingMarkedLine(line: string, width: number): string {
 }
 
 function getCompactToolLine(tool: any, width: number, groupedLabel?: string, showTrailing = true): string {
-	let content = removeGroupedToolPrefix(getToolCallLine(tool), groupedLabel);
+	const callComponent = tool?.callRendererComponent;
+	const preserveKernelCallLabel = isToolTextComponent(callComponent)
+		&& typeof callComponent.getPresentationSurface === "function"
+		&& callComponent.getPresentationSurface() === "call";
+	let content = removeGroupedToolPrefix(
+		getToolCallLine(tool, width),
+		preserveKernelCallLabel ? undefined : groupedLabel,
+	);
 	if (!showTrailing) content = content.split(TRAILING_MARK, 1)[0] ?? content;
 	return alignTrailingMarkedLine(content || getToolName(tool), width);
 }
@@ -4380,6 +4403,25 @@ function toolStatusDot(ctx: any, theme: Theme): string {
 	return `${blinkDot(ctx, theme)} `;
 }
 
+function semanticToolCallStatus(
+	ctx: any,
+): Pick<SemanticCallPresentation, "status" | "activity"> {
+	const status = ctx.state?._toolStatus as SemanticCallPresentation["status"] | undefined;
+	if (status !== "pending") return { status: status ?? "idle" };
+	setupBlinkTimer(ctx);
+	const active = getBlinkKey(ctx)?._blinkActive === true;
+	if (ctx.state?._agentBreathe === true) {
+		return {
+			status,
+			activity: { kind: "breathe", frame: _globalBlinkPhaseIndex, active },
+		};
+	}
+	return {
+		status,
+		activity: { kind: "blink", visible: active && _globalBlinkPhase },
+	};
+}
+
 // ---------------------------------------------------------------------------
 // Branch connector — visual tree from header to output
 // ---------------------------------------------------------------------------
@@ -4802,6 +4844,18 @@ type ToolTextSemanticRow = {
 	anchorText?: string;
 };
 
+type KernelPresentationInput = Readonly<{
+	presentation: SemanticPresentation;
+	expansion: "collapsed" | "expanded";
+	detail?: ToolClickDetailLevel;
+	preview?: Readonly<{
+		normal?: unknown;
+		expanded?: unknown;
+		extra?: unknown;
+	}>;
+	theme: PresentationThemeSnapshot;
+}>;
+
 function findToolExecutionAncestor(value: any): any | undefined {
 	if (isToolExecutionComponent(value?.[TOOL_CLICK_OWNER])) return value[TOOL_CLICK_OWNER];
 	let current = value;
@@ -4814,6 +4868,7 @@ function findToolExecutionAncestor(value: any): any | undefined {
 
 class ToolText extends Text {
 	private value = "";
+	private kernelPresentation?: KernelPresentationInput;
 	private followPiOutputPad = false;
 	private toolCachedValue?: string;
 	private toolCachedWidth?: number;
@@ -4832,8 +4887,15 @@ class ToolText extends Text {
 	}
 
 	setText(text: string): void {
-		if (this.value === text) return;
+		if (!this.kernelPresentation && this.value === text) return;
+		this.kernelPresentation = undefined;
 		this.value = text;
+		this.invalidate();
+	}
+
+	setPresentation(input: KernelPresentationInput): void {
+		this.kernelPresentation = input;
+		this.value = "";
 		this.invalidate();
 	}
 
@@ -4867,7 +4929,17 @@ class ToolText extends Text {
 		return this.semanticRows;
 	}
 
+	getPresentationSurface(): SemanticPresentation["surface"] | undefined {
+		return this.kernelPresentation?.presentation.surface;
+	}
+
 	hasClickAction(tool: any): boolean {
+		if (this.kernelPresentation) {
+			const { presentation } = this.kernelPresentation;
+			return presentation.surface === "result"
+				&& presentation.summary.expandable
+				&& toolClickExpansionActive(tool);
+		}
 		return this.value.split("\n").some((line) => resolveClickHints(line, tool).anchors.length > 0);
 	}
 
@@ -4896,6 +4968,43 @@ class ToolText extends Text {
 			&& (this as any)._toolBranchCacheKey === branchKey
 			&& (this as any)._toolBranchCacheEpoch === _toolBranchVisualEpoch
 		) return this.toolCachedLines;
+		if (this.kernelPresentation) {
+			const frame = presentationKernel.present(
+				this.kernelPresentation.presentation,
+				{
+					width,
+					padding: paddingX === 1 ? 1 : 0,
+					expansion: this.kernelPresentation.expansion,
+					detail: this.kernelPresentation.detail,
+					preview: this.kernelPresentation.preview,
+					clickActions: tool ? toolClickExpansionActive(tool) : false,
+					theme: this.kernelPresentation.theme,
+				},
+			);
+			const rendered = frame.rows.map((row) => row.text);
+			this.semanticRows = frame.rows.flatMap((row, line) => row.actions.map((action) => {
+				const plain = stripAnsi(row.text);
+				const start = rawIndexAtVisibleColumn(plain, action.span.start);
+				const end = rawIndexAtVisibleColumn(plain, action.span.end);
+				return {
+					line,
+					text: row.text,
+					action: action.origin === "execution-header"
+						? "header" as const
+						: action.behavior === "toggle" ? "expand" as const : "detail" as const,
+					viewportAnchor: action.viewport,
+					anchorText: plain.slice(start, end),
+				};
+			}));
+			this.toolCachedValue = this.value;
+			this.toolCachedWidth = width;
+			this.toolCachedPaddingX = paddingX;
+			this.toolCachedClickKey = clickKey;
+			this.toolCachedLines = rendered;
+			(this as any)._toolBranchCacheKey = branchKey;
+			(this as any)._toolBranchCacheEpoch = _toolBranchVisualEpoch;
+			return rendered;
+		}
 		if (!this.value || this.value.trim() === "") {
 			this.toolCachedValue = this.value;
 			this.toolCachedWidth = width;
@@ -4986,6 +5095,27 @@ function makeText(last: unknown, text: string, followPiOutputPad = false): Text 
 	component.setWidthObserver();
 	component.setFollowPiOutputPad(followPiOutputPad);
 	component.setText(text);
+	return component;
+}
+
+function makePresentationText(
+	last: unknown,
+	presentation: SemanticPresentation,
+	view: Pick<KernelPresentationInput, "expansion" | "detail" | "preview">,
+	theme: Theme,
+	followPiOutputPad = false,
+): Text {
+	const component = isToolTextComponent(last)
+		&& typeof (last as ToolText).setPresentation === "function"
+		? last
+		: new ToolText();
+	component.setWidthObserver();
+	component.setFollowPiOutputPad(followPiOutputPad);
+	component.setPresentation({
+		presentation,
+		...view,
+		theme: presentationThemeSnapshot(theme),
+	});
 	return component;
 }
 
@@ -5310,26 +5440,14 @@ function isLightThemeBackground(theme: any): boolean {
 	return foreground ? normalizedLuminance(foreground) < 95 : false;
 }
 
-type ThemePaletteCacheKey = Readonly<{
-	theme: unknown;
-	name: string;
-	fingerprint: string;
-	overrides: string;
-}>;
-
-// Cache theme identity so we only recompute on theme change. The Theme
-// object is reused across renders within a single session unless the user
-// switches themes via the picker.
-let _themePaletteCacheKey: ThemePaletteCacheKey | undefined;
-
 /** Resolved-color fingerprint so palette re-derives when the active theme file changes under the same name/object. */
 function themePaletteFingerprint(theme: any): string {
-	const keys = ["success", "error", "borderMuted", "accent", "muted", "toolDiffAdded", "toolDiffRemoved"] as const;
+	const keys = ["success", "error", "dim", "thinkingText", "borderMuted", "accent", "muted", "toolDiffAdded", "toolDiffRemoved"] as const;
 	return keys.map((k) => safeFgAnsi(theme, k) ?? "").join("\u001f");
 }
 
 function invalidateThemePaletteCache(): void {
-	_themePaletteCacheKey = undefined;
+	presentationKernel.resetPalette();
 }
 
 function themeAdaptiveEnabled(): boolean {
@@ -5350,6 +5468,7 @@ const CHROME_STYLE_DEFAULTS = {
 
 function resetThemePalette(): void {
 	const configured = diffPresentationModule.compatibility.configuredForegrounds();
+	invalidateThemePaletteCache();
 	BORDER_COLOR = CHROME_STYLE_DEFAULTS.border;
 	WORKED_LINE_FG = CHROME_STYLE_DEFAULTS.workedLine;
 	CODE_BLOCK_LANG_FG = CHROME_STYLE_DEFAULTS.codeBlockLanguage;
@@ -5361,50 +5480,83 @@ function resetThemePalette(): void {
 	applyToolBranchColor();
 }
 
+function presentationPaletteRequest(
+	theme: any,
+): Parameters<typeof presentationKernel.resolvePalette>[0] {
+	const configured = diffPresentationModule.compatibility.configuredForegrounds();
+	const adaptive = themeAdaptiveEnabled();
+	const muted = safeFgAnsi(theme, "muted") ?? "";
+	const warning = safeFgAnsi(theme, "warning") ?? "";
+	const success = safeFgAnsi(theme, "success") ?? "";
+	const error = safeFgAnsi(theme, "error") ?? "";
+	const accent = safeFgAnsi(theme, "accent") ?? "";
+	const title = safeFgAnsi(theme, "toolTitle") ?? "";
+	const branch = currentToolBranchAnsi(theme);
+	return {
+		cache: {
+			identity: theme,
+			name: typeof theme.name === "string" ? theme.name : "",
+			fingerprint: themePaletteFingerprint(theme),
+		},
+		adaptive,
+		defaults: {
+			branch,
+			muted,
+			dim: CHROME_STYLE_DEFAULTS.dim,
+			semanticDim: safeFgAnsi(theme, "dim") ?? "",
+			warning,
+			success,
+			error,
+			accent,
+			title,
+			rule: CHROME_STYLE_DEFAULTS.rule,
+			statusSuccess: CHROME_STYLE_DEFAULTS.statusSuccess,
+			statusError: CHROME_STYLE_DEFAULTS.statusError,
+			statusPending: CHROME_STYLE_DEFAULTS.statusPending,
+		},
+		adaptiveColors: {
+			branch,
+			muted,
+			dim: muted || CHROME_STYLE_DEFAULTS.dim,
+			semanticDim: safeFgAnsi(theme, "dim") ?? "",
+			warning,
+			success,
+			error,
+			accent,
+			title,
+			rule: BORDER_COLOR,
+			statusSuccess: success || CHROME_STYLE_DEFAULTS.statusSuccess,
+			statusError: error || CHROME_STYLE_DEFAULTS.statusError,
+			statusPending: safeFgAnsi(theme, "dim") || muted || safeFgAnsi(theme, "thinkingText") || CHROME_STYLE_DEFAULTS.statusPending,
+		},
+		overrides: configured,
+	};
+}
+
+function presentationThemeSnapshot(theme: Theme): PresentationThemeSnapshot {
+	applyThemePaletteIfNeeded(theme);
+	return {
+		palette: presentationPaletteRequest(theme),
+		control: {
+			foregroundReset: "\x1b[39m",
+			branchReset: TRANSPARENT_RESET,
+			bold: "\x1b[1m",
+			boldReset: "\x1b[22m",
+		},
+		expandHint: configuredKeyHint("app.tools.expand", "ctrl+o", "to expand"),
+	};
+}
+
 function applyThemePaletteIfNeeded(theme: any): void {
 	if (!theme) return;
-	const configured = diffPresentationModule.compatibility.configuredForegrounds();
-	if (!themeAdaptiveEnabled()) {
-		invalidateThemePaletteCache();
-		FG_DIM = configured.dim ?? CHROME_STYLE_DEFAULTS.dim;
-		FG_RULE = configured.rule ?? CHROME_STYLE_DEFAULTS.rule;
-		applyToolBranchColor(theme);
-		return;
-	}
-	const nextCacheKey: ThemePaletteCacheKey = {
-		theme,
-		name: typeof theme.name === "string" ? theme.name : "",
-		fingerprint: themePaletteFingerprint(theme),
-		overrides: `${configured.dim ?? ""}\u001f${configured.rule ?? ""}`,
-	};
-	const previousCacheKey = _themePaletteCacheKey;
-	if (
-		previousCacheKey
-		&& previousCacheKey.theme === nextCacheKey.theme
-		&& previousCacheKey.name === nextCacheKey.name
-		&& previousCacheKey.fingerprint === nextCacheKey.fingerprint
-		&& previousCacheKey.overrides === nextCacheKey.overrides
-	) {
-		applyToolBranchColor(theme);
-		return;
-	}
-	if (
-		!previousCacheKey
-		|| previousCacheKey.name !== nextCacheKey.name
-		|| previousCacheKey.fingerprint !== nextCacheKey.fingerprint
-		|| previousCacheKey.overrides !== nextCacheKey.overrides
-	) {
-		bumpToolBranchVisualEpoch();
-	}
-	_themePaletteCacheKey = nextCacheKey;
 	applyToolBranchColor(theme);
-	const muted = safeFgAnsi(theme, "muted");
-	TOOL_STATUS_SUCCESS = safeFgAnsi(theme, "success") ?? TOOL_STATUS_SUCCESS;
-	TOOL_STATUS_ERROR = safeFgAnsi(theme, "error") ?? TOOL_STATUS_ERROR;
-	TOOL_STATUS_PENDING = safeFgAnsi(theme, "dim") ?? muted ?? safeFgAnsi(theme, "thinkingText") ?? TOOL_STATUS_PENDING;
-	if (configured.dim) FG_DIM = configured.dim;
-	else if (muted) FG_DIM = muted;
-	FG_RULE = configured.rule ?? BORDER_COLOR;
+	const resolution = presentationKernel.resolvePalette(presentationPaletteRequest(theme));
+	if (resolution.changed) bumpToolBranchVisualEpoch();
+	FG_DIM = resolution.colors.dim;
+	FG_RULE = resolution.colors.rule;
+	TOOL_STATUS_SUCCESS = resolution.colors.statusSuccess;
+	TOOL_STATUS_ERROR = resolution.colors.statusError;
+	TOOL_STATUS_PENDING = resolution.colors.statusPending;
 }
 
 const D_RST = "\x1b[0m";
@@ -5882,9 +6034,28 @@ function renderGenericToolCall(name: string, args: any, theme: Theme, ctx: any):
 	if (isAgentFamilyToolName(name)) ctx.state._agentBreathe = true;
 	const sp = (path: string) => shortPath(ctx.cwd ?? process.cwd(), path);
 	const summary = stableCallSummary(ctx, "_callSummary", () => summarizeGenericToolCall(name, args, theme, sp));
-	return makeText(
+	const liveCount = ctx?.isPartial === true
+		&& typeof ctx?.state?._liveLineCount === "number"
+		&& Number.isFinite(ctx.state._liveLineCount)
+		&& ctx.state._liveLineCount > 0
+		? ctx.state._liveLineCount
+		: undefined;
+	const subject = [
+		...(summary ? [{ text: summary, tone: "accent" as const }] : []),
+		...(liveCount === undefined
+			? []
+			: [{ text: `${summary ? " " : ""}(${lineCountLabel(liveCount)})`, tone: "muted" as const }]),
+	];
+	return makePresentationText(
 		ctx.lastComponent,
-		toolHeader(genericToolLabel(name), summary, theme, toolStatusDot(ctx, theme), liveLineCountTrailing(ctx, theme)),
+		{
+			surface: "call",
+			title: genericToolLabel(name),
+			...(subject.length > 0 ? { subject } : {}),
+			...semanticToolCallStatus(ctx),
+		},
+		{ expansion: "collapsed" },
+		theme,
 		isMcpToolName(name),
 	);
 }
@@ -7209,6 +7380,35 @@ export default function (pi: ExtensionAPI) {
 			const content = result.content.find((block: any) => block?.type === "text");
 			if (content?.type !== "text") return makeText(ctx.lastComponent, withToolErrorIndent(theme.fg("error", "No text content")));
 			const lines = content.text.split("\n");
+			if (!details?.truncation?.truncated && (!expanded || progressiveLocalControlsEnabled())) {
+				const detail = expanded ? progressiveLocalDetailLevelForRender(ctx.state) : 0;
+				return makePresentationText(
+					ctx.lastComponent,
+					{
+						surface: "result",
+						summary: {
+							count: lines.length,
+							unit: { one: "lines", other: "lines" },
+							label: "loaded",
+							expandable: true,
+						},
+						detail: {
+							rows: lines.map((line) => [{ text: line, tone: "dim" }]),
+							totalRows: lines.length,
+						},
+					},
+					{
+						expansion: expanded ? "expanded" : "collapsed",
+						detail,
+						preview: {
+							normal: readSettings().previewLines,
+							expanded: readSettings().expandedPreviewMaxLines,
+							extra: readSettings().extraExpandedPreviewMaxLines,
+						},
+					},
+					theme,
+				);
+			}
 			let text = markResultSummary(theme.fg("muted", `${lines.length} lines loaded`));
 			if (details?.truncation?.truncated) text += theme.fg("warning", " (truncated)");
 			if (!expanded) return makeText(ctx.lastComponent, withBranch(`${text}${toolOutputDetailHint(theme, expanded)}`, theme));

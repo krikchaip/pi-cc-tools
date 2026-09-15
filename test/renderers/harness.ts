@@ -42,6 +42,7 @@ export interface ToolExecutionFixture {
   expanded?: boolean;
   viewport?: RendererViewportFixture;
   lockOwnResultRenderer?: boolean;
+  retainedCallRendererVersion?: "pre-presentation-kernel";
 }
 
 export type RendererActionBehavior =
@@ -241,6 +242,15 @@ export async function withRendererHarness(
       );
       if (fixture.started !== false) component.markExecutionStarted();
       if (fixture.argsComplete !== false) component.setArgsComplete();
+      if (fixture.retainedCallRendererVersion === "pre-presentation-kernel") {
+        const retained = (component as any).callRendererComponent;
+        if (retained) {
+          Object.defineProperty(retained, "getPresentationSurface", {
+            configurable: true,
+            value: undefined,
+          });
+        }
+      }
       if (fixture.result !== undefined)
         component.updateResult(fixture.result, fixture.isPartial ?? false);
       if (fixture.expanded !== undefined)
