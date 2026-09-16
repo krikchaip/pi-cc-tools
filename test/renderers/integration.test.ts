@@ -1546,6 +1546,53 @@ await withRendererHarness(
       },
     });
     const skillRead = skillReadExecution.observe(120);
+    const skillHeaderRow = skillRead.rawRows.find((row) =>
+      plain(row).includes("[skill] grilling"),
+    );
+    const ansiStateAt = (row: string, index: number) => {
+      let foreground = "\x1b[39m";
+      let bold = false;
+      for (const match of row.slice(0, index).matchAll(/\x1b\[([0-9;]*)m/g)) {
+        const parameters = match[1] ? match[1].split(";").map(Number) : [0];
+        if (parameters.includes(0)) {
+          foreground = "\x1b[39m";
+          bold = false;
+        }
+        if (parameters.includes(1)) bold = true;
+        if (parameters.includes(22)) bold = false;
+        if (parameters.includes(39)) foreground = "\x1b[39m";
+        if (parameters[0] === 38) foreground = match[0];
+      }
+      return { foreground, bold };
+    };
+    const themedForeground = (
+      role: "customMessageLabel" | "customMessageText",
+    ) =>
+      theme
+        .fg(role, "x")
+        .match(/\x1b\[(?:38;(?:2;\d+;\d+;\d+|5;\d+)|39)m/)?.[0] ?? "\x1b[39m";
+    if (!skillHeaderRow) {
+      throw new Error(
+        `standalone skill header was missing: ${JSON.stringify(skillRead.rows)}`,
+      );
+    }
+    const labelIndex = skillHeaderRow.indexOf("[skill]");
+    const nameIndex = skillHeaderRow.indexOf(
+      "grilling",
+      labelIndex + "[skill]".length,
+    );
+    const labelStyle = ansiStateAt(skillHeaderRow, labelIndex);
+    const nameStyle = ansiStateAt(skillHeaderRow, nameIndex);
+    if (
+      labelStyle.foreground !== themedForeground("customMessageLabel") ||
+      !labelStyle.bold ||
+      nameStyle.foreground !== themedForeground("customMessageText") ||
+      nameStyle.bold
+    ) {
+      throw new Error(
+        `standalone skill header lost its label/name ANSI roles: ${JSON.stringify({ labelStyle, nameStyle, raw: skillHeaderRow })}`,
+      );
+    }
     const skillHeader = skillRead.actions.find(
       (action) =>
         action.origin === "execution-header" &&

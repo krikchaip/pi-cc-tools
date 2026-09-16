@@ -1,3 +1,7 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 import {
   getCapabilities,
   setCapabilities,
@@ -33,15 +37,21 @@ await withRendererHarness(
       );
     }
 
-    const renderRaw = (text: string, expanded = false, width = 120): string => {
+    const renderResultRaw = (
+      result: any,
+      expanded = false,
+      width = 120,
+    ): string => {
       const component = mcp.renderResult(
-        { content: [{ type: "text", text }] },
+        result,
         { expanded, isPartial: false },
         theme,
         { state: {}, isError: false, lastComponent: undefined },
       );
       return component.render(width).join("\n");
     };
+    const renderRaw = (text: string, expanded = false, width = 120): string =>
+      renderResultRaw({ content: [{ type: "text", text }] }, expanded, width);
     const render = (text: string, expanded = false, width = 120): string =>
       plain(renderRaw(text, expanded, width));
 
@@ -182,6 +192,92 @@ await withRendererHarness(
     }
     if (jsonExpanded.includes("Details name")) {
       throw new Error("expanded JSON MCP output still flattened nested paths");
+    }
+
+    const spillRoot = mkdtempSync(join(tmpdir(), "pi-cc-tools-mcp-spill-"));
+    try {
+      const validSpill = join(spillRoot, "valid.json");
+      const missingSpill = join(spillRoot, "missing.json");
+      const unreadableSpill = join(spillRoot, "directory.json");
+      const oversizedSpill = join(spillRoot, "oversized.json");
+      const invalidSpill = join(spillRoot, "invalid.json");
+      writeFileSync(
+        validSpill,
+        JSON.stringify({
+          key: "JIRA-123",
+          fields: { summary: "safe fixture", description: "before\n\nafter" },
+          comments: [],
+        }),
+      );
+      mkdirSync(unreadableSpill);
+      writeFileSync(
+        oversizedSpill,
+        JSON.stringify({ payload: "x".repeat(1_100_000) }),
+      );
+      writeFileSync(invalidSpill, '{"key":"JIRA-123"');
+
+      const guardedPreview = `{
+  "key": "JIRA-123",
+  "fields": {
+    "summary": "safe fixture",
+    "description": "before
+
+after"
+  },
+  "comments": []
+}`;
+      const guardedResult = (fullOutputPath: string) => ({
+        content: [{ type: "text", text: guardedPreview }],
+        details: {
+          outputGuard: {
+            truncated: true,
+            originalBytes: 128,
+            returnedBytes: 112,
+            originalLines: 9,
+            returnedLines: 10,
+            fullOutputPath,
+          },
+        },
+      });
+
+      const hydrated = plain(renderResultRaw(guardedResult(validSpill), true));
+      for (const expected of [
+        "Responded [object] (3 fields)",
+        "key",
+        "JIRA-123",
+        "fields",
+        "object · 2 fields",
+        "comments",
+        "array · 0 items",
+      ]) {
+        if (!hydrated.includes(expected)) {
+          throw new Error(
+            `truncated MCP JSON did not use its complete spill file: missing ${JSON.stringify(expected)} in ${JSON.stringify(hydrated)}`,
+          );
+        }
+      }
+
+      for (const [label, fullOutputPath] of [
+        ["missing", missingSpill],
+        ["unreadable", unreadableSpill],
+        ["oversized", oversizedSpill],
+        ["invalid", invalidSpill],
+      ] as const) {
+        const fallback = plain(
+          renderResultRaw(guardedResult(fullOutputPath), true),
+        );
+        if (
+          !fallback.includes("Responded (10 lines)") ||
+          !fallback.includes('"key": "JIRA-123"') ||
+          fallback.includes("Responded [object]")
+        ) {
+          throw new Error(
+            `${label} MCP spill file did not preserve the raw preview fallback: ${JSON.stringify(fallback)}`,
+          );
+        }
+      }
+    } finally {
+      rmSync(spillRoot, { recursive: true, force: true });
     }
 
     const commitsJson = JSON.stringify({
@@ -392,12 +488,9 @@ await withRendererHarness(
     const collapsedErrorRow = collapsedError
       .split("\n")
       .find((line) => line.includes("Error: complete first failure line"));
-    if (
-      !collapsedErrorRow?.startsWith("  ") ||
-      /^[ ]*[├│└] /.test(collapsedErrorRow)
-    ) {
+    if (!/^\s*└ /.test(collapsedErrorRow ?? "")) {
       throw new Error(
-        `collapsed MCP error retained a branch connector: ${JSON.stringify(collapsedError)}`,
+        `collapsed MCP error summary was not execution-anchored: ${JSON.stringify(collapsedError)}`,
       );
     }
     const expandedErrorComponent = mcp.renderResult(
@@ -435,12 +528,12 @@ await withRendererHarness(
       .split("\n")
       .filter((line) => line.trim().length > 0);
     if (
-      expandedErrorRows.some(
-        (line) => !line.startsWith("  ") || /^[ ]*[├│└] /.test(line),
-      )
+      !/^\s*├ /.test(expandedErrorRows[0] ?? "") ||
+      expandedErrorRows.slice(1, -1).some((line) => !/^\s*│ /.test(line)) ||
+      !/^\s*└ /.test(expandedErrorRows.at(-1) ?? "")
     ) {
       throw new Error(
-        `expanded MCP error retained branch connectors: ${JSON.stringify(expandedErrorRows)}`,
+        `expanded MCP error lost its summary/detail branch structure: ${JSON.stringify(expandedErrorRows)}`,
       );
     }
 
@@ -1032,6 +1125,46 @@ await withRendererHarness(
       }
     } finally {
       setCapabilities(savedCapabilities);
+    }
+
+    writePiSettings({
+      clickExpansion: true,
+      expandedPreviewMaxLines: 10,
+      extraExpandedPreviewMaxLines: 15,
+      mcpOutputMode: "hidden",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    const hiddenSpillRoot = mkdtempSync(
+      join(tmpdir(), "pi-cc-tools-mcp-hidden-spill-"),
+    );
+    try {
+      const hiddenSpill = join(hiddenSpillRoot, "complete.json");
+      writeFileSync(hiddenSpill, JSON.stringify({ hidden: true }));
+      const hiddenState: Record<PropertyKey, unknown> = {};
+      const hiddenComponent = mcp.renderResult(
+        {
+          content: [{ type: "text", text: '{"hidden":"before\n\nafter"}' }],
+          details: {
+            outputGuard: { truncated: true, fullOutputPath: hiddenSpill },
+          },
+        },
+        { expanded: true, isPartial: false },
+        theme,
+        { state: hiddenState, isError: false, lastComponent: undefined },
+      );
+      const spillCache = Symbol.for(
+        "pi-claude-style-tools:mcp-spill-presentation-cache",
+      );
+      if (
+        hiddenComponent
+          .render(120)
+          .some((line: string) => plain(line).trim()) ||
+        hiddenState[spillCache] !== undefined
+      ) {
+        throw new Error("hidden MCP output read or presented its spill file");
+      }
+    } finally {
+      rmSync(hiddenSpillRoot, { recursive: true, force: true });
     }
 
     writePiSettings({

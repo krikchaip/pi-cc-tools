@@ -11,7 +11,7 @@ export default mcpFamily.scenario({
       visible: [
         "BATCH ANCHOR E2E",
         /^ ● Mcp: 1 done • 1 failed/m,
-        /^ │ Error: missing required parameter: sha/m,
+        /^ │ └ Error: missing required parameter: sha/m,
         /^   ├ Responded \[object\] \(2 fields\)/m,
         /^   │ ├ sha {5}254df9c/m,
         /^   │ └ commit {2}object · 2 fields/m,

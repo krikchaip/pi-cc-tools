@@ -30,10 +30,10 @@
   "files": [
     "extensions/index.ts",
     "extensions/spinner.ts",
-    "extensions/bash-command.ts",
     "extensions/click-expansion/",
     "extensions/diff-presentation/",
     "extensions/presentation-kernel/",
+    "extensions/tool-presentation/",
     "config/config.example.json",
     "README.md",
     "CHANGELOG.md"

@@ -22,6 +22,8 @@ const plainTheme = {
       error: "",
       accent: "",
       title: "",
+      messageLabel: "",
+      messageText: "",
       rule: "",
       statusSuccess: "",
       statusError: "",
@@ -37,6 +39,8 @@ const plainTheme = {
       error: "",
       accent: "",
       title: "",
+      messageLabel: "",
+      messageText: "",
       rule: "",
       statusSuccess: "",
       statusError: "",
@@ -116,6 +120,156 @@ test("call presentation owns status and header grammar", () => {
   });
 });
 
+test("call presentation paints message label and text roles independently", () => {
+  const skillTheme = {
+    ...plainTheme,
+    palette: {
+      ...plainTheme.palette,
+      cache: { identity: {}, name: "skill", fingerprint: "skill-v1" },
+      defaults: {
+        ...plainTheme.palette.defaults,
+        messageLabel: "<label>",
+        messageText: "<text>",
+      },
+    },
+    control: {
+      ...plainTheme.control,
+      foregroundReset: "</fg>",
+      bold: "<b>",
+      boldReset: "</b>",
+    },
+  } as const;
+  const frame = presentationKernel.present(
+    {
+      surface: "call",
+      title: "[skill]",
+      titleTone: "message-label",
+      subject: [{ text: "grilling", tone: "message-text" }],
+      status: "success",
+    },
+    {
+      width: 80,
+      padding: 0,
+      expansion: "collapsed",
+      clickActions: false,
+      theme: skillTheme,
+    },
+  );
+
+  assert.match(
+    frame.rows[0].text,
+    /<label><b>\[skill\]<\/b><\/fg> <text>grilling<\/fg>/,
+  );
+});
+
+test("expanded call presents semantic detail as clickable continuation rows", () => {
+  const presentation = {
+    surface: "call" as const,
+    title: "Bash",
+    subject: [{ text: "script · 2 lines", tone: "accent" as const }],
+    status: "success" as const,
+    detail: {
+      rows: ["echo one", "echo two"].map((text) => [
+        { text, tone: "accent" as const },
+      ]),
+      totalRows: 2,
+    },
+  };
+  const baseView = {
+    width: 32,
+    padding: 0 as const,
+    clickActions: true,
+    theme: plainTheme,
+  };
+
+  const collapsed = presentationKernel.present(presentation, {
+    ...baseView,
+    expansion: "collapsed",
+  });
+  const expanded = presentationKernel.present(presentation, {
+    ...baseView,
+    expansion: "expanded",
+  });
+
+  assert.deepEqual(
+    collapsed.rows.map((row) => row.text.trimEnd()),
+    ["● Bash script · 2 lines"],
+  );
+  assert.deepEqual(
+    expanded.rows.map((row) => row.text.trimEnd()),
+    ["● Bash script · 2 lines", "├ echo one", "│ echo two"],
+  );
+  assert.deepEqual(expanded.rows[1]?.actions, [
+    {
+      behavior: "toggle",
+      origin: "execution-header",
+      viewport: "top",
+      span: { start: 2, end: 10 },
+    },
+  ]);
+});
+
+test("collapsed call subject can stay on one prefix-truncated row", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "call",
+      title: "Bash",
+      subject: [{ text: "012345678901234567890123456789", tone: "accent" }],
+      subjectOverflow: "truncate-end",
+      status: "success",
+    },
+    {
+      width: 24,
+      padding: 0,
+      expansion: "collapsed",
+      clickActions: true,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.replace(/\x1b\[[0-9;]*m/g, "").trimEnd()),
+    ["● Bash 0123456789012345…"],
+  );
+});
+
+test("collapsed call detail opt-in keeps a bounded clickable command preview", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "call",
+      title: "Bash",
+      subject: [{ text: "script", tone: "accent" }],
+      status: "error",
+      collapsedDetailPreview: "head",
+      detail: {
+        rows: ["one", "two", "three", "four"].map((text) => [
+          { text, tone: "accent" as const },
+        ]),
+        totalRows: 4,
+      },
+    },
+    {
+      width: 28,
+      padding: 0,
+      expansion: "collapsed",
+      preview: { normal: 3 },
+      clickActions: true,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.trimEnd()),
+    ["● Bash script", "├ one", "│ two", "│ ... 2 more lines"],
+  );
+  assert.equal(
+    frame.rows
+      .slice(1)
+      .every((row) => row.actions[0]?.origin === "execution-header"),
+    true,
+  );
+});
+
 test("pending call selects its activity glyph", () => {
   const frame = presentationKernel.present(
     {
@@ -161,6 +315,42 @@ test("subjectless call titles wrap within narrow frames", () => {
   );
 });
 
+test("semantic file and directory icons keep fixed identity colors", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "stream",
+      detail: {
+        rows: [
+          {
+            icon: { kind: "file", path: "src/index.ts" },
+            content: [{ text: "src/index.ts", tone: "dim" }],
+          },
+          {
+            icon: { kind: "directory" },
+            content: [{ text: "src/", tone: "accent" }],
+          },
+        ],
+        totalRows: 2,
+      },
+    },
+    {
+      width: 48,
+      padding: 0,
+      expansion: "expanded",
+      clickActions: true,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.trimEnd()),
+    [
+      "│ \x1b[38;2;49;120;198m\ue628\x1b[0m src/index.ts",
+      "└ \x1b[38;2;100;140;220m\ue5ff\x1b[0m src/",
+    ],
+  );
+});
+
 test("shared palette applies overrides and reuses an exact cache key", () => {
   presentationKernel.resetPalette();
   const identity = {};
@@ -181,6 +371,8 @@ test("shared palette applies overrides and reuses an exact cache key", () => {
       error: "default-error-tone",
       accent: "default-accent",
       title: "default-title",
+      messageLabel: "default-message-label",
+      messageText: "default-message-text",
       rule: "default-rule",
       statusSuccess: "default-success",
       statusError: "default-error",
@@ -196,6 +388,8 @@ test("shared palette applies overrides and reuses an exact cache key", () => {
       error: "theme-error-tone",
       accent: "theme-accent",
       title: "theme-title",
+      messageLabel: "theme-message-label",
+      messageText: "theme-message-text",
       rule: "theme-rule",
       statusSuccess: "theme-success",
       statusError: "theme-error",
@@ -221,6 +415,8 @@ test("shared palette applies overrides and reuses an exact cache key", () => {
       error: "theme-error-tone",
       accent: "theme-accent",
       title: "theme-title",
+      messageLabel: "theme-message-label",
+      messageText: "theme-message-text",
       rule: "configured-rule",
       statusSuccess: "theme-success",
       statusError: "theme-error",
@@ -267,6 +463,82 @@ test("collapsed result summary presents one exact row and toggle action", () => 
       },
     ],
   });
+});
+
+test("collapsed result can show a bounded tail preview without a second action", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "result",
+      summary: {
+        text: [{ text: "Done (3 lines)", tone: "success" }],
+        expandable: true,
+      },
+      detail: {
+        rows: ["alpha", "beta", "gamma"].map((text) => [
+          { text, tone: "dim" as const },
+        ]),
+        totalRows: 3,
+      },
+      collapsedDetailPreview: "tail",
+    },
+    {
+      width: 40,
+      padding: 0,
+      expansion: "collapsed",
+      preview: { normal: 2 },
+      clickActions: true,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.trimEnd()),
+    [
+      "└ Done (3 lines) • click to expand",
+      "  … (1 earlier lines)",
+      "  beta",
+      "  gamma",
+    ],
+  );
+  assert.equal(frame.rows[0]?.actions.length, 1);
+  assert.deepEqual(
+    frame.rows.slice(1).map((row) => row.actions),
+    [[], [], []],
+  );
+});
+
+test("collapsed result supports a bounded head preview", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "result",
+      summary: {
+        text: [{ text: "Done", tone: "success" }],
+        expandable: true,
+      },
+      detail: {
+        rows: ["alpha", "beta"].map((text) => [{ text, tone: "dim" as const }]),
+        totalRows: 2,
+      },
+      collapsedDetailPreview: "head",
+    },
+    {
+      width: 32,
+      padding: 0,
+      expansion: "collapsed",
+      preview: { normal: 1 },
+      clickActions: false,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.trimEnd()),
+    ["└ Done • ctrl+o to expand", "  alpha", "  … (1 more lines)"],
+  );
+  assert.deepEqual(
+    frame.rows.slice(1).map((row) => row.actions),
+    [[], []],
+  );
 });
 
 test("result without detail omits expansion grammar", () => {
@@ -786,4 +1058,100 @@ test("expanded payload keeps indentation inside leading ANSI state", () => {
   );
 
   assert.ok(frame.rows[1]?.text.includes("\x1b[90m\x1b[31m  INDENT_ANSI"));
+});
+
+test("collapsed stream presents the newest rows with an earlier-lines marker", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "stream",
+      detail: {
+        rows: ["one", "two", "three", "four"].map((text) => ({
+          content: [{ text, tone: "dim" as const }],
+        })),
+        totalRows: 4,
+      },
+      selection: "tail",
+    },
+    {
+      width: 48,
+      padding: 0,
+      expansion: "collapsed",
+      preview: { normal: 2 },
+      clickActions: false,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.trimEnd()),
+    ["│ … (2 earlier lines • ctrl+o to expand)", "│ three", "└ four"],
+  );
+  assert.equal(
+    frame.rows.every((row) => row.actions.length === 0),
+    true,
+  );
+});
+
+test("clickable stream marker exposes one toggle action", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "stream",
+      detail: {
+        rows: ["one", "two"].map((text) => ({
+          content: [{ text, tone: "dim" as const }],
+        })),
+        totalRows: 2,
+      },
+      selection: "tail",
+    },
+    {
+      width: 40,
+      padding: 0,
+      expansion: "collapsed",
+      preview: { normal: 1 },
+      clickActions: true,
+      theme: plainTheme,
+    },
+  );
+
+  assert.equal(
+    frame.rows[0]?.text.trimEnd(),
+    "│ … (1 earlier lines • click to expand)",
+  );
+  assert.deepEqual(
+    frame.rows[0]?.actions.map(({ behavior, origin, viewport }) => ({
+      behavior,
+      origin,
+      viewport,
+    })),
+    [{ behavior: "toggle", origin: "result-detail", viewport: "top" }],
+  );
+});
+
+test("expanded stream preserves all output rows", () => {
+  const frame = presentationKernel.present(
+    {
+      surface: "stream",
+      detail: {
+        rows: ["one", "", "three"].map((text) => ({
+          content: [{ text, tone: "dim" as const }],
+        })),
+        totalRows: 3,
+      },
+      selection: "tail",
+    },
+    {
+      width: 24,
+      padding: 0,
+      expansion: "expanded",
+      preview: { normal: 1 },
+      clickActions: false,
+      theme: plainTheme,
+    },
+  );
+
+  assert.deepEqual(
+    frame.rows.map((row) => row.text.trimEnd()),
+    ["│ one", "│", "└ three"],
+  );
 });

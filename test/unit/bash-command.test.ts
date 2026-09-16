@@ -1,16 +1,57 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import {
-	buildBashCommandPresentation,
-	buildBashPreview,
-	describeBashSource,
-	formatBashDuration,
-	getLastBashOutputLine,
-} from "../../extensions/bash-command.ts";
+import { createToolPresentationModule } from "../../extensions/tool-presentation/index.ts";
+
+const presentations = createToolPresentationModule();
+
+function presentBashCall(
+  command: string,
+  elapsedMs?: number,
+  showCallDetail = false,
+) {
+  const decision = presentations.present({
+    surface: "call",
+    tool: { family: "tool-native", name: "bash", label: "Bash" },
+    cwd: "/workspace",
+    args: { command },
+    lifecycle: {
+      status: "pending",
+      partial: true,
+      argsComplete: true,
+      ...(typeof elapsedMs === "number" ? { elapsedMs } : {}),
+    },
+    policy: { showCallDetail },
+  });
+  assert.equal(decision.kind, "present");
+  if (decision.kind !== "present" || decision.presentation.surface !== "call") {
+    throw new Error("Bash call was not presented");
+  }
+  return { presentation: decision.presentation, metadata: decision.metadata };
+}
+
+function presentBashOutput(text: string) {
+  const decision = presentations.present({
+    surface: "result",
+    tool: { family: "tool-native", name: "bash", label: "Bash" },
+    cwd: "/workspace",
+    args: { command: "fixture" },
+    lifecycle: { status: "pending", partial: true, argsComplete: true },
+    result: {
+      content: [{ type: "text", text }],
+      details: {},
+      error: false,
+      partial: true,
+    },
+  });
+  assert.equal(decision.kind, "present");
+  if (decision.kind !== "present")
+    throw new Error("Bash output was not presented");
+  return decision;
+}
 
 test("headlines a script by its first operative line", () => {
-	const presentation = buildBashCommandPresentation(`set -euo pipefail
+  const decision = presentBashCall(`set -euo pipefail
 SESSION="validation-session"
 EVIDENCE="/tmp/evidence"
 printf 'Starting validation in %s\\n' "$WORKSPACE"
@@ -18,89 +59,134 @@ for phase in hashing indexing verifying; do
   printf 'Running %s\\n' "$phase"
 done`);
 
-	assert.equal(presentation.headline, `printf 'Starting validation in %s\\n' "$WORKSPACE" · 7 lines`);
+  assert.equal(
+    decision.metadata?.bash?.command.headline,
+    `printf 'Starting validation in %s\\n' "$WORKSPACE" · 7 lines`,
+  );
 });
 
 test("skips standalone shell structure when choosing a headline", () => {
-	const presentation = buildBashCommandPresentation(`context_file=/tmp/context
+  const decision = presentBashCall(`context_file=/tmp/context
 {
 echo '# Current source tree'
 find src -type f | sort
 }`);
 
-	assert.equal(presentation.headline, "echo '# Current source tree' · 5 lines");
+  assert.equal(
+    decision.metadata?.bash?.command.headline,
+    "echo '# Current source tree' · 5 lines",
+  );
 });
 
 test("describes visible source without repeating its headline", () => {
-	assert.equal(describeBashSource(buildBashCommandPresentation("git status --short")), "command");
-	assert.equal(describeBashSource(buildBashCommandPresentation("echo one\necho two")), "script · 2 lines");
+  const command = presentBashCall("git status --short", undefined, true);
+  const script = presentBashCall("echo one\necho two", undefined, true);
+  assert.deepEqual(command.presentation.subject, [
+    { text: "command", tone: "accent" },
+  ]);
+  assert.deepEqual(script.presentation.subject, [
+    { text: "script · 2 lines", tone: "accent" },
+  ]);
 });
 
 test("formats live and completed durations compactly", () => {
-	assert.equal(formatBashDuration(400), "<1s");
-	assert.equal(formatBashDuration(12_900), "12s");
-	assert.equal(formatBashDuration(64_000), "1m 04s");
-	assert.equal(formatBashDuration(3_780_000), "1h 03m");
+  for (const [elapsedMs, expected] of [
+    [400, "<1s"],
+    [12_900, "12s"],
+    [64_000, "1m 04s"],
+    [3_780_000, "1h 03m"],
+  ] as const) {
+    assert.equal(
+      presentBashCall("fixture", elapsedMs).metadata?.bash?.duration,
+      expected,
+    );
+  }
 });
 
-test("selects the latest non-empty bash output line", () => {
-	assert.equal(getLastBashOutputLine("building\n\n  testing target 3  \n"), "testing target 3");
-	assert.equal(getLastBashOutputLine("\n\t\n"), undefined);
+test("selects the latest non-empty Bash output line", () => {
+  assert.equal(
+    presentBashOutput("building\n\n  testing target 3  \n").metadata?.bash
+      ?.lastOutputLine,
+    "testing target 3",
+  );
+  assert.equal(
+    presentBashOutput("\n\t\n").metadata?.bash?.lastOutputLine,
+    undefined,
+  );
 });
 
 test("treats carriage-return progress as live output and removes terminal escapes", () => {
-	assert.equal(
-		getLastBashOutputLine("\u001b[32mCompiling\u001b[0m\r\u001b]0;tests\u0007Running suite 4/9\r"),
-		"Running suite 4/9",
-	);
+  assert.equal(
+    presentBashOutput(
+      "\u001b[32mCompiling\u001b[0m\r\u001b]0;tests\u0007Running suite 4/9\r",
+    ).metadata?.bash?.lastOutputLine,
+    "Running suite 4/9",
+  );
 });
 
-test("shows multiline scripts verbatim", () => {
-	const presentation = buildBashCommandPresentation(`context_file=/tmp/context
+test("supplies multiline scripts as semantic call detail", () => {
+  const decision = presentBashCall(
+    `context_file=/tmp/context
 {
 echo '# Current source tree'
 find src -type f | sort
-}`);
+}`,
+    undefined,
+    true,
+  );
 
-	assert.deepEqual(buildBashPreview(presentation.sourceLines, 8), [
-		"context_file=/tmp/context",
-		"{",
-		"echo '# Current source tree'",
-		"find src -type f | sort",
-		"}",
-	]);
+  assert.deepEqual(
+    decision.presentation.detail?.rows.map((row: any) => row.content[0].text),
+    [
+      "context_file=/tmp/context",
+      "{",
+      "echo '# Current source tree'",
+      "find src -type f | sort",
+      "}",
+    ],
+  );
 });
 
-test("shows heredocs as ordinary source lines", () => {
-	const presentation = buildBashCommandPresentation(`cat <<'END' | review-command
+test("keeps heredocs as ordinary semantic source rows", () => {
+  const decision = presentBashCall(
+    `cat <<'END' | review-command
   Review this code.
   Check error handling.
 END
-jq '.result' result.json`);
+jq '.result' result.json`,
+    undefined,
+    true,
+  );
 
-	assert.equal(presentation.headline, "cat <<'END' | review-command · 5 lines");
-	assert.deepEqual(buildBashPreview(presentation.sourceLines, 8), [
-		"cat <<'END' | review-command",
-		"  Review this code.",
-		"  Check error handling.",
-		"END",
-		"jq '.result' result.json",
-	]);
-});
-
-test("reserves the final preview row for an omission count", () => {
-	assert.deepEqual(buildBashPreview(["one", "two", "three", "four"], 3), [
-		"one",
-		"two",
-		"... 2 more lines",
-	]);
-	assert.deepEqual(buildBashPreview(["one", "two"], 0), []);
-	assert.deepEqual(buildBashPreview(["one", "two"], 1), ["... 2 more lines"]);
+  assert.equal(
+    decision.metadata?.bash?.command.headline,
+    "cat <<'END' | review-command · 5 lines",
+  );
+  assert.deepEqual(
+    decision.presentation.detail?.rows.map((row: any) => row.content[0].text),
+    [
+      "cat <<'END' | review-command",
+      "  Review this code.",
+      "  Check error handling.",
+      "END",
+      "jq '.result' result.json",
+    ],
+  );
 });
 
 test("normalizes line endings and unsafe control characters without changing indentation", () => {
-	const presentation = buildBashCommandPresentation("\r\n\tprintf 'one'\x00\r\n  printf 'two'\r\n\r\n");
+  const decision = presentBashCall(
+    "\r\n\tprintf 'one'\x00\r\n  printf 'two'\r\n\r\n",
+    undefined,
+    true,
+  );
 
-	assert.deepEqual(presentation.sourceLines, ["   printf 'one'", "  printf 'two'"]);
-	assert.equal(presentation.headline, "printf 'one' · 2 lines");
+  assert.deepEqual(decision.metadata?.bash?.command.sourceLines, [
+    "   printf 'one'",
+    "  printf 'two'",
+  ]);
+  assert.equal(
+    decision.metadata?.bash?.command.headline,
+    "printf 'one' · 2 lines",
+  );
 });
