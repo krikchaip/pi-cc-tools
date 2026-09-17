@@ -801,14 +801,6 @@ export function installPiHost(
         {
           showCallDetail:
             ctx.expanded === true && toolExecution.shouldRevealCallArgs(ctx),
-          showCollapsedCallDetail:
-            ctx.expanded !== true &&
-            toolExecution.shouldRevealCallArgs(ctx) &&
-            (ctx.state?._toolStatus === "pending" ||
-              (ctx.state?._toolStatus === "error" &&
-                toolExecution.lineCount(
-                  typeof args?.command === "string" ? args.command : "",
-                ) > 1)),
           ...(rewrite ? { bashRewrite: rewrite } : {}),
         },
         toolExecution.bashElapsedMs(ctx),

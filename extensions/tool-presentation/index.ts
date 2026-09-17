@@ -54,7 +54,6 @@ export interface ToolPresentationPolicy {
   readonly preserveBlankLines?: boolean;
   readonly bashRewrite?: RtkRewriteRecord;
   readonly showCallDetail?: boolean;
-  readonly showCollapsedCallDetail?: boolean;
   readonly showCollapsedResultDetail?: boolean;
 }
 
@@ -399,7 +398,6 @@ interface CallPresentationOptions {
   readonly titleTone?: SemanticCallPresentation["titleTone"];
   readonly detail?: SemanticDetail;
   readonly metadata?: ToolPresentationMetadata;
-  readonly collapsedDetailPreview?: SemanticCallPresentation["collapsedDetailPreview"];
   readonly subjectOverflow?: SemanticCallPresentation["subjectOverflow"];
 }
 
@@ -433,9 +431,6 @@ function callPresentation(
         ? { activity: request.lifecycle.activity }
         : {}),
       ...(options.detail ? { detail: options.detail } : {}),
-      ...(options.collapsedDetailPreview
-        ? { collapsedDetailPreview: options.collapsedDetailPreview }
-        : {}),
       ...(options.subjectOverflow
         ? { subjectOverflow: options.subjectOverflow }
         : {}),
@@ -547,8 +542,6 @@ const nativeAdapter: FamilyPresentationAdapter = Object.freeze({
       }
       const command = bashCommand(rawStringArg(request.args, "command"));
       const showDetail = request.policy?.showCallDetail === true;
-      const showCollapsedDetail =
-        request.policy?.showCollapsedCallDetail === true;
       const rewrite = request.policy?.bashRewrite;
       const subject: SemanticText = [
         {
@@ -570,10 +563,9 @@ const nativeAdapter: FamilyPresentationAdapter = Object.freeze({
           : []),
       ];
       return callPresentation(request, title, subject, {
-        detail:
-          showDetail || showCollapsedDetail
-            ? detail(command.sourceLines, showDetail ? "muted" : "accent")
-            : undefined,
+        detail: showDetail
+          ? detail(command.sourceLines, "muted")
+          : undefined,
         metadata: {
           bash: {
             command,
@@ -582,7 +574,6 @@ const nativeAdapter: FamilyPresentationAdapter = Object.freeze({
               : {}),
           },
         },
-        collapsedDetailPreview: showCollapsedDetail ? "head" : undefined,
         subjectOverflow: "truncate-end",
       });
     }

@@ -150,8 +150,6 @@ interface SettingsFile {
   groupToolCalls?: boolean;
   bashOutputMode?: "opencode" | "summary" | "preview";
   bashCollapsedLines?: number;
-  /** Verbatim script lines shown while bash is running or after failure. Defaults to 8. */
-  bashCommandPreviewLines?: number;
   /** Show a small live output preview while tools are still running. Defaults to true. */
   liveToolPreview?: boolean;
   /** Number of live output lines to show while collapsed. Defaults to 5. */

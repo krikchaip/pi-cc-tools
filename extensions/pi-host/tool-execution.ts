@@ -1258,19 +1258,7 @@ export function makeToolFamilyCallText(
   return makePresentationText(
     ctx.lastComponent,
     decision.presentation,
-    {
-      expansion: ctx.expanded === true ? "expanded" : "collapsed",
-      ...(name === "bash"
-        ? {
-            preview: {
-              normal: Math.max(
-                0,
-                Math.floor(readSettings().bashCommandPreviewLines ?? 8),
-              ),
-            },
-          }
-        : {}),
-    },
+    { expansion: ctx.expanded === true ? "expanded" : "collapsed" },
     theme,
     followPiOutputPad,
   );

@@ -1432,7 +1432,7 @@ await withRendererHarness(
       );
     }
 
-    const bashCommandPreviewLines = [
+    const bashCommandLines = [
       "for i in 1 2 3; do",
       "  : # BASH_COLLAPSED_CONTINUATION_TARGET",
       "  sleep 0.1",
@@ -1446,7 +1446,7 @@ await withRendererHarness(
     const bashCommandWrappedExecution = fullscreenExecution({
       tool: "bash",
       id: "standalone_bash_command_continuation_click_fixture",
-      args: { command: bashCommandPreviewLines.join("\n") },
+      args: { command: bashCommandLines.join("\n") },
       definition: bash,
       result: {
         content: [{ type: "text", text: "fixture failed" }],
@@ -1455,13 +1455,13 @@ await withRendererHarness(
     });
     const bashCommandWrapped = bashCommandWrappedExecution.observe(40);
     const bashCommandWrappedRow = bashCommandWrapped.rows.findIndex(
-      (line: string) => line.includes("BASH_COLLAPSED"),
+      (line: string) => line.includes("for i in 1 2 3; do"),
     );
     const bashCommandWrappedStart =
       bashCommandWrappedRow < 0
         ? -1
         : bashCommandWrapped.rows[bashCommandWrappedRow].indexOf(
-            "BASH_COLLAPSED",
+            "for i in 1 2 3; do",
           );
     const wrappedHeader = bashCommandWrapped.actions.find(
       (action) =>
@@ -1475,18 +1475,19 @@ await withRendererHarness(
       : undefined;
     if (
       bashCommandWrappedStart < 0 ||
+      bashCommandWrapped.text.includes("BASH_COLLAPSED_CONTINUATION_TARGET") ||
       !wrappedExpansion?.accepted ||
       !wrappedExpansion.after.text.includes("BASH_COMMAND_HIDDEN_FINAL")
     ) {
       throw new Error(
-        `collapsed Bash command continuation row did not bind an expansion action: ${JSON.stringify({ rows: bashCommandWrapped.rows, bashCommandWrappedRow, bashCommandWrappedStart })}`,
+        `collapsed Bash header did not hide command rows and expand from a narrow frame: ${JSON.stringify({ rows: bashCommandWrapped.rows, bashCommandWrappedRow, bashCommandWrappedStart })}`,
       );
     }
 
     const bashCommandRemainderExecution = fullscreenExecution({
       tool: "bash",
       id: "standalone_bash_command_remainder_click_fixture",
-      args: { command: bashCommandPreviewLines.join("\n") },
+      args: { command: bashCommandLines.join("\n") },
       definition: bash,
       result: {
         content: [{ type: "text", text: "fixture failed" }],
@@ -1495,13 +1496,13 @@ await withRendererHarness(
     });
     const bashCommandPreview = bashCommandRemainderExecution.observe(120);
     const bashCommandRemainderRow = bashCommandPreview.rows.findIndex(
-      (line: string) => line.includes("... 2 more lines"),
+      (line: string) => line.includes("for i in 1 2 3; do"),
     );
     const bashCommandRemainderStart =
       bashCommandRemainderRow < 0
         ? -1
         : bashCommandPreview.rows[bashCommandRemainderRow].indexOf(
-            "... 2 more lines",
+            "for i in 1 2 3; do",
           );
     const remainderHeader = bashCommandPreview.actions.find(
       (action) =>
@@ -1515,14 +1516,12 @@ await withRendererHarness(
       : undefined;
     if (
       bashCommandRemainderStart < 0 ||
-      bashCommandPreview.rows[bashCommandRemainderRow].includes(
-        "click to expand",
-      ) ||
+      bashCommandPreview.text.includes("BASH_COMMAND_VISIBLE_1") ||
       !remainderExpansion?.accepted ||
       !remainderExpansion.after.text.includes("BASH_COMMAND_HIDDEN_FINAL")
     ) {
       throw new Error(
-        `collapsed Bash command remainder did not stay terse and clickable: ${JSON.stringify({ rows: bashCommandPreview.rows, bashCommandRemainderRow, bashCommandRemainderStart })}`,
+        `collapsed Bash header did not hide command rows and remain clickable: ${JSON.stringify({ rows: bashCommandPreview.rows, bashCommandRemainderRow, bashCommandRemainderStart })}`,
       );
     }
 

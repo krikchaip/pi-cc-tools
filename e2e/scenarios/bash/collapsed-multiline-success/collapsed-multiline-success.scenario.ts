@@ -2,26 +2,26 @@ import assert from "node:assert/strict";
 
 import { bashFamily, fixture } from "../family.ts";
 
-const summaryCommand = "git -C eko-core fetch origin master";
+const summaryCommand = `tmux -L "$socket" send-keys -t "$session" C-o`;
 const hiddenPrelude = "set -euo pipefail";
-const hiddenTail = "git -C eko-core push origin refs/tags/18.12.1";
+const hiddenTail = `printf '%s\\n' "$pane"`;
 
 export default bashFamily.scenario({
-  name: "collapsed multiline Bash errors hide script rows",
+  name: "collapsed multiline Bash successes hide script rows",
   start: {
     mode: "session",
     session: {
       path: fixture(
-        "error-command-duplicate/bash-error-command-duplicate-session.jsonl",
+        "collapsed-multiline-success/bash-collapsed-multiline-success-session.jsonl",
       ),
-      replaceCwd: "/tmp/pi-cc-tools-bash-error-command-duplicate",
+      replaceCwd: "/tmp/pi-cc-tools-bash-collapsed-multiline-success",
     },
     settings: { groupToolCalls: false },
   },
   async run(terminal) {
-    const collapsed = await terminal.expect("collapsed-error", {
-      visible: [summaryCommand, /Exit \d+ \(2 lines\)/],
-      absent: [hiddenPrelude, hiddenTail, "BASH_FAILURE_OUTPUT"],
+    const collapsed = await terminal.expect("collapsed-success", {
+      visible: [summaryCommand, /Done \(1 lines\)/],
+      absent: [hiddenPrelude, hiddenTail, "BASH_SUCCESS_OUTPUT"],
     });
     const collapsedOccurrences = collapsed.lines.filter((line) =>
       line.includes(summaryCommand),
@@ -31,14 +31,13 @@ export default bashFamily.scenario({
       type: "click",
       at: collapsed.find(summaryCommand),
     });
-    const expanded = await terminal.expect("expanded-error", {
+    const expanded = await terminal.expect("expanded-success", {
       visible: [
         "Bash script",
         hiddenPrelude,
         summaryCommand,
         hiddenTail,
-        "BASH_FAILURE_OUTPUT",
-        "Command exited with code 7",
+        "BASH_SUCCESS_OUTPUT",
       ],
     });
     const expandedOccurrences = expanded.lines.filter((line) =>
@@ -47,12 +46,12 @@ export default bashFamily.scenario({
     assert.equal(
       expandedOccurrences,
       1,
-      `expanded Bash error summary command appeared ${expandedOccurrences} times\n${expanded.text}`,
+      `expanded Bash success summary command appeared ${expandedOccurrences} times\n${expanded.text}`,
     );
     assert.equal(
       collapsedOccurrences,
       1,
-      `collapsed Bash error summary command appeared ${collapsedOccurrences} times\n${collapsed.text}`,
+      `collapsed Bash success summary command appeared ${collapsedOccurrences} times\n${collapsed.text}`,
     );
   },
 });

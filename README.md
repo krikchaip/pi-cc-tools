@@ -57,7 +57,6 @@ Set in `.pi/settings.json` or `~/.pi/settings.json`:
   "thinkingMode": "live",
   "bashOutputMode": "opencode",
   "bashCollapsedLines": 10,
-  "bashCommandPreviewLines": 8,
   "liveToolPreview": true,
   "liveToolPreviewLines": 5,
   "diffCollapsedLines": 24,
@@ -159,7 +158,6 @@ Local click expansion preserves each renderer's normal first expanded view. For 
 | `groupToolCalls` | `true` | Group adjacent/concurrent tool calls under a compact status header |
 | `thinkingMode` | `live` | `live` = only streaming thinking expands (finished collapse to `Thought for Xs`); `full` = always expanded |
 | `bashCollapsedLines` | `10` | Lines for collapsed bash output |
-| `bashCommandPreviewLines` | `8` | Verbatim script lines shown while bash runs or after failure; `0` disables them |
 | `liveToolPreview` | `true` | Show a small live output preview while tools are still running |
 | `liveToolPreviewLines` | `5` | Lines shown in the collapsed live preview |
 | `diffCollapsedLines` | `24` | Diff lines before collapsing |
